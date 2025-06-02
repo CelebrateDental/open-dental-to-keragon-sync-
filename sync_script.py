@@ -9,6 +9,9 @@ from typing import List, Dict, Any, Optional
 from requests.exceptions import HTTPError, RequestException
 from collections import defaultdict
 
+# Import ZoneInfo for timezone handling (Python 3.9+)
+from zoneinfo import ZoneInfo
+
 # === CONFIGURATION ===
 API_BASE_URL        = os.environ.get('OPEN_DENTAL_API_URL', 'https://api.opendental.com/api/v1')
 DEVELOPER_KEY       = os.environ.get('OPEN_DENTAL_DEVELOPER_KEY')
@@ -19,7 +22,7 @@ LOG_LEVEL           = os.environ.get('LOG_LEVEL', 'INFO')
 
 # Sync window params
 OVERLAP_MINUTES     = int(os.environ.get('OVERLAP_MINUTES', '5'))
-LOOKAHEAD_HOURS     = int(os.environ.get('LOOKAHEAD_HOURS', '24'))
+LOOKAHEAD_HOURS     = int(os.environ.get('LOOKAHEAD_HOURS', '72'))  # 3 days × 24 hours
 
 # Pull clinic numbers dynamically from env
 CLINIC_NUMS = [
@@ -127,7 +130,14 @@ def fetch_appointments(clinic: int, since: datetime.datetime,
     if filtered_ops:
         for op in filtered_ops:
             for st in statuses:
-                params = {'dateStart': date_start, 'dateEnd': date_end, 'ClinicNum': clinic, 'AptStatus': st, 'Op': op, 'Limit': 100}
+                params = {
+                    'dateStart': date_start,
+                    'dateEnd': date_end,
+                    'ClinicNum': clinic,
+                    'AptStatus': st,
+                    'Op': op,
+                    'Limit': 100
+                }
                 try:
                     resp = requests.get(endpoint, headers=headers, params=params, timeout=30)
                     resp.raise_for_status()
@@ -139,7 +149,13 @@ def fetch_appointments(clinic: int, since: datetime.datetime,
                     logger.error(f"Error fetching {st}/Op{op}: {e}")
     else:
         for st in statuses:
-            params = {'dateStart': date_start, 'dateEnd': date_end, 'ClinicNum': clinic, 'AptStatus': st, 'Limit': 100}
+            params = {
+                'dateStart': date_start,
+                'dateEnd': date_end,
+                'ClinicNum': clinic,
+                'AptStatus': st,
+                'Limit': 100
+            }
             try:
                 resp = requests.get(endpoint, headers=headers, params=params, timeout=30)
                 resp.raise_for_status()
@@ -152,7 +168,10 @@ def fetch_appointments(clinic: int, since: datetime.datetime,
     # Raw fetched logging
     logger.info(f"Raw fetched for clinic {clinic}:")
     for a in all_appts:
-        logger.info(f"  AptNum={a.get('AptNum')} | Op={a.get('Op')} | AptDateTime={a.get('AptDateTime')} | DateTStamp={a.get('DateTStamp')}")
+        logger.info(
+            f"  AptNum={a.get('AptNum')} | Op={a.get('Op')} | "
+            f"AptDateTime={a.get('AptDateTime')} | DateTStamp={a.get('DateTStamp')}"
+        )
 
     # Client-side filter
     if filtered_ops:
@@ -162,6 +181,7 @@ def fetch_appointments(clinic: int, since: datetime.datetime,
         logger.info(f"Filtered out {before - len(all_appts)}; kept {len(all_appts)} for ops {filtered_ops}")
 
     return all_appts
+
 
 def filter_new_appointments(appts: List[Dict[str, Any]], since: datetime.datetime) -> List[Dict[str, Any]]:
     new_list = []
@@ -185,11 +205,15 @@ def get_patient_details(pat_num: int) -> Dict[str, Any]:
     except Exception:
         logger.warning(f"Primary fetch failed for PatNum {pat_num}, trying fallback...")
     try:
-        resp = requests.get(f"{API_BASE_URL}/patients", headers=headers, params={'PatNum':pat_num}, timeout=15)
+        resp = requests.get(
+            f"{API_BASE_URL}/patients", headers=headers, params={'PatNum': pat_num}, timeout=15
+        )
         resp.raise_for_status()
         data = resp.json()
-        if isinstance(data, list) and data: return data[0]
-        if isinstance(data, dict): return data
+        if isinstance(data, list) and data:
+            return data[0]
+        if isinstance(data, dict):
+            return data
     except Exception as e:
         logger.error(f"Fallback patient fetch failed: {e}")
     return {}
@@ -198,34 +222,46 @@ def get_patient_details(pat_num: int) -> Dict[str, Any]:
 def send_to_keragon(appt: Dict[str, Any]) -> bool:
     pat_num = appt.get('PatNum')
     patient = get_patient_details(pat_num) if pat_num else {}
+
+    # Convert AptDateTime (naive) to timezone-aware ISO8601 string
+    raw_start = appt.get('AptDateTime')
+    start_dt = parse_time(raw_start)
+    if start_dt:
+        central_tz = ZoneInfo("America/Chicago")
+        aware_local = start_dt.replace(tzinfo=central_tz)
+        iso_start = aware_local.isoformat()  # "YYYY-MM-DDTHH:MM:SS-05:00"
+    else:
+        iso_start = None
+
     payload = {
-        'firstName': patient.get('FName', appt.get('FName','')),
-        'lastName':  patient.get('LName', appt.get('LName','')),
-        'email':     patient.get('Email', appt.get('Email','')),
-        'phone':     (patient.get('HmPhone') or patient.get('WkPhone') or patient.get('WirelessPhone') or appt.get('HmPhone','')),
-        'appointmentTime': appt.get('AptDateTime'),
-        'locationId':      str(appt.get('ClinicNum','')),
-        'calendarId':      str(appt.get('Op','')),
-        'status':          appt.get('AptStatus',''),
-        'providerName':    appt.get('provAbbr',''),
-        'appointmentLength': appt.get('Pattern',''),
-        'notes':            appt.get('Note',''),
-        'appointmentId':    str(appt.get('AptNum','')),
-        'patientId':        str(appt.get('PatNum','')),
-        'birthdate':        patient.get('Birthdate',''),
-        'zipCode':          patient.get('Zip',''),
-        'gender':           patient.get('Gender',''),
-        'clinicName':       patient.get('ClinicName', appt.get('ClinicName','')),
-        'address':          patient.get('Address',''),
-        'address2':         patient.get('Address2',''),
-        'city':             patient.get('City',''),
-        'state':            patient.get('State',''),
-        'balanceTotal':     patient.get('BalTotal',0.0),
+        'firstName':        patient.get('FName', appt.get('FName', '')),  
+        'lastName':         patient.get('LName', appt.get('LName', '')),
+        'email':            patient.get('Email', appt.get('Email', '')),
+        'phone':            (patient.get('HmPhone') or patient.get('WkPhone') or patient.get('WirelessPhone') or appt.get('HmPhone', '')),
+        'appointmentTime':  iso_start or appt.get('AptDateTime'),
+        'locationId':       str(appt.get('ClinicNum', '')),
+        'calendarId':       str(appt.get('Op', '')),
+        'status':           appt.get('AptStatus', ''),
+        'providerName':     appt.get('provAbbr', ''),
+        'appointmentLength': appt.get('Pattern', ''),
+        'notes':             appt.get('Note', ''),
+        'appointmentId':     str(appt.get('AptNum', '')),
+        'patientId':         str(appt.get('PatNum', '')),
+        'birthdate':         patient.get('Birthdate', ''),
+        'zipCode':           patient.get('Zip', ''),
+        'gender':            patient.get('Gender', ''),
+        'clinicName':        patient.get('ClinicName', appt.get('ClinicName', '')),
+        'address':           patient.get('Address', ''),
+        'address2':          patient.get('Address2', ''),
+        'city':              patient.get('City', ''),
+        'state':             patient.get('State', ''),
+        'balanceTotal':      patient.get('BalTotal', 0.0),
+        # If Keragon requires a user assignment, add 'assignedUserId': 'YOUR_ID'
     }
     try:
         r = requests.post(KERAGON_WEBHOOK_URL, json=payload, timeout=30)
         r.raise_for_status()
-        logger.info(f"Sent to Keragon: {payload['firstName']} {payload['lastName']} (Op {payload['calendarId']})")
+        logger.info(f"Sent to Keragon: {payload['firstName']} {payload['lastName']} (Op {payload['calendarId']}) at {payload['appointmentTime']}")
         return True
     except Exception as e:
         logger.error(f"Keragon send failed: {e}")
