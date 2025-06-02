@@ -9,9 +9,6 @@ from typing import List, Dict, Any, Optional
 from requests.exceptions import HTTPError, RequestException
 from collections import defaultdict
 
-# Import ZoneInfo for timezone handling (Python 3.9+)
-from zoneinfo import ZoneInfo
-
 # === CONFIGURATION ===
 API_BASE_URL        = os.environ.get('OPEN_DENTAL_API_URL', 'https://api.opendental.com/api/v1')
 DEVELOPER_KEY       = os.environ.get('OPEN_DENTAL_DEVELOPER_KEY')
@@ -22,7 +19,7 @@ LOG_LEVEL           = os.environ.get('LOG_LEVEL', 'INFO')
 
 # Sync window params
 OVERLAP_MINUTES     = int(os.environ.get('OVERLAP_MINUTES', '5'))
-LOOKAHEAD_HOURS     = int(os.environ.get('LOOKAHEAD_HOURS', '72'))  # 3 days × 24 hours
+LOOKAHEAD_HOURS     = int(os.environ.get('LOOKAHEAD_HOURS', '720'))  # 30 days × 24 hours
 
 # Pull clinic numbers dynamically from env
 CLINIC_NUMS = [
@@ -32,8 +29,8 @@ CLINIC_NUMS = [
 
 # Map each ClinicNum → the list of operatories you care about
 CLINIC_OPERATORY_FILTERS: Dict[int, List[int]] = {
-    9034: [11579,11580],
-    9035: [11574,11576, 11577],
+    9034: [11579, 11580],
+    9035: [11574, 11576, 11577],
 }
 
 # === LOGGER SETUP ===
@@ -117,12 +114,12 @@ def get_filtered_operatories_for_clinic(clinic: int) -> List[int]:
 # === API INTERACTION ===
 
 def fetch_appointments(clinic: int, since: datetime.datetime,
-                       filtered_ops: List[int]=None) -> List[Dict[str, Any]]:
+                       filtered_ops: List[int] = None) -> List[Dict[str, Any]]:
     endpoint = f"{API_BASE_URL}/appointments"
     headers = make_auth_header()
     now = datetime.datetime.utcnow()
     date_start = (since - datetime.timedelta(minutes=OVERLAP_MINUTES)).strftime("%Y-%m-%d")
-    date_end   = (now + datetime.timedelta(hours=LOOKAHEAD_HOURS)).strftime("%Y-%m-%d")
+    date_end = (now + datetime.timedelta(hours=LOOKAHEAD_HOURS)).strftime("%Y-%m-%d")
 
     all_appts: List[Dict[str, Any]] = []
     statuses = ['Scheduled', 'Complete', 'Broken']
@@ -143,7 +140,8 @@ def fetch_appointments(clinic: int, since: datetime.datetime,
                     resp.raise_for_status()
                     data = resp.json()
                     if isinstance(data, list):
-                        for a in data: a.setdefault('Op', op)
+                        for a in data:
+                            a.setdefault('Op', op)
                         all_appts.extend(data)
                 except (HTTPError, RequestException) as e:
                     logger.error(f"Error fetching {st}/Op{op}: {e}")
@@ -223,13 +221,14 @@ def send_to_keragon(appt: Dict[str, Any]) -> bool:
     pat_num = appt.get('PatNum')
     patient = get_patient_details(pat_num) if pat_num else {}
 
-    # Convert AptDateTime (naive) to timezone-aware ISO8601 string
+    # Convert AptDateTime (naive) to fixed CST (UTC-06:00) ISO8601 string
     raw_start = appt.get('AptDateTime')
     start_dt = parse_time(raw_start)
     if start_dt:
-        central_tz = ZoneInfo("America/Chicago")
-        aware_local = start_dt.replace(tzinfo=central_tz)
-        iso_start = aware_local.isoformat()  # "YYYY-MM-DDTHH:MM:SS-05:00"
+        from datetime import timezone, timedelta
+        fixed_cst = timezone(timedelta(hours=-6))  # Always UTC-06:00
+        aware_local = start_dt.replace(tzinfo=fixed_cst)
+        iso_start = aware_local.isoformat()  # "YYYY-MM-DDTHH:MM:SS-06:00"
     else:
         iso_start = None
 
@@ -288,6 +287,7 @@ def process_appointments(clinic: int, appts: List[Dict[str, Any]], last_sync: da
     return min(max_mod, now)
 
 # === MAIN SYNC ===
+
 
 def run_sync():
     if not (DEVELOPER_KEY and CUSTOMER_KEY and KERAGON_WEBHOOK_URL):
