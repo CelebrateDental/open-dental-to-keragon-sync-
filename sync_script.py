@@ -191,7 +191,7 @@ def filter_new_appointments(appts: List[Dict[str, Any]], since: datetime.datetim
     new_list = []
     for a in appts:
         mod = parse_time(a.get('DateTStamp'))
-        if mod and mod >= since:
+        if mod and mod > since:
             new_list.append(a)
     logger.info(f"Kept {len(new_list)} new appointments since {since.isoformat()}")
     return new_list
