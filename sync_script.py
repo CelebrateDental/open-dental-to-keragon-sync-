@@ -224,8 +224,9 @@ def get_patient_details(pat_num: int) -> Dict[str, Any]:
     return {}
 
 def send_to_keragon(appt: Dict[str, Any]) -> bool:
-    # … your get_patient_details(…) call etc …
-
+    pat_num = appt.get('PatNum')
+    patient = get_patient_details(pat_num) if pat_num else {} 
+    
     # 1) Parse the naïve “AptDateTime” string
     raw_start = appt.get('AptDateTime')            # e.g. "2025-06-05 08:00:00"
     start_dt  = parse_time(raw_start)              # gives datetime(2025,6,5,8,0,0) if valid
