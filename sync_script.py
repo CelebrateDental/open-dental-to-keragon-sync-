@@ -128,7 +128,7 @@ def fetch_appointments(clinic: int, since: datetime.datetime,
                     'ClinicNum': clinic,
                     'AptStatus': st,
                     'Op': op,
-                    'Limit': 100
+                    'Limit': 300
                 }
                 try:
                     resp = requests.get(endpoint, headers=headers, params=params, timeout=30)
