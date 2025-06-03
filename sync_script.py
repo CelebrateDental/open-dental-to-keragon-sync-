@@ -110,11 +110,17 @@ def get_filtered_operatories_for_clinic(clinic: int) -> List[int]:
 
 def fetch_appointments(clinic: int, since: datetime.datetime,
                        filtered_ops: List[int] = None) -> List[Dict[str, Any]]:
+    """
+    Fetch all appointments whose AptDateTime falls between today and today+LOOKAHEAD_HOURS,
+    then return the raw list. We'll apply DateTStamp filtering later.
+    """
     endpoint = f"{API_BASE_URL}/appointments"
     headers = make_auth_header()
     now = datetime.datetime.utcnow()
-    date_start = (since - datetime.timedelta(minutes=OVERLAP_MINUTES)).strftime("%Y-%m-%d")
-    date_end = (now + datetime.timedelta(hours=LOOKAHEAD_HOURS)).strftime("%Y-%m-%d")
+
+    # ── FETCH WINDOW: always from “today” (UTC date) up to “today + LOOKAHEAD_HOURS”
+    date_start = now.strftime("%Y-%m-%d")
+    date_end   = (now + datetime.timedelta(hours=LOOKAHEAD_HOURS)).strftime("%Y-%m-%d")
 
     all_appts: List[Dict[str, Any]] = []
     statuses = ['Scheduled', 'Complete', 'Broken']
@@ -124,17 +130,18 @@ def fetch_appointments(clinic: int, since: datetime.datetime,
             for st in statuses:
                 params = {
                     'dateStart': date_start,
-                    'dateEnd': date_end,
+                    'dateEnd':   date_end,
                     'ClinicNum': clinic,
                     'AptStatus': st,
-                    'Op': op,
-                    'Limit': 300
+                    'Op':        op,
+                    'Limit':     300  # raised limit to 300 to avoid missing >100
                 }
                 try:
                     resp = requests.get(endpoint, headers=headers, params=params, timeout=30)
                     resp.raise_for_status()
                     data = resp.json()
                     if isinstance(data, list):
+                        # ensure each appointment has its operatory field
                         for a in data:
                             a.setdefault('Op', op)
                         all_appts.extend(data)
@@ -144,10 +151,10 @@ def fetch_appointments(clinic: int, since: datetime.datetime,
         for st in statuses:
             params = {
                 'dateStart': date_start,
-                'dateEnd': date_end,
+                'dateEnd':   date_end,
                 'ClinicNum': clinic,
                 'AptStatus': st,
-                'Limit': 100
+                'Limit':     300
             }
             try:
                 resp = requests.get(endpoint, headers=headers, params=params, timeout=30)
@@ -166,7 +173,7 @@ def fetch_appointments(clinic: int, since: datetime.datetime,
             f"AptDateTime={a.get('AptDateTime')} | DateTStamp={a.get('DateTStamp')}"
         )
 
-    # Client-side filter
+    # Client-side operatory filter
     if filtered_ops:
         before = len(all_appts)
         allowed = set(filtered_ops)
@@ -176,6 +183,11 @@ def fetch_appointments(clinic: int, since: datetime.datetime,
     return all_appts
 
 def filter_new_appointments(appts: List[Dict[str, Any]], since: datetime.datetime) -> List[Dict[str, Any]]:
+    """
+    From the raw list (all_appts), keep only those whose DateTStamp >= since.
+    That way, we process every appointment in the [today→+30d] window,
+    but only if it was created or modified since our last sync.
+    """
     new_list = []
     for a in appts:
         mod = parse_time(a.get('DateTStamp'))
@@ -215,26 +227,26 @@ def send_to_keragon(appt: Dict[str, Any]) -> bool:
 
     # 1) Parse and tag start time with fixed CST (UTC–06:00)
     raw_start = appt.get('AptDateTime')  # e.g. "2025-06-05 08:00:00"
-    start_dt = parse_time(raw_start)     # naive datetime(2025, 6, 5, 8, 0, 0)
+    start_dt  = parse_time(raw_start)    # naive datetime(2025,6,5,8,0,0)
     if start_dt:
         from datetime import timezone, timedelta
-        fixed_cst = timezone(timedelta(hours=-6))
+        fixed_cst   = timezone(timedelta(hours=-6))
         aware_start = start_dt.replace(tzinfo=fixed_cst)
-        iso_start = aware_start.isoformat()         # "2025-06-05T08:00:00-06:00"
+        iso_start   = aware_start.isoformat()  # "2025-06-05T08:00:00-06:00"
     else:
         iso_start = None
 
     # 2) Derive duration from Pattern (each “X” = 10 minutes)
-    pattern = appt.get('Pattern', "")
-    SLOT_INCREMENT = 10  # 10 minutes per “X”
-    num_slots = pattern.count("X")               # e.g. "////XX////" → 2 X’s
-    duration_minutes = num_slots * SLOT_INCREMENT  # e.g. 2 × 10 = 20 minutes
+    pattern          = appt.get('Pattern', "")
+    SLOT_INCREMENT   = 10  # 10 minutes per “X”
+    num_slots        = pattern.count("X")
+    duration_minutes = num_slots * SLOT_INCREMENT
 
     # 3) Compute end time = start + duration_minutes
     if start_dt and duration_minutes:
-        end_dt = start_dt + datetime.timedelta(minutes=duration_minutes)
+        end_dt   = start_dt + datetime.timedelta(minutes=duration_minutes)
         aware_end = end_dt.replace(tzinfo=fixed_cst)
-        iso_end = aware_end.isoformat()               # e.g. "2025-06-05T08:20:00-06:00"
+        iso_end   = aware_end.isoformat()  # e.g. "2025-06-05T08:20:00-06:00"
     else:
         iso_end = None
 
@@ -242,9 +254,9 @@ def send_to_keragon(appt: Dict[str, Any]) -> bool:
         'firstName':         patient.get('FName', appt.get('FName', '')),
         'lastName':          patient.get('LName', appt.get('LName', '')),
         'email':             patient.get('Email', appt.get('Email', '')),
-        'phone':             (patient.get('HmPhone') 
-                              or patient.get('WkPhone') 
-                              or patient.get('WirelessPhone') 
+        'phone':             (patient.get('HmPhone')
+                              or patient.get('WkPhone')
+                              or patient.get('WirelessPhone')
                               or appt.get('HmPhone', '')),
         'appointmentTime':   iso_start or appt.get('AptDateTime'),
         'endTime':           iso_end,
@@ -310,7 +322,7 @@ def run_sync():
 
     logger.info(f"Syncing clinics: {CLINIC_NUMS}")
     last_state = load_last_sync_state()
-    new_state = last_state.copy()
+    new_state  = last_state.copy()
 
     for clinic in CLINIC_NUMS:
         # Log operatories for verification
@@ -319,7 +331,7 @@ def run_sync():
         since = last_state.get(clinic, datetime.datetime.utcnow() - datetime.timedelta(hours=24))
         logger.info(f"Clinic {clinic}: since {since.isoformat()}")
         filt_ops = get_filtered_operatories_for_clinic(clinic)
-        appts = fetch_appointments(clinic, since, filt_ops)
+        appts    = fetch_appointments(clinic, since, filt_ops)
         new_state[clinic] = process_appointments(clinic, appts, since)
 
     save_last_sync_state(new_state)
