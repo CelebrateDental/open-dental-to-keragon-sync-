@@ -5,9 +5,11 @@ import json
 import logging
 import datetime
 import requests
+from zoneinfo import ZoneInfo
 from typing import List, Dict, Any, Optional
 from requests.exceptions import HTTPError, RequestException
 from collections import defaultdict
+
 
 # === CONFIGURATION ===
 API_BASE_URL        = os.environ.get('OPEN_DENTAL_API_URL', 'https://api.opendental.com/api/v1')
@@ -222,31 +224,31 @@ def get_patient_details(pat_num: int) -> Dict[str, Any]:
     return {}
 
 def send_to_keragon(appt: Dict[str, Any]) -> bool:
-    pat_num = appt.get('PatNum')
-    patient = get_patient_details(pat_num) if pat_num else {}
+    # … your get_patient_details(…) call etc …
 
-    # 1) Parse and tag start time with fixed CST (UTC–06:00)
-    raw_start = appt.get('AptDateTime')  # e.g. "2025-06-05 08:00:00"
-    start_dt  = parse_time(raw_start)    # naive datetime(2025,6,5,8,0,0)
+    # 1) Parse the naïve “AptDateTime” string
+    raw_start = appt.get('AptDateTime')            # e.g. "2025-06-05 08:00:00"
+    start_dt  = parse_time(raw_start)              # gives datetime(2025,6,5,8,0,0) if valid
+
     if start_dt:
-        from datetime import timezone, timedelta
-        fixed_cst   = timezone(timedelta(hours=-6))
-        aware_start = start_dt.replace(tzinfo=fixed_cst)
-        iso_start   = aware_start.isoformat()  # "2025-06-05T08:00:00-06:00"
+        # 2) Localize to America/Chicago (automatically chooses -05:00 for summer)
+        central = ZoneInfo("America/Chicago")
+        aware_start = start_dt.replace(tzinfo=central)
+        iso_start = aware_start.isoformat()        # “2025-06-05T08:00:00-05:00”
     else:
         iso_start = None
 
-    # 2) Derive duration from Pattern (each “X” = 10 minutes)
-    pattern          = appt.get('Pattern', "")
-    SLOT_INCREMENT   = 10  # 10 minutes per “X”
-    num_slots        = pattern.count("X")
-    duration_minutes = num_slots * SLOT_INCREMENT
+    # 3) Derive “end” the same way, using the same zoneinfo
+    #    (for example, if you store length in `AptLength` or derive from “Pattern”):
+    SLOT_INCREMENT = 10  # minutes per “X” if you’re counting X’s in appt["Pattern"]
+    pattern        = appt.get('Pattern', "")
+    num_slots      = pattern.count("X")
+    duration_min   = num_slots * SLOT_INCREMENT
 
-    # 3) Compute end time = start + duration_minutes
-    if start_dt and duration_minutes:
-        end_dt   = start_dt + datetime.timedelta(minutes=duration_minutes)
-        aware_end = end_dt.replace(tzinfo=fixed_cst)
-        iso_end   = aware_end.isoformat()  # e.g. "2025-06-05T08:20:00-06:00"
+    if start_dt and duration_min:
+        end_dt = start_dt + datetime.timedelta(minutes=duration_min)
+        aware_end = end_dt.replace(tzinfo=central)
+        iso_end = aware_end.isoformat()             # e.g. “2025-06-05T09:20:00-05:00”
     else:
         iso_end = None
 
