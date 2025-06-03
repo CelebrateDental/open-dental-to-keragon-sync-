@@ -19,7 +19,7 @@ LOG_LEVEL           = os.environ.get('LOG_LEVEL', 'INFO')
 
 # Sync window params
 OVERLAP_MINUTES     = int(os.environ.get('OVERLAP_MINUTES', '5'))
-LOOKAHEAD_HOURS     = int(os.environ.get('LOOKAHEAD_HOURS', '720'))  # 30 days × 24 hours
+LOOKAHEAD_HOURS     = int(os.environ.get('LOOKAHEAD_HOURS', '720'))  # 30 days = 30×24 hrs
 
 # Pull clinic numbers dynamically from env
 CLINIC_NUMS = [
@@ -55,7 +55,6 @@ def load_last_sync_state() -> Dict[int, datetime.datetime]:
     cutoff = datetime.datetime.utcnow() - datetime.timedelta(hours=24)
     return {c: cutoff for c in CLINIC_NUMS}
 
-
 def save_last_sync_state(state: Dict[int, datetime.datetime]) -> None:
     try:
         serial = {str(k): v.isoformat() for k, v in state.items()}
@@ -63,7 +62,6 @@ def save_last_sync_state(state: Dict[int, datetime.datetime]) -> None:
             json.dump(serial, f)
     except Exception as e:
         logger.error(f"Error saving state file: {e}")
-
 
 def parse_time(ts: Optional[str]) -> Optional[datetime.datetime]:
     if not ts:
@@ -76,13 +74,11 @@ def parse_time(ts: Optional[str]) -> Optional[datetime.datetime]:
     logger.warning(f"Unrecognized time format: {ts}")
     return None
 
-
 def make_auth_header() -> Dict[str, str]:
     return {
         'Authorization': f'ODFHIR {DEVELOPER_KEY}/{CUSTOMER_KEY}',
         'Content-Type': 'application/json'
     }
-
 
 def list_operatories_for_clinic(clinic: int) -> List[Dict[str, Any]]:
     """
@@ -101,7 +97,6 @@ def list_operatories_for_clinic(clinic: int) -> List[Dict[str, Any]]:
     except Exception as e:
         logger.error(f"Failed to list operatories for clinic {clinic}: {e}")
         return []
-
 
 def get_filtered_operatories_for_clinic(clinic: int) -> List[int]:
     filt = CLINIC_OPERATORY_FILTERS.get(clinic, [])
@@ -180,7 +175,6 @@ def fetch_appointments(clinic: int, since: datetime.datetime,
 
     return all_appts
 
-
 def filter_new_appointments(appts: List[Dict[str, Any]], since: datetime.datetime) -> List[Dict[str, Any]]:
     new_list = []
     for a in appts:
@@ -189,7 +183,6 @@ def filter_new_appointments(appts: List[Dict[str, Any]], since: datetime.datetim
             new_list.append(a)
     logger.info(f"Kept {len(new_list)} new appointments since {since.isoformat()}")
     return new_list
-
 
 def get_patient_details(pat_num: int) -> Dict[str, Any]:
     if not pat_num:
@@ -216,32 +209,49 @@ def get_patient_details(pat_num: int) -> Dict[str, Any]:
         logger.error(f"Fallback patient fetch failed: {e}")
     return {}
 
-
 def send_to_keragon(appt: Dict[str, Any]) -> bool:
     pat_num = appt.get('PatNum')
     patient = get_patient_details(pat_num) if pat_num else {}
 
-    # Convert AptDateTime (naive) to fixed CST (UTC-06:00) ISO8601 string
-    raw_start = appt.get('AptDateTime')
-    start_dt = parse_time(raw_start)
+    # 1) Parse and tag start time with fixed CST (UTC–06:00)
+    raw_start = appt.get('AptDateTime')  # e.g. "2025-06-05 08:00:00"
+    start_dt = parse_time(raw_start)     # naive datetime(2025, 6, 5, 8, 0, 0)
     if start_dt:
         from datetime import timezone, timedelta
-        fixed_cst = timezone(timedelta(hours=-6))  # Always UTC-06:00
-        aware_local = start_dt.replace(tzinfo=fixed_cst)
-        iso_start = aware_local.isoformat()  # "YYYY-MM-DDTHH:MM:SS-06:00"
+        fixed_cst = timezone(timedelta(hours=-6))
+        aware_start = start_dt.replace(tzinfo=fixed_cst)
+        iso_start = aware_start.isoformat()         # "2025-06-05T08:00:00-06:00"
     else:
         iso_start = None
 
+    # 2) Derive duration from Pattern (each “X” = 10 minutes)
+    pattern = appt.get('Pattern', "")
+    SLOT_INCREMENT = 10  # 10 minutes per “X”
+    num_slots = pattern.count("X")               # e.g. "////XX////" → 2 X’s
+    duration_minutes = num_slots * SLOT_INCREMENT  # e.g. 2 × 10 = 20 minutes
+
+    # 3) Compute end time = start + duration_minutes
+    if start_dt and duration_minutes:
+        end_dt = start_dt + datetime.timedelta(minutes=duration_minutes)
+        aware_end = end_dt.replace(tzinfo=fixed_cst)
+        iso_end = aware_end.isoformat()               # e.g. "2025-06-05T08:20:00-06:00"
+    else:
+        iso_end = None
+
     payload = {
-        'firstName':        patient.get('FName', appt.get('FName', '')),  
-        'lastName':         patient.get('LName', appt.get('LName', '')),
-        'email':            patient.get('Email', appt.get('Email', '')),
-        'phone':            (patient.get('HmPhone') or patient.get('WkPhone') or patient.get('WirelessPhone') or appt.get('HmPhone', '')),
-        'appointmentTime':  iso_start or appt.get('AptDateTime'),
-        'locationId':       str(appt.get('ClinicNum', '')),
-        'calendarId':       str(appt.get('Op', '')),
-        'status':           appt.get('AptStatus', ''),
-        'providerName':     appt.get('provAbbr', ''),
+        'firstName':         patient.get('FName', appt.get('FName', '')),
+        'lastName':          patient.get('LName', appt.get('LName', '')),
+        'email':             patient.get('Email', appt.get('Email', '')),
+        'phone':             (patient.get('HmPhone') 
+                              or patient.get('WkPhone') 
+                              or patient.get('WirelessPhone') 
+                              or appt.get('HmPhone', '')),
+        'appointmentTime':   iso_start or appt.get('AptDateTime'),
+        'endTime':           iso_end,
+        'locationId':        str(appt.get('ClinicNum', '')),
+        'calendarId':        str(appt.get('Op', '')),
+        'status':            appt.get('AptStatus', ''),
+        'providerName':      appt.get('provAbbr', ''),
         'appointmentLength': appt.get('Pattern', ''),
         'notes':             appt.get('Note', ''),
         'appointmentId':     str(appt.get('AptNum', '')),
@@ -255,17 +265,19 @@ def send_to_keragon(appt: Dict[str, Any]) -> bool:
         'city':              patient.get('City', ''),
         'state':             patient.get('State', ''),
         'balanceTotal':      patient.get('BalTotal', 0.0),
-        # If Keragon requires a user assignment, add 'assignedUserId': 'YOUR_ID'
+        # If Keragon needs an assignedUserId, add 'assignedUserId': 'YOUR_ID' here
     }
     try:
         r = requests.post(KERAGON_WEBHOOK_URL, json=payload, timeout=30)
         r.raise_for_status()
-        logger.info(f"Sent to Keragon: {payload['firstName']} {payload['lastName']} (Op {payload['calendarId']}) at {payload['appointmentTime']}")
+        logger.info(
+            f"Sent to Keragon: {payload['firstName']} {payload['lastName']} "
+            f"(Op {payload['calendarId']}) start={payload['appointmentTime']} end={payload['endTime']}"
+        )
         return True
     except Exception as e:
         logger.error(f"Keragon send failed: {e}")
         return False
-
 
 def process_appointments(clinic: int, appts: List[Dict[str, Any]], last_sync: datetime.datetime) -> datetime.datetime:
     if not appts:
@@ -287,7 +299,6 @@ def process_appointments(clinic: int, appts: List[Dict[str, Any]], last_sync: da
     return min(max_mod, now)
 
 # === MAIN SYNC ===
-
 
 def run_sync():
     if not (DEVELOPER_KEY and CUSTOMER_KEY and KERAGON_WEBHOOK_URL):
