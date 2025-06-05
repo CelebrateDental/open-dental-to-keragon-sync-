@@ -35,7 +35,7 @@ CLINIC_NUMS = [
 
 # Map each ClinicNum → the list of operatories you care about
 CLINIC_OPERATORY_FILTERS: Dict[int, List[int]] = {
-    9034: [11579, 11580],
+    9034: [11579, 11580,11588],
     9035: [11574, 11576, 11577],
 }
 
@@ -176,7 +176,7 @@ def fetch_appointments(clinic: int, since: Optional[datetime.datetime],
                     'ClinicNum': clinic,
                     'AptStatus': st,
                     'Op':        op,
-                    'Limit':     300
+                    'Limit':     1000
                 }
                 try:
                     resp = requests.get(endpoint, headers=headers, params=params, timeout=30)
@@ -195,7 +195,7 @@ def fetch_appointments(clinic: int, since: Optional[datetime.datetime],
                 'dateEnd':   date_end,
                 'ClinicNum': clinic,
                 'AptStatus': st,
-                'Limit':     300
+                'Limit':     1000
             }
             try:
                 resp = requests.get(endpoint, headers=headers, params=params, timeout=30)
