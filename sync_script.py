@@ -256,7 +256,7 @@ def send_to_keragon(appt: Dict[str, Any]) -> bool:
         'zipCode':           patient.get('Zip', ''),
         'state':             patient.get('State', ''),
         'city':              patient.get('City', ''),
-        'gender':              patient.get('gender', ''),
+        'gender':            patient.get('gender', ''),
     }
 
     try:
