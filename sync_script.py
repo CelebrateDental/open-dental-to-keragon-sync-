@@ -192,17 +192,24 @@ def send_to_keragon(appt: Dict[str, Any]) -> bool:
     apt_id = str(appt.get('AptNum', ''))
     original_note = appt.get('Note', '') or ""
     now = datetime.datetime.utcnow()
-    # 1) Strip from GHL
+
+    # 1) Strip the GHL tag if present
     if "[fromGHL]" in original_note:
         cleaned = original_note.replace("[fromGHL]", "").strip()
         try:
             patch_url = f"{API_BASE_URL}/appointments/{apt_id}"
-            resp = requests.patch(patch_url, headers=make_auth_header(), json={"Note": cleaned}, timeout=30)
+            resp = requests.patch(
+                patch_url,
+                headers=make_auth_header(),
+                json={"Note": cleaned},
+                timeout=30
+            )
             resp.raise_for_status()
             logger.info(f"Stripped [fromGHL] from AptNum={apt_id}")
         except Exception as e:
             logger.error(f"Failed stripping [fromGHL] on AptNum={apt_id}: {e}")
         return True
+
     # 2) Build payload, append fromOpenDental
     raw_start = appt.get('AptDateTime')
     start_dt = parse_time(raw_start)
@@ -212,6 +219,7 @@ def send_to_keragon(appt: Dict[str, Any]) -> bool:
         iso_start = aware_start.isoformat()
     else:
         iso_start = None
+
     duration = appt.get('Pattern', '').count('X') * 10
     if start_dt and duration:
         end_dt = start_dt + datetime.timedelta(minutes=duration)
@@ -219,24 +227,37 @@ def send_to_keragon(appt: Dict[str, Any]) -> bool:
         iso_end = aware_end.isoformat()
     else:
         iso_end = None
+
     tagged_note = f"{original_note} [fromOpenDental]"
+
+    # Fetch patient details once
     patient = get_patient_details(appt.get('PatNum')) if appt.get('PatNum') else {}
+
     payload = {
-        'firstName':       patient.get('FName', appt.get('FName', '')),
-        'lastName':        patient.get('LName', appt.get('LName', '')),
-        'email':           patient.get('Email', appt.get('Email', '')),
-        'phone':           (patient.get('HmPhone') or patient.get('WkPhone') or patient.get('WirelessPhone') or appt.get('HmPhone', '')),
-        'appointmentTime': iso_start or raw_start,
-        'endTime':         iso_end,
-        'locationId':      str(appt.get('ClinicNum', '')),
-        'calendarId':      str(appt.get('Op', '')),
-        'status':          appt.get('AptStatus', ''),
-        'providerName':    appt.get('provAbbr', ''),
+        'firstName':         patient.get('FName', appt.get('FName', '')),
+        'lastName':          patient.get('LName', appt.get('LName', '')),
+        'email':             patient.get('Email', appt.get('Email', '')),
+        'phone':             (patient.get('HmPhone')
+                              or patient.get('WkPhone')
+                              or patient.get('WirelessPhone')
+                              or appt.get('HmPhone', '')),
+        'appointmentTime':   iso_start or raw_start,
+        'endTime':           iso_end,
+        'locationId':        str(appt.get('ClinicNum', '')),
+        'calendarId':        str(appt.get('Op', '')),
+        'status':            appt.get('AptStatus', ''),
+        'providerName':      appt.get('provAbbr', ''),
         'appointmentLength': appt.get('Pattern', ''),
-        'notes':           tagged_note,
-        'appointmentId':   apt_id,
-        'patientId':       str(appt.get('PatNum', ''))
+        'notes':             tagged_note,
+        'appointmentId':     apt_id,
+        'patientId':         str(appt.get('PatNum', '')),
+        # Newly added fields:
+        'birthdate':         patient.get('Birthdate', ''),
+        'zipCode':           patient.get('Zip', ''),
+        'state':             patient.get('State', ''),
+        'city':              patient.get('City', ''),
     }
+
     try:
         r = requests.post(KERAGON_WEBHOOK_URL, json=payload, timeout=30)
         r.raise_for_status()
@@ -245,7 +266,6 @@ def send_to_keragon(appt: Dict[str, Any]) -> bool:
     except Exception as e:
         logger.error(f"Keragon send failed for AptNum={apt_id}: {e}")
         return False
-
 
 def process_appointments(clinic: int, appts: List[Dict[str, Any]], lastSync: Optional[datetime.datetime], didFullFetch: bool) -> Dict[str, Any]:
     now = datetime.datetime.utcnow()
