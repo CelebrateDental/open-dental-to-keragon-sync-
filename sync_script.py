@@ -298,8 +298,8 @@ def fetch_appointments(clinic: int, since: Optional[datetime.datetime], filtered
     
     # Add DateTStamp for incremental sync if we have a last sync time
     if since:
-        # Format as YYYY-MM-DD for the API
-        params['DateTStamp'] = since.strftime("%Y-%m-%d")
+        # Format as YYYY-MM-DD HH:MM:SS for the API (NOT just YYYY-MM-DD)
+        params['DateTStamp'] = since.strftime("%Y-%m-%d %H:%M:%S")
         logger.info(f"Fetching appointments since {params['DateTStamp']}")
     
     try:
