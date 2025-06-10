@@ -97,17 +97,111 @@ def convert_to_timezone_aware(dt: datetime.datetime, timezone_str: str = "Americ
     return dt.replace(tzinfo=target_tz)
 
 
-def calculate_end_time(start_dt: datetime.datetime, pattern: str) -> Optional[datetime.datetime]:
-    """Calculate end time properly handling timezone-aware datetime"""
-    if not start_dt or not pattern:
+def get_appointment_duration_from_api(appt_id: str) -> Optional[int]:
+    """Fetch full appointment details to get accurate duration"""
+    if not appt_id:
         return None
     
-    duration_minutes = pattern.count('X') * 10
-    if duration_minutes <= 0:
+    endpoint = f"{API_BASE_URL}/appointments/{appt_id}"
+    headers = make_auth_header()
+    
+    try:
+        resp = requests.get(endpoint, headers=headers, timeout=15)
+        resp.raise_for_status()
+        appt_detail = resp.json()
+        
+        # Try to get duration from various fields
+        duration_sources = [
+            'Length',           # Total length in minutes
+            'Minutes',          # Duration in minutes  
+            'PatternLength',    # Pattern-based length
+            'TotalTime'         # Total time
+        ]
+        
+        for field in duration_sources:
+            if field in appt_detail and appt_detail[field]:
+                duration = int(appt_detail[field])
+                if duration > 0:
+                    logger.debug(f"Got duration from API field '{field}': {duration} minutes")
+                    return duration
+        
+        # Try to calculate from start/end times if available
+        start_time = appt_detail.get('AptDateTime')
+        end_time = appt_detail.get('AptDateTimeEnd') or appt_detail.get('EndTime')
+        
+        if start_time and end_time:
+            start_dt = parse_time(start_time)
+            end_dt = parse_time(end_time)
+            if start_dt and end_dt:
+                duration = int((end_dt - start_dt).total_seconds() / 60)
+                logger.debug(f"Calculated duration from start/end times: {duration} minutes")
+                return duration
+                
+        # Fallback: use pattern but calculate total pattern length
+        pattern = appt_detail.get('Pattern', '')
+        if pattern:
+            # Each character in pattern represents 10 minutes
+            total_duration = len(pattern) * 10
+            logger.debug(f"Using total pattern length: '{pattern}' -> {total_duration} minutes")
+            return total_duration
+            
+    except Exception as e:
+        logger.warning(f"Could not fetch detailed appointment data for {appt_id}: {e}")
+    
+    return None
+
+
+def calculate_end_time(start_dt: datetime.datetime, pattern: str, appt_data: Dict[str, Any] = None) -> Optional[datetime.datetime]:
+    """Calculate end time properly handling timezone-aware datetime"""
+    if not start_dt:
         return None
+    
+    duration_minutes = 0
+    appt_id = appt_data.get('AptNum') if appt_data else None
+    
+    # Method 1: Try to get accurate duration from API
+    if appt_id:
+        api_duration = get_appointment_duration_from_api(str(appt_id))
+        if api_duration:
+            duration_minutes = api_duration
+    
+    # Method 2: Check local appointment data
+    if duration_minutes <= 0 and appt_data:
+        duration_sources = ['Length', 'Minutes', 'PatternLength', 'TotalTime']
+        for field in duration_sources:
+            if field in appt_data and appt_data[field]:
+                try:
+                    duration_minutes = int(appt_data[field])
+                    if duration_minutes > 0:
+                        logger.debug(f"Using local field '{field}': {duration_minutes} minutes")
+                        break
+                except (ValueError, TypeError):
+                    continue
+    
+    # Method 3: Try direct end time
+    if duration_minutes <= 0 and appt_data:
+        raw_end = appt_data.get('AptDateTimeEnd') or appt_data.get('EndTime')
+        if raw_end:
+            end_dt = parse_time(raw_end)
+            if end_dt:
+                end_aware = convert_to_timezone_aware(end_dt, "America/Chicago")
+                logger.debug(f"Using direct end time: {end_aware.isoformat()}")
+                return end_aware
+    
+    # Method 4: Use total pattern length instead of just X's
+    if duration_minutes <= 0 and pattern:
+        # Each character represents 10 minutes
+        duration_minutes = len(pattern) * 10
+        logger.debug(f"Using total pattern length: '{pattern}' -> {duration_minutes} minutes")
+    
+    # Default fallback
+    if duration_minutes <= 0:
+        duration_minutes = 60  # Default to 1 hour
+        logger.warning(f"No duration found, defaulting to {duration_minutes} minutes")
     
     # Add duration to the timezone-aware datetime
     end_dt = start_dt + datetime.timedelta(minutes=duration_minutes)
+    logger.debug(f"Final calculated end time: {end_dt.isoformat()} (added {duration_minutes} min)")
     return end_dt
 
 
@@ -249,11 +343,11 @@ def send_to_keragon(appt: Dict[str, Any]) -> bool:
         
         # Calculate end time using the timezone-aware start time
         pattern = appt.get('Pattern', '')
-        aware_end = calculate_end_time(aware_start, pattern)
+        aware_end = calculate_end_time(aware_start, pattern, appt)
         iso_end = aware_end.isoformat() if aware_end else None
         
         # Debug logging
-        logger.debug(f"AptNum={apt_id} | Start: {iso_start} | End: {iso_end} | Pattern: {pattern}")
+        logger.debug(f"AptNum={apt_id} | Start: {iso_start} | End: {iso_end} | Pattern: '{pattern}' | Raw appointment data keys: {list(appt.keys())}")
     else:
         iso_start = None
         iso_end = None
