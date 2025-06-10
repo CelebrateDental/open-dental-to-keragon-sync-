@@ -518,12 +518,13 @@ def send_to_keragon(appt: Dict[str, Any]) -> bool:
     try:
         r = requests.post(KERAGON_WEBHOOK_URL, json=payload, timeout=30)
         r.raise_for_status()
-        logger.info(f"✓ Successfully sent to Keragon: ID={apt_id} | Patient='{patient_name}' | Start='{formatted_start}' | End='{formatted_end}' | Status={appt.get('AptStatus', '')}")
+        # UPDATED SUCCESS LOG MESSAGE - This is the key change!
+        logger.info(f"✓ Sent AptNum={apt_id} to Keragon | Patient='{patient_name}' | Start='{formatted_start}' | End='{formatted_end}' | Status={appt.get('AptStatus', '')}")
         return True
     except Exception as e:
         logger.error(f"✗ Keragon send failed: ID={apt_id} | Patient='{patient_name}' | Start='{formatted_start}' | End='{formatted_end}' | Error: {e}")
         return False
-
+        
 def process_appointments(clinic: int, appts: List[Dict[str, Any]], lastSync: Optional[datetime.datetime], didFullFetch: bool) -> Dict[str, Any]:
     now = datetime.datetime.utcnow()
     max_mod = lastSync or now
