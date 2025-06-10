@@ -277,6 +277,30 @@ def get_filtered_operatories_for_clinic(clinic: int) -> List[int]:
         logger.info(f"Clinic {clinic}: no operatory filter, will fetch all")
     return filt
 
+def get_patient_name_for_logging(appt: Dict[str, Any]) -> str:
+    """Get patient name for logging, trying multiple sources"""
+    # Try to get name from appointment data first
+    fname = appt.get('FName', '').strip()
+    lname = appt.get('LName', '').strip()
+    
+    if fname or lname:
+        return f"{fname} {lname}".strip()
+    
+    # If no name in appointment data, try to fetch from patient details
+    pat_num = appt.get('PatNum')
+    if pat_num:
+        try:
+            patient = get_patient_details(pat_num)
+            if patient:
+                p_fname = patient.get('FName', '').strip()
+                p_lname = patient.get('LName', '').strip()
+                if p_fname or p_lname:
+                    return f"{p_fname} {p_lname}".strip()
+        except Exception as e:
+            logger.debug(f"Could not fetch patient details for PatNum {pat_num}: {e}")
+    
+    return "Unknown Patient"
+
 
 def fetch_appointments(clinic: int, since: Optional[datetime.datetime], filtered_ops: List[int] = None) -> List[Dict[str, Any]]:
     """
@@ -320,7 +344,7 @@ def fetch_appointments(clinic: int, since: Optional[datetime.datetime], filtered
         for appt in appointments:
             # Get appointment details for logging
             apt_id = appt.get('AptNum', 'N/A')
-            patient_name = f"{appt.get('FName', '')} {appt.get('LName', '')}".strip() or "Unknown Patient"
+            patient_name = get_patient_name_for_logging(appt)  # UPDATED: Use helper function
             raw_start = appt.get('AptDateTime', '')
             status = appt.get('AptStatus', '')
             op_num = appt.get('Op') or appt.get('OperatoryNum')
@@ -384,6 +408,7 @@ def fetch_appointments(clinic: int, since: Optional[datetime.datetime], filtered
 
 
 
+
 def filter_new_appointments(appts: List[Dict[str, Any]], since: Optional[datetime.datetime]) -> List[Dict[str, Any]]:
     if since is None:
         return []
@@ -425,8 +450,8 @@ def send_to_keragon(appt: Dict[str, Any]) -> bool:
     original_note = appt.get('Note', '') or ""
     now = datetime.datetime.utcnow()
     
-    # Get patient name for logging
-    patient_name = f"{appt.get('FName', '')} {appt.get('LName', '')}".strip() or "Unknown Patient"
+    # Get patient name for logging - use the helper function
+    patient_name = get_patient_name_for_logging(appt)  # UPDATED: Use helper function
     
     # Get and format start time and end time for logging
     raw_start = appt.get('AptDateTime')
@@ -518,7 +543,6 @@ def send_to_keragon(appt: Dict[str, Any]) -> bool:
     try:
         r = requests.post(KERAGON_WEBHOOK_URL, json=payload, timeout=30)
         r.raise_for_status()
-        # UPDATED SUCCESS LOG MESSAGE - This is the key change!
         logger.info(f"✓ Sent AptNum={apt_id} to Keragon | Patient='{patient_name}' | Start='{formatted_start}' | End='{formatted_end}' | Status={appt.get('AptStatus', '')}")
         return True
     except Exception as e:
