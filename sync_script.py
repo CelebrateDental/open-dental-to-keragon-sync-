@@ -83,6 +83,34 @@ def parse_time(ts: Optional[str]) -> Optional[datetime.datetime]:
     return None
 
 
+def convert_to_timezone_aware(dt: datetime.datetime, timezone_str: str = "America/Chicago") -> datetime.datetime:
+    """Convert naive datetime to timezone-aware datetime"""
+    if dt is None:
+        return None
+    
+    if dt.tzinfo is not None:
+        # Already timezone aware, convert to target timezone
+        return dt.astimezone(ZoneInfo(timezone_str))
+    
+    # Assume the naive datetime is in the target timezone
+    target_tz = ZoneInfo(timezone_str)
+    return dt.replace(tzinfo=target_tz)
+
+
+def calculate_end_time(start_dt: datetime.datetime, pattern: str) -> Optional[datetime.datetime]:
+    """Calculate end time properly handling timezone-aware datetime"""
+    if not start_dt or not pattern:
+        return None
+    
+    duration_minutes = pattern.count('X') * 10
+    if duration_minutes <= 0:
+        return None
+    
+    # Add duration to the timezone-aware datetime
+    end_dt = start_dt + datetime.timedelta(minutes=duration_minutes)
+    return end_dt
+
+
 def make_auth_header() -> Dict[str, str]:
     return {'Authorization': f'ODFHIR {DEVELOPER_KEY}/{CUSTOMER_KEY}', 'Content-Type': 'application/json'}
 
@@ -210,23 +238,26 @@ def send_to_keragon(appt: Dict[str, Any]) -> bool:
             logger.error(f"Failed stripping [fromGHL] on AptNum={apt_id}: {e}")
         return True
 
-    # 2) Build payload, append fromOpenDental
+    # 2) Build payload with FIXED time handling
     raw_start = appt.get('AptDateTime')
     start_dt = parse_time(raw_start)
+    
+    # Convert to timezone-aware datetime FIRST
     if start_dt:
-        central = ZoneInfo("America/Chicago")
-        aware_start = start_dt.replace(tzinfo=central)
+        aware_start = convert_to_timezone_aware(start_dt, "America/Chicago")
         iso_start = aware_start.isoformat()
+        
+        # Calculate end time using the timezone-aware start time
+        pattern = appt.get('Pattern', '')
+        aware_end = calculate_end_time(aware_start, pattern)
+        iso_end = aware_end.isoformat() if aware_end else None
+        
+        # Debug logging
+        logger.debug(f"AptNum={apt_id} | Start: {iso_start} | End: {iso_end} | Pattern: {pattern}")
     else:
         iso_start = None
-
-    duration = appt.get('Pattern', '').count('X') * 10
-    if start_dt and duration:
-        end_dt = start_dt + datetime.timedelta(minutes=duration)
-        aware_end = end_dt.replace(tzinfo=central)
-        iso_end = aware_end.isoformat()
-    else:
         iso_end = None
+        logger.warning(f"AptNum={apt_id} | Could not parse start time: {raw_start}")
 
     tagged_note = f"{original_note} [fromOpenDental]"
 
