@@ -318,17 +318,45 @@ def fetch_appointments(clinic: int, since: Optional[datetime.datetime], filtered
         filtered_appointments = []
         
         for appt in appointments:
-            # Filter by status
+            # Get appointment details for logging
+            apt_id = appt.get('AptNum', 'N/A')
+            patient_name = f"{appt.get('FName', '')} {appt.get('LName', '')}".strip() or "Unknown Patient"
+            raw_start = appt.get('AptDateTime', '')
             status = appt.get('AptStatus', '')
+            op_num = appt.get('Op') or appt.get('OperatoryNum')
+            
+            # Parse and format the start time for logging
+            start_dt = parse_time(raw_start)
+            if start_dt:
+                aware_start = convert_to_timezone_aware(start_dt, "America/Chicago")
+                formatted_start = aware_start.strftime("%Y-%m-%d %H:%M:%S %Z")
+                
+                # Calculate end time for logging
+                pattern = appt.get('Pattern', '')
+                aware_end = calculate_end_time(aware_start, pattern, appt)
+                if aware_end:
+                    formatted_end = aware_end.strftime("%Y-%m-%d %H:%M:%S %Z")
+                else:
+                    formatted_end = "Unknown end time"
+            else:
+                formatted_start = raw_start or "No start time"
+                formatted_end = "Unknown end time"
+            
+            logger.debug(f"Processing appointment: ID={apt_id} | Patient='{patient_name}' | Start='{formatted_start}' | End='{formatted_end}' | Status='{status}' | Op={op_num}")
+            
+            # Filter by status
             if status not in VALID_STATUSES:
+                logger.debug(f"Skipping appointment {apt_id} - invalid status: {status}")
                 continue
             
             # Filter by operatory if specified
             if filtered_ops:
-                op_num = appt.get('Op') or appt.get('OperatoryNum')
                 if op_num not in filtered_ops:
+                    logger.debug(f"Skipping appointment {apt_id} - operatory {op_num} not in filter {filtered_ops}")
                     continue
             
+            # Log accepted appointments
+            logger.info(f"✓ Accepted: ID={apt_id} | Patient='{patient_name}' | Start='{formatted_start}' | End='{formatted_end}' | Status='{status}' | Op={op_num}")
             filtered_appointments.append(appt)
         
         if filtered_ops:
@@ -353,6 +381,7 @@ def fetch_appointments(clinic: int, since: Optional[datetime.datetime], filtered
     except Exception as e:
         logger.error(f"Unexpected error fetching appointments: {e}")
         return []
+
 
 
 def filter_new_appointments(appts: List[Dict[str, Any]], since: Optional[datetime.datetime]) -> List[Dict[str, Any]]:
@@ -395,6 +424,29 @@ def send_to_keragon(appt: Dict[str, Any]) -> bool:
     apt_id = str(appt.get('AptNum', ''))
     original_note = appt.get('Note', '') or ""
     now = datetime.datetime.utcnow()
+    
+    # Get patient name for logging
+    patient_name = f"{appt.get('FName', '')} {appt.get('LName', '')}".strip() or "Unknown Patient"
+    
+    # Get and format start time and end time for logging
+    raw_start = appt.get('AptDateTime')
+    start_dt = parse_time(raw_start)
+    if start_dt:
+        aware_start = convert_to_timezone_aware(start_dt, "America/Chicago")
+        formatted_start = aware_start.strftime("%Y-%m-%d %H:%M:%S %Z")
+        
+        # Calculate end time for logging
+        pattern = appt.get('Pattern', '')
+        aware_end = calculate_end_time(aware_start, pattern, appt)
+        if aware_end:
+            formatted_end = aware_end.strftime("%Y-%m-%d %H:%M:%S %Z")
+        else:
+            formatted_end = "Unknown end time"
+    else:
+        formatted_start = raw_start or "No start time"
+        formatted_end = "Unknown end time"
+    
+    logger.info(f"Processing appointment for Keragon: ID={apt_id} | Patient='{patient_name}' | Start='{formatted_start}' | End='{formatted_end}'")
 
     # 1) Strip the GHL tag if present
     if "[fromGHL]" in original_note:
@@ -408,14 +460,12 @@ def send_to_keragon(appt: Dict[str, Any]) -> bool:
                 timeout=30
             )
             resp.raise_for_status()
-            logger.info(f"Stripped [fromGHL] from AptNum={apt_id}")
+            logger.info(f"Stripped [fromGHL] from AptNum={apt_id} | Patient='{patient_name}' | Start='{formatted_start}' | End='{formatted_end}'")
         except Exception as e:
-            logger.error(f"Failed stripping [fromGHL] on AptNum={apt_id}: {e}")
+            logger.error(f"Failed stripping [fromGHL] on AptNum={apt_id} | Patient='{patient_name}': {e}")
         return True
 
     # 2) Build payload with corrected time handling
-    raw_start = appt.get('AptDateTime')
-    start_dt = parse_time(raw_start)
     
     # Convert to timezone-aware datetime FIRST
     if start_dt:
@@ -428,11 +478,11 @@ def send_to_keragon(appt: Dict[str, Any]) -> bool:
         iso_end = aware_end.isoformat() if aware_end else None
         
         # Debug logging
-        logger.debug(f"AptNum={apt_id} | Start: {iso_start} | End: {iso_end} | Pattern: '{pattern}'")
+        logger.debug(f"AptNum={apt_id} | Patient='{patient_name}' | Start: {iso_start} | End: {iso_end} | Pattern: '{pattern}'")
     else:
         iso_start = None
         iso_end = None
-        logger.warning(f"AptNum={apt_id} | Could not parse start time: {raw_start}")
+        logger.warning(f"AptNum={apt_id} | Patient='{patient_name}' | Could not parse start time: {raw_start}")
 
     tagged_note = f"{original_note} [fromOpenDental]"
 
@@ -468,12 +518,11 @@ def send_to_keragon(appt: Dict[str, Any]) -> bool:
     try:
         r = requests.post(KERAGON_WEBHOOK_URL, json=payload, timeout=30)
         r.raise_for_status()
-        logger.info(f"Sent AptNum={apt_id} to Keragon with [fromOpenDental]")
+        logger.info(f"✓ Successfully sent to Keragon: ID={apt_id} | Patient='{patient_name}' | Start='{formatted_start}' | End='{formatted_end}' | Status={appt.get('AptStatus', '')}")
         return True
     except Exception as e:
-        logger.error(f"Keragon send failed for AptNum={apt_id}: {e}")
+        logger.error(f"✗ Keragon send failed: ID={apt_id} | Patient='{patient_name}' | Start='{formatted_start}' | End='{formatted_end}' | Error: {e}")
         return False
-
 
 def process_appointments(clinic: int, appts: List[Dict[str, Any]], lastSync: Optional[datetime.datetime], didFullFetch: bool) -> Dict[str, Any]:
     now = datetime.datetime.utcnow()
@@ -484,6 +533,32 @@ def process_appointments(clinic: int, appts: List[Dict[str, Any]], lastSync: Opt
         logger.info(f"Clinic {clinic}: no updates since {lastSync}")
         return {'newLastSync': lastSync, 'didFullFetch': True}
     
+    logger.info(f"Clinic {clinic}: Processing {len(to_send)} appointments for sync:")
+    
+    # Log summary of appointments to be processed
+    for i, appt in enumerate(to_send, 1):
+        apt_id = appt.get('AptNum', 'N/A')
+        patient_name = f"{appt.get('FName', '')} {appt.get('LName', '')}".strip() or "Unknown Patient"
+        raw_start = appt.get('AptDateTime', '')
+        start_dt = parse_time(raw_start)
+        
+        if start_dt:
+            aware_start = convert_to_timezone_aware(start_dt, "America/Chicago")
+            formatted_start = aware_start.strftime("%Y-%m-%d %H:%M:%S")
+            
+            # Calculate end time for summary logging
+            pattern = appt.get('Pattern', '')
+            aware_end = calculate_end_time(aware_start, pattern, appt)
+            if aware_end:
+                formatted_end = aware_end.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                formatted_end = "Unknown end time"
+        else:
+            formatted_start = raw_start or "No start time"
+            formatted_end = "Unknown end time"
+            
+        logger.info(f"  {i:2d}. ID={apt_id} | Patient='{patient_name}' | Start='{formatted_start}' | End='{formatted_end}' | Status={appt.get('AptStatus', '')}")
+    
     sent_count = 0
     for a in to_send:
         # send_to_keragon handles strip vs append
@@ -493,7 +568,7 @@ def process_appointments(clinic: int, appts: List[Dict[str, Any]], lastSync: Opt
             # advance mod time so we don't resend
             max_mod = now if now > max_mod else max_mod
     
-    logger.info(f"Clinic {clinic}: processed {sent_count}/{len(to_send)} appointments")
+    logger.info(f"Clinic {clinic}: Successfully processed {sent_count}/{len(to_send)} appointments")
     return {'newLastSync': max_mod, 'didFullFetch': True}
 
 
