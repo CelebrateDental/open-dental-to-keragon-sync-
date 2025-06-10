@@ -96,6 +96,40 @@ def convert_to_timezone_aware(dt: datetime.datetime, timezone_str: str = "Americ
     target_tz = ZoneInfo(timezone_str)
     return dt.replace(tzinfo=target_tz)
 
+def calculate_pattern_duration(pattern: str, pattern_secondary: str = None, minutes_per_slot: int = 10) -> int:
+    """
+    Calculate appointment duration from pattern strings.
+    Returns duration in minutes.
+    """
+    if not pattern:
+        return 0
+    
+    # Combine both patterns to find the full span
+    all_patterns = [pattern]
+    if pattern_secondary:
+        all_patterns.append(pattern_secondary)
+    
+    first_x = -1
+    last_x = -1
+    
+    # Find first and last X across all patterns
+    for pat in all_patterns:
+        for i, char in enumerate(pat):
+            if char.upper() == 'X':  # Handle both X and x
+                if first_x == -1:
+                    first_x = i
+                last_x = i
+    
+    if first_x == -1:
+        # No X found, return total pattern length as fallback
+        return len(pattern) * minutes_per_slot
+    
+    # Calculate span from first X to last X (inclusive)
+    duration_slots = last_x - first_x + 1
+    duration_minutes = duration_slots * minutes_per_slot
+    
+    return duration_minutes
+
 
 def get_appointment_duration_from_api(appt_id: str) -> Optional[int]:
     """Fetch full appointment details to get accurate duration"""
@@ -110,7 +144,7 @@ def get_appointment_duration_from_api(appt_id: str) -> Optional[int]:
         resp.raise_for_status()
         appt_detail = resp.json()
         
-        # Try to get duration from various fields
+        # Try to get duration from various fields (in order of preference)
         duration_sources = [
             'Length',           # Total length in minutes
             'Minutes',          # Duration in minutes  
@@ -120,10 +154,13 @@ def get_appointment_duration_from_api(appt_id: str) -> Optional[int]:
         
         for field in duration_sources:
             if field in appt_detail and appt_detail[field]:
-                duration = int(appt_detail[field])
-                if duration > 0:
-                    logger.debug(f"Got duration from API field '{field}': {duration} minutes")
-                    return duration
+                try:
+                    duration = int(appt_detail[field])
+                    if duration > 0:
+                        logger.debug(f"Got duration from API field '{field}': {duration} minutes")
+                        return duration
+                except (ValueError, TypeError):
+                    continue
         
         # Try to calculate from start/end times if available
         start_time = appt_detail.get('AptDateTime')
@@ -134,16 +171,18 @@ def get_appointment_duration_from_api(appt_id: str) -> Optional[int]:
             end_dt = parse_time(end_time)
             if start_dt and end_dt:
                 duration = int((end_dt - start_dt).total_seconds() / 60)
-                logger.debug(f"Calculated duration from start/end times: {duration} minutes")
-                return duration
-                
-        # Fallback: use pattern but calculate total pattern length
+                if duration > 0:
+                    logger.debug(f"Calculated duration from start/end times: {duration} minutes")
+                    return duration
+        
+        # Use pattern calculation as last resort
         pattern = appt_detail.get('Pattern', '')
+        pattern_secondary = appt_detail.get('PatternSecondary', '')
+        
         if pattern:
-            # Each character in pattern represents 10 minutes
-            total_duration = len(pattern) * 10
-            logger.debug(f"Using total pattern length: '{pattern}' -> {total_duration} minutes")
-            return total_duration
+            duration = calculate_pattern_duration(pattern, pattern_secondary)
+            logger.debug(f"Calculated duration from patterns: '{pattern}' + '{pattern_secondary}' = {duration} minutes")
+            return duration
             
     except Exception as e:
         logger.warning(f"Could not fetch detailed appointment data for {appt_id}: {e}")
@@ -162,10 +201,11 @@ def calculate_end_time(start_dt: datetime.datetime, pattern: str, appt_data: Dic
     # Method 1: Try to get accurate duration from API
     if appt_id:
         api_duration = get_appointment_duration_from_api(str(appt_id))
-        if api_duration:
+        if api_duration and api_duration > 0:
             duration_minutes = api_duration
+            logger.debug(f"Using API duration: {duration_minutes} minutes")
     
-    # Method 2: Check local appointment data
+    # Method 2: Check local appointment data for duration fields
     if duration_minutes <= 0 and appt_data:
         duration_sources = ['Length', 'Minutes', 'PatternLength', 'TotalTime']
         for field in duration_sources:
@@ -178,7 +218,7 @@ def calculate_end_time(start_dt: datetime.datetime, pattern: str, appt_data: Dic
                 except (ValueError, TypeError):
                     continue
     
-    # Method 3: Try direct end time
+    # Method 3: Try direct end time calculation
     if duration_minutes <= 0 and appt_data:
         raw_end = appt_data.get('AptDateTimeEnd') or appt_data.get('EndTime')
         if raw_end:
@@ -188,11 +228,12 @@ def calculate_end_time(start_dt: datetime.datetime, pattern: str, appt_data: Dic
                 logger.debug(f"Using direct end time: {end_aware.isoformat()}")
                 return end_aware
     
-    # Method 4: Use total pattern length instead of just X's
-    if duration_minutes <= 0 and pattern:
-        # Each character represents 10 minutes
-        duration_minutes = len(pattern) * 10
-        logger.debug(f"Using total pattern length: '{pattern}' -> {duration_minutes} minutes")
+    # Method 4: Calculate from patterns (FIXED VERSION)
+    if duration_minutes <= 0:
+        pattern_secondary = appt_data.get('PatternSecondary', '') if appt_data else ''
+        duration_minutes = calculate_pattern_duration(pattern, pattern_secondary)
+        if duration_minutes > 0:
+            logger.debug(f"Using pattern calculation: {duration_minutes} minutes")
     
     # Default fallback
     if duration_minutes <= 0:
