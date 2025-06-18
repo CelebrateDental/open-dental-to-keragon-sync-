@@ -43,7 +43,7 @@ class Config:
         
         # Parse operatory filters
         self.clinic_operatory_filters: Dict[int, List[int]] = {
-            9034: [11579, 11580],
+            9034: [11579, 11580, 11588],
             9035: [11574, 11576, 11577],
         }
 
@@ -271,7 +271,7 @@ def fetch_appointments_batch(clinic_num: int, date_start: str, date_end: str, st
         'dateEnd': date_end,
         'ClinicNum': clinic_num,
         'AptStatus': status,
-        'Limit': 100
+        'Limit': 1000
     }
     
     if operatory_num:
