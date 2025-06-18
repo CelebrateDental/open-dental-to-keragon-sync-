@@ -192,31 +192,46 @@ def retry_request(func, max_attempts: int = None, backoff_factor: float = 1.5):
     return wrapper
 
 # === STATE MANAGEMENT ===
-def load_last_sync_state() -> Dict[int, datetime.datetime]:
-    """Load last sync state from file"""
+def load_last_sync_state() -> Tuple[Dict[int, datetime.datetime], bool]:
+    """Load last sync state from file. Returns (state_dict, is_first_run)"""
     if not os.path.exists(config.state_file):
-        logger.info("No state file found, using 24-hour lookback for first run")
-        cutoff = datetime.datetime.utcnow() - datetime.timedelta(hours=24)
-        return {clinic: cutoff for clinic in config.clinic_nums}
+        logger.info("No state file found - this is a FIRST RUN")
+        return {}, True
     
     try:
         with open(config.state_file, 'r') as f:
             data = json.load(f)
         
+        # Check if state file is empty or has no valid entries
+        if not data or not isinstance(data, dict):
+            logger.info("Empty or invalid state file - treating as FIRST RUN")
+            return {}, True
+        
         state = {}
+        valid_entries = 0
+        
         for k, v in data.items():
             try:
-                state[int(k)] = datetime.datetime.fromisoformat(v)
+                clinic_num = int(k)
+                if clinic_num in config.clinic_nums:  # Only load state for configured clinics
+                    state[clinic_num] = datetime.datetime.fromisoformat(v)
+                    valid_entries += 1
             except (ValueError, TypeError) as e:
                 logger.warning(f"Invalid state entry for clinic {k}: {e}")
-                state[int(k)] = datetime.datetime.utcnow() - datetime.timedelta(hours=24)
         
-        logger.info(f"Loaded sync state for {len(state)} clinics")
-        return state
+        # If we don't have state for all configured clinics, treat as first run
+        is_first_run = valid_entries != len(config.clinic_nums)
+        
+        if is_first_run:
+            logger.info(f"Incomplete state file (have {valid_entries}, need {len(config.clinic_nums)}) - treating as FIRST RUN")
+            return {}, True
+        
+        logger.info(f"Loaded sync state for {len(state)} clinics - SUBSEQUENT RUN")
+        return state, False
+        
     except Exception as e:
-        logger.error(f"Error reading state file: {e}, using fallback")
-        cutoff = datetime.datetime.utcnow() - datetime.timedelta(hours=24)
-        return {clinic: cutoff for clinic in config.clinic_nums}
+        logger.error(f"Error reading state file: {e} - treating as FIRST RUN")
+        return {}, True
 
 def save_last_sync_state(state: Dict[int, datetime.datetime]) -> None:
     """Save last sync state to file"""
@@ -294,12 +309,15 @@ def fetch_appointments_for_clinic(clinic_num: int, since: datetime.datetime, is_
     """Fetch all relevant appointments for a clinic"""
     now = datetime.datetime.utcnow()
 
-    # --- MODIFICATION APPLIED HERE ---
+    # Set date range based on run type
     date_start = now.strftime("%Y-%m-%d")
-    date_end = (now + datetime.timedelta(days=30)).strftime("%Y-%m-%d")
+    date_end = (now + datetime.timedelta(days=config.first_run_lookahead_days)).strftime("%Y-%m-%d")
 
-    logger.info(f"Fetching appointments for clinic {clinic_num} for the next 30 days")
-    logger.info(f"Date range: {date_start} to {date_end}")
+    logger.info(f"Fetching appointments for clinic {clinic_num} from {date_start} to {date_end}")
+    if is_first_run:
+        logger.info(f"FIRST RUN: Will fetch ALL appointments in date range")
+    else:
+        logger.info(f"SUBSEQUENT RUN: Will filter for appointments modified since {since.isoformat()}")
 
     statuses = ['Scheduled', 'Complete', 'Broken']
     filtered_ops = config.clinic_operatory_filters.get(clinic_num, [])
@@ -443,29 +461,30 @@ def process_appointments_for_clinic(clinic_num: int, appointments: List[Appointm
     """Process appointments for a clinic and send to Keragon"""
     if not appointments:
         logger.info(f"No appointments to process for clinic {clinic_num}")
-        return since, 0, 0
+        # Return current time as new timestamp even if no appointments
+        return datetime.datetime.utcnow(), 0, 0
     
-    # FIXED: Handle first run vs subsequent runs differently
+    # FIXED: Handle first run vs subsequent runs correctly
     if is_first_run:
         # On first run, send ALL appointments regardless of when they were modified
         new_appointments = appointments
-        logger.info(f"First run: Processing ALL {len(new_appointments)} appointments for clinic {clinic_num}")
+        logger.info(f"FIRST RUN: Processing ALL {len(new_appointments)} appointments for clinic {clinic_num}")
     else:
         # On subsequent runs, only send new/modified appointments
         new_appointments = [
             apt for apt in appointments 
             if apt.date_t_stamp and apt.date_t_stamp >= since
         ]
-        logger.info(f"Subsequent run: Processing {len(new_appointments)} new/modified appointments since {since.isoformat()} for clinic {clinic_num}")
+        logger.info(f"SUBSEQUENT RUN: Processing {len(new_appointments)} new/modified appointments since {since.isoformat()} for clinic {clinic_num}")
     
     if not new_appointments:
-        logger.info(f"No appointments to process for clinic {clinic_num}")
-        return since, 0, 0
+        logger.info(f"No new/modified appointments to process for clinic {clinic_num}")
+        # Return current time as new timestamp even if no new appointments
+        return datetime.datetime.utcnow(), 0, 0
     
     # Track patient data to avoid duplicate fetches
     patient_cache = {}
     success_count = 0
-    max_timestamp = since
     
     # Process appointments with threading for patient data fetches
     with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
@@ -485,25 +504,25 @@ def process_appointments_for_clinic(clinic_num: int, appointments: List[Appointm
                 patient_cache[pat_num] = {}
     
     # Send appointments to Keragon
+    max_timestamp = since
     for appointment in new_appointments:
         try:
             patient_data = patient_cache.get(appointment.pat_num, {})
             if send_appointment_to_keragon(appointment, patient_data):
                 success_count += 1
             
-            # Update max timestamp - FIXED: Handle first run case
-            if is_first_run:
-                # On first run, set timestamp to current time since we processed all existing appointments
-                max_timestamp = datetime.datetime.utcnow()
-            elif appointment.date_t_stamp and appointment.date_t_stamp > max_timestamp:
+            # Update max timestamp - track the latest modification time we've processed
+            if appointment.date_t_stamp and appointment.date_t_stamp > max_timestamp:
                 max_timestamp = appointment.date_t_stamp
+                
         except Exception as e:
             logger.error(f"Failed to process appointment {appointment.apt_num}: {e}")
     
     logger.info(f"Clinic {clinic_num}: Successfully processed {success_count}/{len(new_appointments)} appointments")
     
-    # Return the latest timestamp, bounded by current time
-    return min(max_timestamp, datetime.datetime.utcnow()), len(new_appointments), success_count
+    # FIXED: Always return current time or later to mark this sync as complete
+    new_timestamp = max(max_timestamp, datetime.datetime.utcnow())
+    return new_timestamp, len(new_appointments), success_count
 
 # === MAIN SYNC LOGIC ===
 def validate_configuration() -> bool:
@@ -535,19 +554,18 @@ def run_sync() -> bool:
     logger.info("=== Starting OpenDental → Keragon Sync ===")
     start_time = datetime.datetime.utcnow()
     
-    # Load previous sync state
-    last_state = load_last_sync_state()
-    new_state = last_state.copy()
+    # FIXED: Load state and detect first run properly
+    last_state, is_first_run = load_last_sync_state()
+    new_state = {}
     
-    # Detect if this is a first run
-    is_first_run = len(last_state) == 0  # Empty state means first run
     if is_first_run:
-        logger.info(f"First run detected - will fetch all appointments for the next {config.first_run_lookahead_days} days")
-        # Initialize state with a baseline for each clinic
+        logger.info(f"🚀 FIRST RUN DETECTED - will fetch ALL appointments for the next {config.first_run_lookahead_days} days")
+        # Initialize state for all clinics
         for clinic_num in config.clinic_nums:
-            last_state[clinic_num] = datetime.datetime.utcnow() - datetime.timedelta(hours=24)
+            new_state[clinic_num] = datetime.datetime.utcnow() - datetime.timedelta(hours=24)  # Baseline time
     else:
-        logger.info(f"Subsequent run - will fetch appointments modified since last sync")
+        logger.info(f"🔄 SUBSEQUENT RUN - will fetch appointments modified since last sync")
+        new_state = last_state.copy()
     
     total_processed = 0
     total_successful = 0
@@ -557,11 +575,12 @@ def run_sync() -> bool:
             logger.info(f"\n--- Processing Clinic {clinic_num} ---")
             
             # Get last sync time for this clinic
-            since = last_state.get(clinic_num, datetime.datetime.utcnow() - datetime.timedelta(hours=24))
+            since = new_state.get(clinic_num, datetime.datetime.utcnow() - datetime.timedelta(hours=24))
+            
             if is_first_run:
-                logger.info(f"First run for clinic {clinic_num}")
+                logger.info(f"FIRST RUN for clinic {clinic_num}")
             else:
-                logger.info(f"Last sync: {since.isoformat()}")
+                logger.info(f"SUBSEQUENT RUN for clinic {clinic_num} - last sync: {since.isoformat()}")
             
             # Fetch and verify operatories
             try:
@@ -572,12 +591,12 @@ def run_sync() -> bool:
             # Fetch appointments
             appointments = fetch_appointments_for_clinic(clinic_num, since, is_first_run)
             
-            # Process appointments - FIXED: Pass is_first_run flag
+            # Process appointments
             new_timestamp, processed, successful = process_appointments_for_clinic(
                 clinic_num, appointments, since, is_first_run
             )
             
-            # Update state
+            # FIXED: Always update state with new timestamp
             new_state[clinic_num] = new_timestamp
             total_processed += processed
             total_successful += successful
@@ -586,9 +605,11 @@ def run_sync() -> bool:
             
         except Exception as e:
             logger.error(f"Failed to process clinic {clinic_num}: {e}")
-            # Don't update timestamp for failed clinics
+            # Don't update timestamp for failed clinics, but keep existing timestamp
+            if clinic_num not in new_state:
+                new_state[clinic_num] = datetime.datetime.utcnow() - datetime.timedelta(hours=24)
     
-    # Save updated state
+    # FIXED: Always save state after processing
     save_last_sync_state(new_state)
     
     # Summary
@@ -603,6 +624,7 @@ def run_sync() -> bool:
         logger.info(f"Success rate: {success_rate:.1f}%")
     
     return total_processed == 0 or total_successful > 0
+
 # === CLI INTERFACE ===
 def main():
     """Main CLI interface"""
@@ -683,21 +705,37 @@ Examples:
         return 0
     
     # Handle dry run
+
     if args.dry_run:
+
         logger.info("DRY RUN MODE - appointments will be processed but not sent to Keragon")
+
         # TODO: Implement dry run logic
+
         return 0
+
     
+
     # Run sync
+
     try:
+
         success = run_sync()
+
         return 0 if success else 1
+
     except KeyboardInterrupt:
+
         logger.info("Sync interrupted by user")
+
         return 130
+
     except Exception as e:
+
         logger.critical(f"Sync failed with unexpected error: {e}", exc_info=True)
+
         return 1
 
-if __name__ == "__main__":
+if name == "__main__":
+
     sys.exit(main())
