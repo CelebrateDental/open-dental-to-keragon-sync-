@@ -439,23 +439,28 @@ def send_appointment_to_keragon(appointment: AppointmentData, patient_data: Dict
     )
     return True
 
-def process_appointments_for_clinic(clinic_num: int, appointments: List[AppointmentData], since: datetime.datetime) -> Tuple[datetime.datetime, int, int]:
+def process_appointments_for_clinic(clinic_num: int, appointments: List[AppointmentData], since: datetime.datetime, is_first_run: bool = False) -> Tuple[datetime.datetime, int, int]:
     """Process appointments for a clinic and send to Keragon"""
     if not appointments:
         logger.info(f"No appointments to process for clinic {clinic_num}")
         return since, 0, 0
     
-    # Filter to new/modified appointments
-    new_appointments = [
-        apt for apt in appointments 
-        if apt.date_t_stamp and apt.date_t_stamp >= since
-    ]
+    # FIXED: Handle first run vs subsequent runs differently
+    if is_first_run:
+        # On first run, send ALL appointments regardless of when they were modified
+        new_appointments = appointments
+        logger.info(f"First run: Processing ALL {len(new_appointments)} appointments for clinic {clinic_num}")
+    else:
+        # On subsequent runs, only send new/modified appointments
+        new_appointments = [
+            apt for apt in appointments 
+            if apt.date_t_stamp and apt.date_t_stamp >= since
+        ]
+        logger.info(f"Subsequent run: Processing {len(new_appointments)} new/modified appointments since {since.isoformat()} for clinic {clinic_num}")
     
     if not new_appointments:
-        logger.info(f"No new appointments since {since.isoformat()} for clinic {clinic_num}")
+        logger.info(f"No appointments to process for clinic {clinic_num}")
         return since, 0, 0
-    
-    logger.info(f"Processing {len(new_appointments)} new/modified appointments for clinic {clinic_num}")
     
     # Track patient data to avoid duplicate fetches
     patient_cache = {}
@@ -486,8 +491,11 @@ def process_appointments_for_clinic(clinic_num: int, appointments: List[Appointm
             if send_appointment_to_keragon(appointment, patient_data):
                 success_count += 1
             
-            # Update max timestamp
-            if appointment.date_t_stamp > max_timestamp:
+            # Update max timestamp - FIXED: Handle first run case
+            if is_first_run:
+                # On first run, set timestamp to current time since we processed all existing appointments
+                max_timestamp = datetime.datetime.utcnow()
+            elif appointment.date_t_stamp and appointment.date_t_stamp > max_timestamp:
                 max_timestamp = appointment.date_t_stamp
         except Exception as e:
             logger.error(f"Failed to process appointment {appointment.apt_num}: {e}")
@@ -534,7 +542,7 @@ def run_sync() -> bool:
     # Detect if this is a first run for any clinic
     is_first_run = not os.path.exists(config.state_file)
     if is_first_run:
-        logger.info(f"First run detected - will fetch {config.first_run_lookahead_days} days ahead")
+        logger.info(f"First run detected - will fetch all appointments for the next {config.first_run_lookahead_days} days")
     
     total_processed = 0
     total_successful = 0
@@ -556,9 +564,9 @@ def run_sync() -> bool:
             # Fetch appointments
             appointments = fetch_appointments_for_clinic(clinic_num, since, is_first_run)
             
-            # Process appointments
+            # Process appointments - FIXED: Pass is_first_run flag
             new_timestamp, processed, successful = process_appointments_for_clinic(
-                clinic_num, appointments, since
+                clinic_num, appointments, since, is_first_run
             )
             
             # Update state
@@ -587,7 +595,6 @@ def run_sync() -> bool:
         logger.info(f"Success rate: {success_rate:.1f}%")
     
     return total_processed == 0 or total_successful > 0
-
 # === CLI INTERFACE ===
 def main():
     """Main CLI interface"""
