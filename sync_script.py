@@ -1,791 +1,694 @@
 #!/usr/bin/env python3
+"""
+Optimized OpenDental to Keragon Appointment Sync
+Fixes appointment timing issues and implements best practices
+"""
+
 import os
 import sys
 import json
 import logging
 import datetime
 import requests
-from zoneinfo import ZoneInfo
-from typing import List, Dict, Any, Optional
+import time
+from typing import List, Dict, Any, Optional, Set, Tuple
 from requests.exceptions import HTTPError, RequestException
+from collections import defaultdict
+from dataclasses import dataclass, asdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import re
 
 # === CONFIGURATION ===
-API_BASE_URL        = os.environ.get('OPEN_DENTAL_API_URL', 'https://api.opendental.com/api/v1')
-DEVELOPER_KEY       = os.environ.get('OPEN_DENTAL_DEVELOPER_KEY')
-CUSTOMER_KEY        = os.environ.get('OPEN_DENTAL_CUSTOMER_KEY')
-KERAGON_WEBHOOK_URL = os.environ.get('KERAGON_WEBHOOK_URL')
+@dataclass
+class Config:
+    api_base_url: str = os.environ.get('OPEN_DENTAL_API_URL', 'https://api.opendental.com/api/v1')
+    developer_key: str = os.environ.get('OPEN_DENTAL_DEVELOPER_KEY', '')
+    customer_key: str = os.environ.get('OPEN_DENTAL_CUSTOMER_KEY', '')
+    keragon_webhook_url: str = os.environ.get('KERAGON_WEBHOOK_URL', '')
+    state_file: str = 'last_sync_state.json'
+    log_level: str = os.environ.get('LOG_LEVEL', 'INFO')
+    overlap_minutes: int = int(os.environ.get('OVERLAP_MINUTES', '5'))
+    lookahead_hours: int = int(os.environ.get('LOOKAHEAD_HOURS', '24'))
+    first_run_lookahead_days: int = int(os.environ.get('FIRST_RUN_LOOKAHEAD_DAYS', '30'))
+    max_workers: int = int(os.environ.get('MAX_WORKERS', '5'))
+    request_timeout: int = int(os.environ.get('REQUEST_TIMEOUT', '30'))
+    retry_attempts: int = int(os.environ.get('RETRY_ATTEMPTS', '3'))
 
-STATE_FILE = 'last_sync_state.json'
-LOG_LEVEL           = os.environ.get('LOG_LEVEL', 'INFO')
-OVERLAP_MINUTES     = int(os.environ.get('OVERLAP_MINUTES', '5'))
-LOOKAHEAD_HOURS     = int(os.environ.get('LOOKAHEAD_HOURS', '720'))
+    def __post_init__(self):
+        # Parse clinic numbers
+        clinic_nums_str = os.environ.get('CLINIC_NUMS', '')
+        self.clinic_nums = [
+            int(x) for x in clinic_nums_str.split(',') if x.strip().isdigit()
+        ]
+        
+        # Parse operatory filters
+        self.clinic_operatory_filters: Dict[int, List[int]] = {
+            9034: [11579, 11580],
+            9035: [11574, 11576, 11577],
+        }
 
-CLINIC_NUMS = [
-   int(x) for x in os.environ.get('CLINIC_NUMS', '').split(',')
-   if x.strip().isdigit()
-]
+@dataclass
+class AppointmentData:
+    """Structured appointment data"""
+    apt_num: int
+    pat_num: int
+    clinic_num: int
+    operatory_num: int
+    apt_date_time: datetime.datetime
+    apt_end_time: datetime.datetime  # Calculated field
+    pattern: str
+    apt_status: str
+    date_t_stamp: datetime.datetime
+    provider_abbr: str = ''
+    note: str = ''
 
-CLINIC_OPERATORY_FILTERS: Dict[int, List[int]] = {
-   9034: [11579, 11580, 11588],
-   9035: [11574, 11576, 11577],
-}
+    @classmethod
+    def from_api_response(cls, data: Dict[str, Any]) -> 'AppointmentData':
+        """Create AppointmentData from API response with proper time calculations"""
+        apt_datetime = parse_datetime(data.get('AptDateTime'))
+        pattern = data.get('Pattern', '')
+        
+        # Calculate end time based on pattern
+        duration_minutes = calculate_appointment_duration(pattern)
+        apt_end_time = apt_datetime + datetime.timedelta(minutes=duration_minutes) if apt_datetime else None
+        
+        return cls(
+            apt_num=int(data.get('AptNum', 0)),
+            pat_num=int(data.get('PatNum', 0)),
+            clinic_num=int(data.get('ClinicNum', 0)),
+            operatory_num=int(data.get('Op', 0)),
+            apt_date_time=apt_datetime,
+            apt_end_time=apt_end_time,
+            pattern=pattern,
+            apt_status=data.get('AptStatus', ''),
+            date_t_stamp=parse_datetime(data.get('DateTStamp')),
+            provider_abbr=data.get('provAbbr', ''),
+            note=data.get('Note', '')
+        )
 
-# Valid appointment statuses to sync
-VALID_STATUSES = {'Scheduled', 'Complete', 'Broken'}
+# === GLOBAL CONFIG ===
+config = Config()
 
-logging.basicConfig(
-   level=getattr(logging, LOG_LEVEL),
-   format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-   handlers=[logging.StreamHandler(sys.stdout)]
-)
-logger = logging.getLogger('opendental_sync')
+# === LOGGER SETUP ===
+def setup_logging():
+    """Setup structured logging"""
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - [%(funcName)s:%(lineno)d] - %(message)s'
+    )
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(formatter)
+    
+    logger = logging.getLogger('opendental_sync')
+    logger.setLevel(getattr(logging, config.log_level))
+    logger.addHandler(handler)
+    
+    # Suppress noisy libraries
+    logging.getLogger('urllib3').setLevel(logging.WARNING)
+    logging.getLogger('requests').setLevel(logging.WARNING)
+    
+    return logger
 
-# Global cache for time increment
-_cached_time_increment = None
+logger = setup_logging()
 
+# === UTILITY FUNCTIONS ===
+def parse_datetime(dt_str: Optional[str]) -> Optional[datetime.datetime]:
+    """Parse datetime string with multiple format support"""
+    if not dt_str:
+        return None
+    
+    formats = [
+        "%Y-%m-%dT%H:%M:%S.%f",  # ISO with microseconds
+        "%Y-%m-%dT%H:%M:%S",     # ISO without microseconds
+        "%Y-%m-%d %H:%M:%S.%f",  # Space separated with microseconds
+        "%Y-%m-%d %H:%M:%S",     # Space separated without microseconds
+        "%Y-%m-%d",              # Date only
+        "%m/%d/%Y %H:%M:%S",     # US format
+        "%m/%d/%Y"               # US date only
+    ]
+    
+    for fmt in formats:
+        try:
+            return datetime.datetime.strptime(dt_str, fmt)
+        except ValueError:
+            continue
+    
+    logger.warning(f"Unable to parse datetime: {dt_str}")
+    return None
 
-def load_last_sync_state() -> Dict[int, Dict[str, Any]]:
-   """Load the last sync state from file"""
-   if os.path.exists(STATE_FILE):
-       try:
-           with open(STATE_FILE, 'r') as f:
-               data = json.load(f)
-           result: Dict[int, Dict[str, Any]] = {}
-           for k, v in data.items():
-               cnum = int(k)
-               last_sync_str = v.get('lastSync')
-               did_full = v.get('didFullFetch', False)
-               last_sync_dt = datetime.datetime.fromisoformat(last_sync_str) if last_sync_str else None
-               result[cnum] = {'lastSync': last_sync_dt, 'didFullFetch': bool(did_full)}
-           for c in CLINIC_NUMS:
-               if c not in result:
-                   result[c] = {'lastSync': None, 'didFullFetch': False}
-           return result
-       except Exception as e:
-           logger.error(f"Error reading state file: {e}")
-   return {c: {'lastSync': None, 'didFullFetch': False} for c in CLINIC_NUMS}
-
-
-def save_last_sync_state(state: Dict[int, Dict[str, Any]]) -> None:
-   """Save the sync state to file"""
-   try:
-       serial: Dict[str, Any] = {}
-       for k, v in state.items():
-           last_str = v['lastSync'].isoformat() if v['lastSync'] else None
-           serial[str(k)] = {'lastSync': last_str, 'didFullFetch': v['didFullFetch']}
-       with open(STATE_FILE, 'w') as f:
-           json.dump(serial, f, indent=2)
-   except Exception as e:
-       logger.error(f"Error saving state file: {e}")
-
+def calculate_appointment_duration(pattern: str) -> int:
+    """
+    Calculate appointment duration in minutes from OpenDental pattern.
+    OpenDental patterns use 'X' for scheduled time slots (typically 10-15 minute increments).
+    """
+    if not pattern:
+        return 60  # Default 1 hour if no pattern
+    
+    # Count 'X' characters in pattern - each typically represents 10 minutes
+    # But this can vary by practice configuration
+    x_count = pattern.count('X')
+    if x_count == 0:
+        return 60  # Default if no X's found
+    
+    # Most practices use 10-minute increments, but some use 15
+    # You may need to adjust this based on your practice configuration
+    minutes_per_x = 10  # Adjust this value based on your OpenDental setup
+    duration = x_count * minutes_per_x
+    
+    # Reasonable bounds checking
+    if duration < 15:
+        duration = 15  # Minimum 15 minutes
+    elif duration > 480:  # 8 hours
+        duration = 480  # Maximum 8 hours
+    
+    logger.debug(f"Pattern '{pattern}' -> {x_count} X's -> {duration} minutes")
+    return duration
 
 def make_auth_header() -> Dict[str, str]:
-   """Create authentication header for API requests"""
-   return {'Authorization': f'ODFHIR {DEVELOPER_KEY}/{CUSTOMER_KEY}', 'Content-Type': 'application/json'}
+    """Create authentication header"""
+    return {
+        'Authorization': f'ODFHIR {config.developer_key}/{config.customer_key}',
+        'Content-Type': 'application/json',
+        'User-Agent': 'OpenDental-Keragon-Sync/1.0'
+    }
 
+def retry_request(func, max_attempts: int = None, backoff_factor: float = 1.5):
+    """Retry decorator for API requests"""
+    max_attempts = max_attempts or config.retry_attempts
+    
+    def wrapper(*args, **kwargs):
+        last_exception = None
+        for attempt in range(max_attempts):
+            try:
+                return func(*args, **kwargs)
+            except (HTTPError, RequestException) as e:
+                last_exception = e
+                if attempt < max_attempts - 1:
+                    wait_time = backoff_factor ** attempt
+                    logger.warning(f"Request failed (attempt {attempt + 1}/{max_attempts}), retrying in {wait_time}s: {e}")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"Request failed after {max_attempts} attempts: {e}")
+        raise last_exception
+    return wrapper
 
-def parse_time(ts: Optional[str]) -> Optional[datetime.datetime]:
-   """Parse time string into datetime object"""
-   if not ts:
-       return None
-   for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-       try:
-           return datetime.datetime.strptime(ts, fmt)
-       except ValueError:
-           continue
-   logger.warning(f"Unrecognized time format: {ts}")
-   return None
+# === STATE MANAGEMENT ===
+def load_last_sync_state() -> Dict[int, datetime.datetime]:
+    """Load last sync state from file"""
+    if not os.path.exists(config.state_file):
+        logger.info("No state file found, using 24-hour lookback for first run")
+        cutoff = datetime.datetime.utcnow() - datetime.timedelta(hours=24)
+        return {clinic: cutoff for clinic in config.clinic_nums}
+    
+    try:
+        with open(config.state_file, 'r') as f:
+            data = json.load(f)
+        
+        state = {}
+        for k, v in data.items():
+            try:
+                state[int(k)] = datetime.datetime.fromisoformat(v)
+            except (ValueError, TypeError) as e:
+                logger.warning(f"Invalid state entry for clinic {k}: {e}")
+                state[int(k)] = datetime.datetime.utcnow() - datetime.timedelta(hours=24)
+        
+        logger.info(f"Loaded sync state for {len(state)} clinics")
+        return state
+    except Exception as e:
+        logger.error(f"Error reading state file: {e}, using fallback")
+        cutoff = datetime.datetime.utcnow() - datetime.timedelta(hours=24)
+        return {clinic: cutoff for clinic in config.clinic_nums}
 
+def save_last_sync_state(state: Dict[int, datetime.datetime]) -> None:
+    """Save last sync state to file"""
+    try:
+        # Create backup of existing state
+        if os.path.exists(config.state_file):
+            backup_file = f"{config.state_file}.backup"
+            os.rename(config.state_file, backup_file)
+        
+        serialized = {str(k): v.isoformat() for k, v in state.items()}
+        
+        # Write to temporary file first, then rename (atomic write)
+        temp_file = f"{config.state_file}.tmp"
+        with open(temp_file, 'w') as f:
+            json.dump(serialized, f, indent=2)
+        os.rename(temp_file, config.state_file)
+        
+        logger.debug(f"Saved sync state for {len(state)} clinics")
+    except Exception as e:
+        logger.error(f"Error saving state file: {e}")
 
-def convert_to_timezone_aware(dt: datetime.datetime, timezone_str: str = "America/Chicago") -> datetime.datetime:
-   """Convert naive datetime to timezone-aware datetime"""
-   if dt is None:
-       return None
-   
-   if dt.tzinfo is not None:
-       # Already timezone aware, convert to target timezone
-       return dt.astimezone(ZoneInfo(timezone_str))
-   
-   # Assume the naive datetime is in the target timezone
-   target_tz = ZoneInfo(timezone_str)
-   return dt.replace(tzinfo=target_tz)
+# === API OPERATIONS ===
+@retry_request
+def fetch_operatories_for_clinic(clinic_num: int) -> List[Dict[str, Any]]:
+    """Fetch operatories for a clinic"""
+    endpoint = f"{config.api_base_url}/operatories"
+    headers = make_auth_header()
+    
+    response = requests.get(
+        endpoint,
+        headers=headers,
+        params={'ClinicNum': clinic_num},
+        timeout=config.request_timeout
+    )
+    response.raise_for_status()
+    
+    operatories = response.json()
+    logger.info(f"Found {len(operatories)} operatories for clinic {clinic_num}")
+    for op in operatories:
+        logger.debug(f"  Op {op.get('OperatoryNum')}: {op.get('OpName', 'Unnamed')}")
+    
+    return operatories
 
+@retry_request
+def fetch_appointments_batch(clinic_num: int, date_start: str, date_end: str, status: str, operatory_num: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Fetch a batch of appointments"""
+    endpoint = f"{config.api_base_url}/appointments"
+    headers = make_auth_header()
+    
+    params = {
+        'dateStart': date_start,
+        'dateEnd': date_end,
+        'ClinicNum': clinic_num,
+        'AptStatus': status,
+        'Limit': 100
+    }
+    
+    if operatory_num:
+        params['Op'] = operatory_num
+    
+    response = requests.get(endpoint, headers=headers, params=params, timeout=config.request_timeout)
+    response.raise_for_status()
+    
+    data = response.json()
+    appointments = data if isinstance(data, list) else []
+    
+    # Ensure operatory number is set
+    for apt in appointments:
+        if operatory_num and 'Op' not in apt:
+            apt['Op'] = operatory_num
+    
+    return appointments
 
-def get_appointment_time_increment() -> int:
-   """
-   Fetch the actual time increment setting from Open Dental.
-   This is usually stored in preferences or module settings.
-   """
-   # Try multiple endpoints that might contain the time increment setting
-   endpoints_to_try = [
-       f"{API_BASE_URL}/preferences/ApptTimeIncrement",
-       f"{API_BASE_URL}/preferences",
-       f"{API_BASE_URL}/modules/appointments/settings",
-       f"{API_BASE_URL}/settings/appointments"
-   ]
-   
-   headers = make_auth_header()
-   
-   for endpoint in endpoints_to_try:
-       try:
-           resp = requests.get(endpoint, headers=headers, timeout=15)
-           if resp.status_code == 200:
-               data = resp.json()
-               
-               # Look for time increment in various possible field names
-               time_increment_fields = [
-                   'ApptTimeIncrement',
-                   'TimeIncrement',
-                   'AppointmentTimeIncrement',
-                   'MinutesPerIncrement',
-                   'SlotDuration',
-                   'TimeSlotMinutes'
-               ]
-               
-               if isinstance(data, dict):
-                   for field in time_increment_fields:
-                       if field in data and data[field]:
-                           increment = int(data[field])
-                           logger.info(f"Found time increment setting: {increment} minutes")
-                           return increment
-                           
-               elif isinstance(data, list):
-                   for item in data:
-                       if isinstance(item, dict):
-                           for field in time_increment_fields:
-                               if field in item and item[field]:
-                                   increment = int(item[field])
-                                   logger.info(f"Found time increment setting: {increment} minutes")
-                                   return increment
-                                   
-       except Exception as e:
-           logger.debug(f"Failed to fetch from {endpoint}: {e}")
-           continue
-   
-   # If we can't find the setting, try to detect it from existing appointments
-   logger.warning("Could not fetch time increment from API, attempting to detect from appointment patterns")
-   return detect_time_increment_from_appointments()
+def fetch_appointments_for_clinic(clinic_num: int, since: datetime.datetime, is_first_run: bool = False) -> List[AppointmentData]:
+    """Fetch all relevant appointments for a clinic"""
+    now = datetime.datetime.utcnow()
+    
+    # MODIFIED: Always fetch appointments for the next 30 days from today
+    date_start = now.strftime("%Y-%m-%d")
+    date_end = (now + datetime.timedelta(days=30)).strftime("%Y-%m-%d")
+    
+    logger.info(f"Fetching appointments for clinic {clinic_num} for the next 30 days")
+    logger.info(f"Date range: {date_start} to {date_end}")
+    
+    statuses = ['Scheduled', 'Complete', 'Broken']
+    filtered_ops = config.clinic_operatory_filters.get(clinic_num, [])
+    all_appointments = []
+    
+    # Fetch appointments
+    if filtered_ops:
+        logger.info(f"Filtering to operatories: {filtered_ops}")
+        for op_num in filtered_ops:
+            for status in statuses:
+                try:
+                    batch = fetch_appointments_batch(clinic_num, date_start, date_end, status, op_num)
+                    all_appointments.extend(batch)
+                    logger.debug(f"Fetched {len(batch)} {status} appointments for operatory {op_num}")
+                except Exception as e:
+                    logger.error(f"Failed to fetch {status} appointments for operatory {op_num}: {e}")
+    else:
+        logger.info("No operatory filter, fetching all appointments")
+        for status in statuses:
+            try:
+                batch = fetch_appointments_batch(clinic_num, date_start, date_end, status)
+                all_appointments.extend(batch)
+                logger.debug(f"Fetched {len(batch)} {status} appointments")
+            except Exception as e:
+                logger.error(f"Failed to fetch {status} appointments: {e}")
+    
+    # Convert to structured data and filter
+    structured_appointments = []
+    for apt_data in all_appointments:
+        try:
+            apt = AppointmentData.from_api_response(apt_data)
+            
+            # Apply operatory filter if needed
+            if filtered_ops and apt.operatory_num not in filtered_ops:
+                continue
+            
+            structured_appointments.append(apt)
+        except Exception as e:
+            logger.warning(f"Failed to parse appointment {apt_data.get('AptNum', 'unknown')}: {e}")
+    
+    logger.info(f"Parsed {len(structured_appointments)} valid appointments for clinic {clinic_num}")
+    return structured_appointments
 
+@retry_request
+def fetch_patient_details(patient_num: int) -> Dict[str, Any]:
+    """Fetch detailed patient information"""
+    if not patient_num:
+        return {}
+    
+    # Try primary endpoint first
+    endpoint = f"{config.api_base_url}/patients/{patient_num}"
+    headers = make_auth_header()
+    
+    try:
+        response = requests.get(endpoint, headers=headers, timeout=config.request_timeout)
+        response.raise_for_status()
+        return response.json()
+    except Exception:
+        logger.debug(f"Primary patient fetch failed for {patient_num}, trying fallback")
+    
+    # Fallback to search endpoint
+    try:
+        response = requests.get(
+            f"{config.api_base_url}/patients",
+            headers=headers,
+            params={'PatNum': patient_num},
+            timeout=config.request_timeout
+        )
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, list) and data:
+            return data[0]
+        elif isinstance(data, dict):
+            return data
+    except Exception as e:
+        logger.error(f"All patient fetch attempts failed for {patient_num}: {e}")
+    
+    return {}
 
-def detect_time_increment_from_appointments() -> int:
-   """
-   Analyze existing appointments to detect the most likely time increment.
-   """
-   try:
-       # Fetch a sample of recent appointments
-       endpoint = f"{API_BASE_URL}/appointments"
-       headers = make_auth_header()
-       now = datetime.datetime.utcnow()
-       params = {
-           'dateStart': (now - datetime.timedelta(days=7)).strftime("%Y-%m-%d"),
-           'dateEnd': now.strftime("%Y-%m-%d"),
-           'limit': 50  # Sample size
-       }
-       
-       resp = requests.get(endpoint, headers=headers, params=params, timeout=30)
-       resp.raise_for_status()
-       appointments = resp.json()
-       
-       if not appointments:
-           logger.warning("No appointments found for time increment detection")
-           return 15  # Default fallback
-       
-       # Analyze patterns to detect increment
-       pattern_lengths = []
-       for appt in appointments:
-           pattern = appt.get('Pattern', '')
-           if pattern and 'X' in pattern.upper():
-               x_count = pattern.upper().count('X')
-               if x_count > 0:
-                   pattern_lengths.append(x_count)
-       
-       if pattern_lengths:
-           # Most appointments are likely 1-4 time slots
-           # Try both 10 and 15 minute increments and see which makes more sense
-           avg_slots = sum(pattern_lengths) / len(pattern_lengths)
-           
-           # If average is around 3-6 slots, likely 15-minute increments
-           # If average is around 4-9 slots, likely 10-minute increments
-           if avg_slots <= 4:
-               detected_increment = 15
-           else:
-               detected_increment = 10
-               
-           logger.info(f"Detected time increment: {detected_increment} minutes (based on {len(pattern_lengths)} appointment patterns)")
-           return detected_increment
-           
-   except Exception as e:
-       logger.error(f"Failed to detect time increment from appointments: {e}")
-   
-   # Final fallback - 15 minutes is more common in modern dental practices
-   logger.warning("Using default time increment: 15 minutes")
-   return 15
+# === KERAGON INTEGRATION ===
+@retry_request
+def send_appointment_to_keragon(appointment: AppointmentData, patient_data: Dict[str, Any]) -> bool:
+    """Send appointment to Keragon with proper timing"""
+    # Build comprehensive payload
+    payload = {
+        # Patient info
+        'firstName': patient_data.get('FName', ''),
+        'lastName': patient_data.get('LName', ''),
+        'email': patient_data.get('Email', ''),
+        'phone': (
+            patient_data.get('HmPhone') or 
+            patient_data.get('WkPhone') or 
+            patient_data.get('WirelessPhone') or 
+            ''
+        ),
+        'birthdate': patient_data.get('Birthdate', ''),
+        'gender': patient_data.get('Gender', ''),
+        'patientId': str(appointment.pat_num),
+        
+        # Address info
+        'address': patient_data.get('Address', ''),
+        'address2': patient_data.get('Address2', ''),
+        'city': patient_data.get('City', ''),
+        'state': patient_data.get('State', ''),
+        'zipCode': patient_data.get('Zip', ''),
+        
+        # Appointment info - KEY FIXES HERE
+        'appointmentId': str(appointment.apt_num),
+        'appointmentTime': appointment.apt_date_time.isoformat() if appointment.apt_date_time else '',
+        'appointmentEndTime': appointment.apt_end_time.isoformat() if appointment.apt_end_time else '',  # NEW FIELD
+        'appointmentDurationMinutes': calculate_appointment_duration(appointment.pattern),  # EXPLICIT DURATION
+        'locationId': str(appointment.clinic_num),
+        'calendarId': str(appointment.operatory_num),
+        'status': appointment.apt_status,
+        'providerName': appointment.provider_abbr,
+        'appointmentLength': appointment.pattern,  # Keep original pattern too
+        'notes': appointment.note,
+        
+        # Clinic info
+        'clinicName': patient_data.get('ClinicName', ''),
+        'balanceTotal': patient_data.get('BalTotal', 0.0),
+        
+        # Metadata
+        'syncTimestamp': datetime.datetime.utcnow().isoformat(),
+        'lastModified': appointment.date_t_stamp.isoformat() if appointment.date_t_stamp else ''
+    }
+    
+    # Clean up empty values
+    payload = {k: v for k, v in payload.items() if v not in [None, '', 0]}
+    
+    response = requests.post(
+        config.keragon_webhook_url,
+        json=payload,
+        timeout=config.request_timeout,
+        headers={'Content-Type': 'application/json'}
+    )
+    response.raise_for_status()
+    
+    logger.info(
+        f"✓ Sent to Keragon: {payload.get('firstName', '')} {payload.get('lastName', '')} "
+        f"- {payload.get('appointmentTime', '')} to {payload.get('appointmentEndTime', '')} "
+        f"(Op {appointment.operatory_num})"
+    )
+    return True
 
+def process_appointments_for_clinic(clinic_num: int, appointments: List[AppointmentData], since: datetime.datetime) -> Tuple[datetime.datetime, int, int]:
+    """Process appointments for a clinic and send to Keragon"""
+    if not appointments:
+        logger.info(f"No appointments to process for clinic {clinic_num}")
+        return since, 0, 0
+    
+    # Filter to new/modified appointments
+    new_appointments = [
+        apt for apt in appointments 
+        if apt.date_t_stamp and apt.date_t_stamp >= since
+    ]
+    
+    if not new_appointments:
+        logger.info(f"No new appointments since {since.isoformat()} for clinic {clinic_num}")
+        return since, 0, 0
+    
+    logger.info(f"Processing {len(new_appointments)} new/modified appointments for clinic {clinic_num}")
+    
+    # Track patient data to avoid duplicate fetches
+    patient_cache = {}
+    success_count = 0
+    max_timestamp = since
+    
+    # Process appointments with threading for patient data fetches
+    with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
+        # Submit patient fetch tasks
+        patient_futures = {}
+        for apt in new_appointments:
+            if apt.pat_num not in patient_cache and apt.pat_num not in patient_futures:
+                future = executor.submit(fetch_patient_details, apt.pat_num)
+                patient_futures[apt.pat_num] = future
+        
+        # Collect patient data
+        for pat_num, future in patient_futures.items():
+            try:
+                patient_cache[pat_num] = future.result()
+            except Exception as e:
+                logger.error(f"Failed to fetch patient {pat_num}: {e}")
+                patient_cache[pat_num] = {}
+    
+    # Send appointments to Keragon
+    for appointment in new_appointments:
+        try:
+            patient_data = patient_cache.get(appointment.pat_num, {})
+            if send_appointment_to_keragon(appointment, patient_data):
+                success_count += 1
+            
+            # Update max timestamp
+            if appointment.date_t_stamp > max_timestamp:
+                max_timestamp = appointment.date_t_stamp
+        except Exception as e:
+            logger.error(f"Failed to process appointment {appointment.apt_num}: {e}")
+    
+    logger.info(f"Clinic {clinic_num}: Successfully processed {success_count}/{len(new_appointments)} appointments")
+    
+    # Return the latest timestamp, bounded by current time
+    return min(max_timestamp, datetime.datetime.utcnow()), len(new_appointments), success_count
 
-def get_cached_time_increment() -> int:
-   """Get the time increment with caching"""
-   global _cached_time_increment
-   if _cached_time_increment is None:
-       _cached_time_increment = get_appointment_time_increment()
-   return _cached_time_increment
+# === MAIN SYNC LOGIC ===
+def validate_configuration() -> bool:
+    """Validate configuration before running sync"""
+    errors = []
+    
+    if not config.developer_key:
+        errors.append("OPEN_DENTAL_DEVELOPER_KEY not set")
+    if not config.customer_key:
+        errors.append("OPEN_DENTAL_CUSTOMER_KEY not set")
+    if not config.keragon_webhook_url:
+        errors.append("KERAGON_WEBHOOK_URL not set")
+    if not config.clinic_nums:
+        errors.append("CLINIC_NUMS not set or invalid")
+    
+    if errors:
+        for error in errors:
+            logger.critical(error)
+        return False
+    
+    logger.info(f"Configuration valid. Syncing {len(config.clinic_nums)} clinics: {config.clinic_nums}")
+    return True
 
+def run_sync() -> bool:
+    """Run the main synchronization process"""
+    if not validate_configuration():
+        return False
+    
+    logger.info("=== Starting OpenDental → Keragon Sync ===")
+    start_time = datetime.datetime.utcnow()
+    
+    # Load previous sync state
+    last_state = load_last_sync_state()
+    new_state = last_state.copy()
+    
+    # Detect if this is a first run for any clinic
+    is_first_run = not os.path.exists(config.state_file)
+    if is_first_run:
+        logger.info(f"First run detected - will fetch {config.first_run_lookahead_days} days ahead")
+    
+    total_processed = 0
+    total_successful = 0
+    
+    for clinic_num in config.clinic_nums:
+        try:
+            logger.info(f"\n--- Processing Clinic {clinic_num} ---")
+            
+            # Get last sync time for this clinic
+            since = last_state.get(clinic_num, datetime.datetime.utcnow() - datetime.timedelta(hours=24))
+            logger.info(f"Last sync: {since.isoformat()}")
+            
+            # Fetch and verify operatories
+            try:
+                fetch_operatories_for_clinic(clinic_num)
+            except Exception as e:
+                logger.warning(f"Could not fetch operatories for clinic {clinic_num}: {e}")
+            
+            # Fetch appointments
+            appointments = fetch_appointments_for_clinic(clinic_num, since, is_first_run)
+            
+            # Process appointments
+            new_timestamp, processed, successful = process_appointments_for_clinic(
+                clinic_num, appointments, since
+            )
+            
+            # Update state
+            new_state[clinic_num] = new_timestamp
+            total_processed += processed
+            total_successful += successful
+            
+            logger.info(f"Clinic {clinic_num} complete. New sync timestamp: {new_timestamp.isoformat()}")
+            
+        except Exception as e:
+            logger.error(f"Failed to process clinic {clinic_num}: {e}")
+            # Don't update timestamp for failed clinics
+    
+    # Save updated state
+    save_last_sync_state(new_state)
+    
+    # Summary
+    duration = datetime.datetime.utcnow() - start_time
+    logger.info(f"\n=== Sync Complete ===")
+    logger.info(f"Duration: {duration}")
+    logger.info(f"Total appointments processed: {total_processed}")
+    logger.info(f"Successfully sent to Keragon: {total_successful}")
+    
+    if total_processed > 0:
+        success_rate = (total_successful / total_processed) * 100
+        logger.info(f"Success rate: {success_rate:.1f}%")
+    
+    return total_processed == 0 or total_successful > 0
 
-def calculate_pattern_duration(pattern: str, pattern_secondary: str = None, minutes_per_slot: int = None) -> int:
-   """
-   Calculate appointment duration from pattern strings.
-   In OpenDental, each character in the pattern represents a time slot.
-   'X' means the appointment occupies that slot.
-   Returns duration in minutes.
-   """
-   if not pattern:
-       return 0
-   
-   # Get the actual time increment if not provided
-   if minutes_per_slot is None:
-       minutes_per_slot = get_cached_time_increment()
-   
-   # Count all X characters in primary pattern
-   x_count = pattern.upper().count('X')
-   
-   # Add X characters from secondary pattern if it exists
-   if pattern_secondary:
-       x_count += pattern_secondary.upper().count('X')
-   
-   # If no X found, this might be a different pattern format
-   if x_count == 0:
-       logger.warning(f"No 'X' characters found in pattern '{pattern}' + '{pattern_secondary or ''}' - using total length")
-       total_length = len(pattern)
-       if pattern_secondary:
-           total_length += len(pattern_secondary)
-       return total_length * minutes_per_slot
-   
-   # Each X represents one time slot
-   duration_minutes = x_count * minutes_per_slot
-   
-   logger.debug(f"Pattern '{pattern}' + '{pattern_secondary or ''}' has {x_count} X chars × {minutes_per_slot} min/slot = {duration_minutes} minutes")
-   return duration_minutes
-
-
-def get_appointment_duration_from_api(appt_id: str) -> Optional[int]:
-   """Fetch full appointment details to get accurate duration"""
-   if not appt_id:
-       return None
-   
-   endpoint = f"{API_BASE_URL}/appointments/{appt_id}"
-   headers = make_auth_header()
-   
-   try:
-       resp = requests.get(endpoint, headers=headers, timeout=15)
-       resp.raise_for_status()
-       appt_detail = resp.json()
-       
-       # Try to get duration from various fields (in order of preference)
-       duration_sources = [
-           'Length',           # Total length in minutes
-           'Minutes',          # Duration in minutes  
-           'PatternLength',    # Pattern-based length
-           'TotalTime',        # Total time
-           'LengthTime'        # Sometimes used for appointment length
-       ]
-       
-       for field in duration_sources:
-           if field in appt_detail and appt_detail[field]:
-               try:
-                   duration = int(appt_detail[field])
-                   if duration > 0:
-                       logger.debug(f"Got duration from API field '{field}': {duration} minutes for appointment {appt_id}")
-                       return duration
-               except (ValueError, TypeError):
-                   continue
-       
-       # Try to calculate from start/end times if available
-       start_time = appt_detail.get('AptDateTime')
-       end_time = appt_detail.get('AptDateTimeEnd') or appt_detail.get('EndTime')
-       
-       if start_time and end_time:
-           start_dt = parse_time(start_time)
-           end_dt = parse_time(end_time)
-           if start_dt and end_dt:
-               duration = int((end_dt - start_dt).total_seconds() / 60)
-               if duration > 0:
-                   logger.debug(f"Calculated duration from start/end times: {duration} minutes for appointment {appt_id}")
-                   return duration
-       
-       # Use pattern calculation as last resort with correct time increment
-       pattern = appt_detail.get('Pattern', '')
-       pattern_secondary = appt_detail.get('PatternSecondary', '')
-       
-       if pattern:
-           time_increment = get_cached_time_increment()
-           duration = calculate_pattern_duration(pattern, pattern_secondary, time_increment)
-           logger.debug(f"Calculated duration from patterns for appointment {appt_id}: '{pattern}' + '{pattern_secondary}' = {duration} minutes with {time_increment} min/slot")
-           return duration
-           
-       logger.warning(f"No duration source found for appointment {appt_id}")
-           
-   except Exception as e:
-       logger.warning(f"Could not fetch detailed appointment data for {appt_id}: {e}")
-   
-   return None
-
-
-def calculate_end_time(start_dt: datetime.datetime, pattern: str, appt_data: Dict[str, Any] = None) -> Optional[datetime.datetime]:
-   """Calculate end time with improved duration detection and debugging"""
-   if not start_dt:
-       return None
-   
-   duration_minutes = 0
-   appt_id = appt_data.get('AptNum') if appt_data else None
-   duration_source = "unknown"
-   
-   logger.debug(f"Calculating end time for appointment {appt_id}: start={start_dt.isoformat()}")
-   
-   # Method 1: Try to get accurate duration from API
-   if appt_id:
-       api_duration = get_appointment_duration_from_api(str(appt_id))
-       if api_duration and api_duration > 0:
-           duration_minutes = api_duration
-           duration_source = "API"
-           logger.debug(f"Using API duration: {duration_minutes} minutes")
-   
-   # Method 2: Check local appointment data for duration fields
-   if duration_minutes <= 0 and appt_data:
-       duration_sources = ['Length', 'Minutes', 'PatternLength', 'TotalTime']
-       for field in duration_sources:
-           if field in appt_data and appt_data[field]:
-               try:
-                   duration_minutes = int(appt_data[field])
-                   if duration_minutes > 0:
-                       duration_source = f"local field '{field}'"
-                       logger.debug(f"Using local field '{field}': {duration_minutes} minutes")
-                       break
-               except (ValueError, TypeError):
-                   continue
-   
-   # Method 3: Try direct end time calculation
-   if duration_minutes <= 0 and appt_data:
-       raw_end = appt_data.get('AptDateTimeEnd') or appt_data.get('EndTime')
-       if raw_end:
-           end_dt = parse_time(raw_end)
-           if end_dt:
-               end_aware = convert_to_timezone_aware(end_dt, "America/Chicago")
-               calculated_duration = int((end_aware - start_dt).total_seconds() / 60)
-               if calculated_duration > 0:
-                   duration_source = "direct end time"
-                   logger.debug(f"Using direct end time: {end_aware.isoformat()} (duration: {calculated_duration} min)")
-                   return end_aware
-   
-   # Method 4: Calculate from patterns with correct time increment
-   if duration_minutes <= 0:
-       pattern_secondary = appt_data.get('PatternSecondary', '') if appt_data else ''
-       time_increment = get_cached_time_increment()
-       duration_minutes = calculate_pattern_duration(pattern, pattern_secondary, time_increment)
-       if duration_minutes > 0:
-           duration_source = f"pattern calculation ({time_increment} min/slot)"
-           logger.debug(f"Using pattern calculation: {duration_minutes} minutes with {time_increment} min/slot")
-   
-   # Default fallback
-   if duration_minutes <= 0:
-       duration_minutes = 60  # Default to 1 hour
-       duration_source = "default fallback"
-       logger.warning(f"No duration found, defaulting to {duration_minutes} minutes")
-   
-   # Add duration to the timezone-aware datetime
-   end_dt = start_dt + datetime.timedelta(minutes=duration_minutes)
-   
-   # Enhanced logging with duration source
-   logger.info(f"Appointment {appt_id}: {start_dt.strftime('%H:%M')} → {end_dt.strftime('%H:%M')} ({duration_minutes} min from {duration_source})")
-   logger.debug(f"Final calculated end time: {end_dt.isoformat()} (added {duration_minutes} min from {duration_source})")
-   
-   return end_dt
-
-
-def list_operatories_for_clinic(clinic: int) -> List[Dict[str, Any]]:
-   """List all operatories for a given clinic"""
-   endpoint = f"{API_BASE_URL}/operatories"
-   headers = make_auth_header()
-   try:
-       resp = requests.get(endpoint, headers=headers, params={'ClinicNum': clinic}, timeout=15)
-       resp.raise_for_status()
-       ops = resp.json()
-       logger.info(f"Operatories for clinic {clinic}:")
-       for o in ops:
-           logger.info(f"  OperatoryNum={o.get('OperatoryNum')} | OpName={o.get('OpName','')}")
-       return ops
-   except Exception as e:
-       logger.error(f"Failed to list operatories for clinic {clinic}: {e}")
-       return []
-
-
-def get_filtered_operatories_for_clinic(clinic: int) -> List[int]:
-   """Get filtered operatories for a clinic"""
-   filt = CLINIC_OPERATORY_FILTERS.get(clinic, [])
-   if filt:
-       logger.info(f"Clinic {clinic}: filtering to ops {filt}")
-   else:
-       logger.info(f"Clinic {clinic}: no operatory filter, will fetch all")
-   return filt
-
-
-def get_patient_name_for_logging(appt: Dict[str, Any]) -> str:
-   """Get patient name for logging, trying multiple sources"""
-   # Try to get name from appointment data first
-   fname = appt.get('FName', '').strip()
-   lname = appt.get('LName', '').strip()
-   
-   if fname or lname:
-       return f"{fname} {lname}".strip()
-   
-   # If no name in appointment data, try to fetch from patient details
-   pat_num = appt.get('PatNum')
-   if pat_num:
-       try:
-           patient = get_patient_details(pat_num)
-           if patient:
-               p_fname = patient.get('FName', '').strip()
-               p_lname = patient.get('LName', '').strip()
-               if p_fname or p_lname:
-                   return f"{p_fname} {p_lname}".strip()
-       except Exception as e:
-           logger.debug(f"Could not fetch patient details for PatNum {pat_num}: {e}")
-   
-   return "Unknown Patient"
-
-
-def get_patient_details(pat_num: int) -> Dict[str, Any]:
-   """Get patient details from API"""
-   if not pat_num:
-       return {}
-   endpoint = f"{API_BASE_URL}/patients/{pat_num}"
-   headers = make_auth_header()
-   try:
-       resp = requests.get(endpoint, headers=headers, timeout=15)
-       resp.raise_for_status()
-       return resp.json()
-   except Exception:
-       logger.warning(f"Primary fetch failed for PatNum {pat_num}")
-   try:
-       resp = requests.get(f"{API_BASE_URL}/patients", headers=headers, params={'PatNum': pat_num}, timeout=15)
-       resp.raise_for_status()
-       data = resp.json()
-       if isinstance(data, list) and data:
-           return data[0]
-       if isinstance(data, dict):
-           return data
-   except Exception as e:
-       logger.error(f"Fallback patient fetch failed: {e}")
-   return {}
-
-
-def fetch_appointments(clinic: int, since: Optional[datetime.datetime], filtered_ops: List[int] = None) -> List[Dict[str, Any]]:
-   """
-   Fetch appointments using corrected API parameters that match the documentation examples.
-   Post-processes results to filter by status and operatory.
-   """
-   endpoint = f"{API_BASE_URL}/appointments"
-   headers = make_auth_header()
-   now = datetime.datetime.utcnow()
-   date_start = now.strftime("%Y-%m-%d")
-   date_end = (now + datetime.timedelta(hours=LOOKAHEAD_HOURS)).strftime("%Y-%m-%d")
-   
-   # Base parameters that match the documentation examples
-   params = {
-       'dateStart': date_start,
-       'dateEnd': date_end,
-       'ClinicNum': clinic
-   }
-   
-   # Add DateTStamp for incremental sync if we have a last sync time
-   if since:
-       # Format as YYYY-MM-DD HH:MM:SS for the API (NOT just YYYY-MM-DD)
-       params['DateTStamp'] = since.strftime("%Y-%m-%d %H:%M:%S")
-       logger.info(f"Fetching appointments since {params['DateTStamp']}")
-   
-   try:
-       logger.info(f"Fetching appointments for clinic {clinic} from {date_start} to {date_end}")
-       resp = requests.get(endpoint, headers=headers, params=params, timeout=30)
-       resp.raise_for_status()
-       
-       appointments = resp.json()
-       if not isinstance(appointments, list):
-           logger.warning(f"Unexpected response format: {type(appointments)}")
-           return []
-       
-       logger.info(f"Raw fetched for clinic {clinic}: {len(appointments)} records")
-       
-       # Post-process filtering
-       filtered_appointments = []
-       
-       for appt in appointments:
-           # Get appointment details for logging
-           apt_id = appt.get('AptNum', 'N/A')
-           patient_name = get_patient_name_for_logging(appt)
-           raw_start = appt.get('AptDateTime', '')
-           status = appt.get('AptStatus', '')
-           op_num = appt.get('Op') or appt.get('OperatoryNum')
-           
-           # Parse and format the start time for logging
-           start_dt = parse_time(raw_start)
-           if start_dt:
-               aware_start = convert_to_timezone_aware(start_dt, "America/Chicago")
-               formatted_start = aware_start.strftime("%Y-%m-%d %H:%M:%S %Z")
-               
-               # Calculate end time for logging
-               pattern = appt.get('Pattern', '')
-               aware_end = calculate_end_time(aware_start, pattern, appt)
-               if aware_end:
-                   formatted_end = aware_end.strftime("%Y-%m-%d %H:%M:%S %Z")
-               else:
-                   formatted_end = "Unknown end time"
-           else:
-               formatted_start = raw_start or "No start time"
-               formatted_end = "Unknown end time"
-           
-           logger.debug(f"Processing appointment: ID={apt_id} | Patient='{patient_name}' | Start='{formatted_start}' | End='{formatted_end}' | Status='{status}' | Op={op_num}")
-           
-           # Filter by status
-           if status not in VALID_STATUSES:
-               logger.debug(f"Skipping appointment {apt_id} - invalid status: {status}")
-               continue
-           
-           # Filter by operatory if specified
-           if filtered_ops:
-               if op_num not in filtered_ops:
-                   logger.debug(f"Skipping appointment {apt_id} - operatory {op_num} not in filter {filtered_ops}")
-                   continue
-           
-           # Log accepted appointments
-           logger.info(f"✓ Accepted: ID={apt_id} | Patient='{patient_name}' | Start='{formatted_start}' | End='{formatted_end}' | Status='{status}' | Op={op_num}")
-           filtered_appointments.append(appt)
-       
-       if filtered_ops:
-           logger.info(f"After operatory filtering: {len(filtered_appointments)} records")
-       
-       logger.info(f"After status filtering: {len(filtered_appointments)} records with valid statuses")
-       return filtered_appointments
-       
-   except HTTPError as e:
-       if e.response.status_code == 400:
-           logger.error(f"Bad request (400) - check API parameters: {e.response.text}")
-       elif e.response.status_code == 401:
-           logger.error(f"Authentication failed (401) - check API keys")
-       elif e.response.status_code == 404:
-           logger.error(f"Endpoint not found (404) - check API URL")
-       else:
-           logger.error(f"HTTP error {e.response.status_code}: {e.response.text}")
-       return []
-   except RequestException as e:
-       logger.error(f"Request failed: {e}")
-       return []
-   except Exception as e:
-       logger.error(f"Unexpected error fetching appointments: {e}")
-       return []
-
-
-def filter_new_appointments(appts: List[Dict[str, Any]], since: Optional[datetime.datetime]) -> List[Dict[str, Any]]:
-   """Filter appointments to only include new/updated ones since last sync"""
-   if since is None:
-       return []
-   new_list: List[Dict[str, Any]] = []
-   for a in appts:
-       mod = parse_time(a.get('DateTStamp'))
-       if mod and mod > since:
-           new_list.append(a)
-   logger.info(f"Kept {len(new_list)} new/updated appointments since {since.isoformat()}")
-   return new_list
-
-
-def send_to_keragon(appt: Dict[str, Any]) -> bool:
-   """Send appointment data to Keragon webhook"""
-   apt_id = str(appt.get('AptNum', ''))
-   original_note = appt.get('Note', '') or ""
-   now = datetime.datetime.utcnow()
-   
-   # Get patient name for logging
-   patient_name = get_patient_name_for_logging(appt)
-   
-   # Get and format start time and end time for logging
-   raw_start = appt.get('AptDateTime')
-   start_dt = parse_time(raw_start)
-   if start_dt:
-       aware_start = convert_to_timezone_aware(start_dt, "America/Chicago")
-       formatted_start = aware_start.strftime("%Y-%m-%d %H:%M:%S %Z")
-       
-       # Calculate end time for logging
-       pattern = appt.get('Pattern', '')
-       aware_end = calculate_end_time(aware_start, pattern, appt)
-       if aware_end:
-           formatted_end = aware_end.strftime("%Y-%m-%d %H:%M:%S %Z")
-       else:
-           formatted_end = "Unknown end time"
-   else:
-       formatted_start = raw_start or "No start time"
-       formatted_end = "Unknown end time"
-   
-   logger.info(f"Processing appointment for Keragon: ID={apt_id} | Patient='{patient_name}' | Start='{formatted_start}' | End='{formatted_end}'")
-
-   # 1) Strip the GHL tag if present
-   if "[fromGHL]" in original_note:
-       cleaned = original_note.replace("[fromGHL]", "").strip()
-       try:
-           patch_url = f"{API_BASE_URL}/appointments/{apt_id}"
-           resp = requests.patch(
-               patch_url,
-               headers=make_auth_header(),
-               json={"Note": cleaned},
-               timeout=30
-           )
-           resp.raise_for_status()
-           logger.info(f"Stripped [fromGHL] from AptNum={apt_id} | Patient='{patient_name}' | Start='{formatted_start}' | End='{formatted_end}'")
-       except Exception as e:
-           logger.error(f"Failed stripping [fromGHL] on AptNum={apt_id} | Patient='{patient_name}': {e}")
-       return True
-
-   # 2) Build payload with corrected time handling
-   
-   # Convert to timezone-aware datetime FIRST
-   if start_dt:
-       aware_start = convert_to_timezone_aware(start_dt, "America/Chicago")
-       iso_start = aware_start.isoformat()
-       
-       # Calculate end time using the timezone-aware start time
-       pattern = appt.get('Pattern', '')
-       aware_end = calculate_end_time(aware_start, pattern, appt)
-       iso_end = aware_end.isoformat() if aware_end else None
-       
-       # Debug logging
-       logger.debug(f"AptNum={apt_id} | Patient='{patient_name}' | Start: {iso_start} | End: {iso_end} | Pattern: '{pattern}'")
-   else:
-       iso_start = None
-       iso_end = None
-       logger.warning(f"AptNum={apt_id} | Patient='{patient_name}' | Could not parse start time: {raw_start}")
-
-   tagged_note = f"{original_note} [fromOpenDental]"
-
-   # Fetch patient details once
-   patient = get_patient_details(appt.get('PatNum')) if appt.get('PatNum') else {}
-
-   payload = {
-       'firstName':         patient.get('FName', appt.get('FName', '')),
-       'lastName':          patient.get('LName', appt.get('LName', '')),
-       'email':             patient.get('Email', appt.get('Email', '')),
-       'phone':             (patient.get('HmPhone')
-                             or patient.get('WkPhone')
-                             or patient.get('WirelessPhone')
-                             or appt.get('HmPhone', '')),
-       'appointmentTime':   iso_start or raw_start,
-       'endTime':           iso_end,
-       'locationId':        str(appt.get('ClinicNum', '')),
-       'calendarId':        str(appt.get('Op', '') or appt.get('OperatoryNum', '')),
-       'status':            appt.get('AptStatus', ''),
-       'providerName':      appt.get('provAbbr', ''),
-       'appointmentLength': appt.get('Pattern', ''),
-       'notes':             tagged_note,
-       'appointmentId':     apt_id,
-       'patientId':         str(appt.get('PatNum', '')),
-       # Additional patient fields:
-       'birthdate':         patient.get('Birthdate', ''),
-       'zipCode':           patient.get('Zip', ''),
-       'state':             patient.get('State', ''),
-       'city':              patient.get('City', ''),
-       'gender':            patient.get('Gender', '')
-   }
- 
-   try:
-       r = requests.post(KERAGON_WEBHOOK_URL, json=payload, timeout=30)
-       r.raise_for_status()
-       logger.info(f"✓ Sent AptNum={apt_id} to Keragon | Patient='{patient_name}' | Start='{formatted_start}' | End='{formatted_end}' | Status={appt.get('AptStatus', '')}")
-       return True
-   except Exception as e:
-       logger.error(f"✗ Keragon send failed: ID={apt_id} | Patient='{patient_name}' | Start='{formatted_start}' | End='{formatted_end}' | Error: {e}")
-       return False
-
-
-def process_appointments(clinic: int, appts: List[Dict[str, Any]], lastSync: Optional[datetime.datetime], didFullFetch: bool) -> Dict[str, Any]:
-   now = datetime.datetime.utcnow()
-   max_mod = lastSync or now
-   to_send = appts if not didFullFetch or lastSync is None else filter_new_appointments(appts, lastSync)
-   if didFullFetch and not to_send:
-       logger.info(f"Clinic {clinic}: no updates since {lastSync}")
-       return {'newLastSync': lastSync, 'didFullFetch': True}
-   logger.info(f"Clinic {clinic}: Processing {len(to_send)} appointments for sync:")
-   for i, appt in enumerate(to_send, 1):
-       apt_id = appt.get('AptNum', 'N/A')
-       patient_name = get_patient_name_for_logging(appt)
-       raw_start = appt.get('AptDateTime', '')
-       start_dt = parse_time(raw_start)
-       if start_dt:
-           aware_start = convert_to_timezone_aware(start_dt, "America/Chicago")
-           formatted_start = aware_start.strftime("%Y-%m-%d %H:%M:%S")
-           pattern = appt.get('Pattern', '')
-           aware_end = calculate_end_time(aware_start, pattern, appt)
-           formatted_end = aware_end.strftime("%Y-%m-%d %H:%M:%S") if aware_end else "Unknown end time"
-       else:
-           formatted_start = raw_start or "No start time"
-           formatted_end = "Unknown end time"
-       logger.info(f"  {i:2d}. ID={apt_id} | Patient='{patient_name}' | Start='{formatted_start}' | End='{formatted_end}' | Status={appt.get('AptStatus', '')}")
-   sent_count = 0
-   for a in to_send:
-       success = send_to_keragon(a)
-       if success:
-           sent_count += 1
-           max_mod = now if now > max_mod else max_mod
-   logger.info(f"Clinic {clinic}: Successfully processed {sent_count}/{len(to_send)} appointments")
-   return {'newLastSync': max_mod, 'didFullFetch': True}
-
-def run_sync():
-   if not (DEVELOPER_KEY and CUSTOMER_KEY and KERAGON_WEBHOOK_URL):
-       logger.critical("Missing API keys or webhook URL")
-       sys.exit(1)
-   if not CLINIC_NUMS:
-       logger.critical("No CLINIC_NUMS defined")
-       sys.exit(1)
-   logger.info(f"Starting sync for clinics: {CLINIC_NUMS}")
-   state = load_last_sync_state()
-   new_state = {}
-   for clinic in CLINIC_NUMS:
-       logger.info(f"Processing clinic {clinic}")
-       list_operatories_for_clinic(clinic)
-       lastSync = state[clinic]['lastSync']
-       didFullFetch = state[clinic]['didFullFetch']
-       appts = fetch_appointments(clinic, lastSync, get_filtered_operatories_for_clinic(clinic))
-       result = process_appointments(clinic, appts, lastSync, didFullFetch)
-       new_state[clinic] = {
-           'lastSync': result['newLastSync'],
-           'didFullFetch': result['didFullFetch']
-       }
-   save_last_sync_state(new_state)
-   logger.info("Sync complete")
+# === CLI INTERFACE ===
+def main():
+    """Main CLI interface"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description='Sync OpenDental appointments to Keragon',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s --once         Run sync once and exit
+  %(prog)s --test         Test API connectivity
+  %(prog)s --dump-state   Show current sync state
+  %(prog)s --reset        Reset sync state
+  %(prog)s --verbose      Enable debug logging
+"""
+    )
+    
+    parser.add_argument('--once', action='store_true', help='Run sync once and exit')
+    parser.add_argument('--test', action='store_true', help='Test connectivity only')
+    parser.add_argument('--dump-state', action='store_true', help='Print last sync state and exit')
+    parser.add_argument('--reset', action='store_true', help='Reset state file and exit')
+    parser.add_argument('--verbose', action='store_true', help='Enable debug logging')
+    parser.add_argument('--dry-run', action='store_true', help='Process appointments but don\'t send to Keragon')
+    
+    args = parser.parse_args()
+    
+    # Handle verbose logging
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
+        logger.debug("Debug logging enabled")
+    
+    # Handle dump state
+    if args.dump_state:
+        if os.path.exists(config.state_file):
+            with open(config.state_file, 'r') as f:
+                print(json.dumps(json.load(f), indent=2))
+        else:
+            print("No state file exists.")
+        return 0
+    
+    # Handle reset
+    if args.reset:
+        if os.path.exists(config.state_file):
+            os.remove(config.state_file)
+            logger.info("State file removed.")
+        else:
+            logger.info("No state file to remove.")
+        return 0
+    
+    # Handle test mode
+    if args.test:
+        logger.info("Testing connectivity...")
+        if not validate_configuration():
+            return 1
+        
+        # Test OpenDental API
+        try:
+            headers = make_auth_header()
+            response = requests.get(f"{config.api_base_url}/operatories", headers=headers, timeout=10)
+            response.raise_for_status()
+            logger.info("✓ OpenDental API connection successful")
+        except Exception as e:
+            logger.error(f"✗ OpenDental API connection failed: {e}")
+            return 1
+        
+        # Test Keragon webhook
+        try:
+            test_payload = {"test": True, "timestamp": datetime.datetime.utcnow().isoformat()}
+            response = requests.post(config.keragon_webhook_url, json=test_payload, timeout=10)
+            response.raise_for_status()
+            logger.info("✓ Keragon webhook connection successful")
+        except Exception as e:
+            logger.error(f"✗ Keragon webhook connection failed: {e}")
+            return 1
+        
+        logger.info("All connectivity tests passed!")
+        return 0
+    
+    # Handle dry run
+    if args.dry_run:
+        logger.info("DRY RUN MODE - appointments will be processed but not sent to Keragon")
+        # TODO: Implement dry run logic
+        return 0
+    
+    # Run sync
+    try:
+        success = run_sync()
+        return 0 if success else 1
+    except KeyboardInterrupt:
+        logger.info("Sync interrupted by user")
+        return 130
+    except Exception as e:
+        logger.critical(f"Sync failed with unexpected error: {e}", exc_info=True)
+        return 1
 
 if __name__ == "__main__":
-   import argparse
-   parser = argparse.ArgumentParser(description='Sync Open Dental appointments to Keragon')
-   parser.add_argument('--once', action='store_true', help='Run sync once and exit')
-   parser.add_argument('--test', action='store_true', help='Test mode - validate config and exit')
-   parser.add_argument('--dump-state', action='store_true', help='Display current state file')
-   parser.add_argument('--reset', action='store_true', help='Reset state file')
-   parser.add_argument('--verbose', action='store_true', help='Enable debug logging')
-   args = parser.parse_args()
-   if args.verbose:
-       logger.setLevel(logging.DEBUG)
-   if args.dump_state:
-       if os.path.exists(STATE_FILE):
-           print(json.dumps(json.load(open(STATE_FILE)), indent=2))
-       else:
-           print("No state file exists.")
-       sys.exit(0)
-   if args.reset and os.path.exists(STATE_FILE):
-       os.remove(STATE_FILE)
-       logger.info("State file removed.")
-       sys.exit(0)
-   if args.test:
-       logger.info("Test mode - validating configuration")
-       if not (DEVELOPER_KEY and CUSTOMER_KEY and KERAGON_WEBHOOK_URL):
-           logger.error("Missing required environment variables")
-           sys.exit(1)
-       if not CLINIC_NUMS:
-           logger.error("No CLINIC_NUMS configured")
-           sys.exit(1)
-       logger.info("Configuration appears valid")
-       sys.exit(0)
-   run_sync()
+    sys.exit(main())
