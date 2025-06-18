@@ -236,11 +236,11 @@ def run(force_first:bool=False):
 # === CLI ===
 if __name__=='__main__':
     import argparse
-    p=argparse.ArgumentParser(desc='OpenDental→Keragon Sync')
-    p.add_argument('--once',action='store_true',help='Force fetch all (first-run)')
-    p.add_argument('--reset',action='store_true',help='Clear sync state')
-    p.add_argument('--verbose',action='store_true',help='Debug logging')
-    args=p.parse_args()
+    p = argparse.ArgumentParser(description='OpenDental→Keragon Sync')
+    p.add_argument('--once',    action='store_true', help='Force fetch all (first-run)')
+    p.add_argument('--reset',   action='store_true', help='Clear sync state')
+    p.add_argument('--verbose', action='store_true', help='Debug logging')
+    args = p.parse_args()
     if args.verbose: logger.setLevel(logging.DEBUG)
     if args.reset:
         try: os.remove(config.state_file); logger.info("State cleared.")
