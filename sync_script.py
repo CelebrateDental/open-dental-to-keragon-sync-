@@ -539,10 +539,15 @@ def run_sync() -> bool:
     last_state = load_last_sync_state()
     new_state = last_state.copy()
     
-    # Detect if this is a first run for any clinic
-    is_first_run = not os.path.exists(config.state_file)
+    # Detect if this is a first run
+    is_first_run = len(last_state) == 0  # Empty state means first run
     if is_first_run:
         logger.info(f"First run detected - will fetch all appointments for the next {config.first_run_lookahead_days} days")
+        # Initialize state with a baseline for each clinic
+        for clinic_num in config.clinic_nums:
+            last_state[clinic_num] = datetime.datetime.utcnow() - datetime.timedelta(hours=24)
+    else:
+        logger.info(f"Subsequent run - will fetch appointments modified since last sync")
     
     total_processed = 0
     total_successful = 0
@@ -553,7 +558,10 @@ def run_sync() -> bool:
             
             # Get last sync time for this clinic
             since = last_state.get(clinic_num, datetime.datetime.utcnow() - datetime.timedelta(hours=24))
-            logger.info(f"Last sync: {since.isoformat()}")
+            if is_first_run:
+                logger.info(f"First run for clinic {clinic_num}")
+            else:
+                logger.info(f"Last sync: {since.isoformat()}")
             
             # Fetch and verify operatories
             try:
