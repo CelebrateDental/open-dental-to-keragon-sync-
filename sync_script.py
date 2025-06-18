@@ -293,19 +293,19 @@ def fetch_appointments_batch(clinic_num: int, date_start: str, date_end: str, st
 def fetch_appointments_for_clinic(clinic_num: int, since: datetime.datetime, is_first_run: bool = False) -> List[AppointmentData]:
     """Fetch all relevant appointments for a clinic"""
     now = datetime.datetime.utcnow()
-    
-    # MODIFIED: Always fetch appointments for the next 30 days from today
+
+    # --- MODIFICATION APPLIED HERE ---
     date_start = now.strftime("%Y-%m-%d")
     date_end = (now + datetime.timedelta(days=30)).strftime("%Y-%m-%d")
-    
+
     logger.info(f"Fetching appointments for clinic {clinic_num} for the next 30 days")
     logger.info(f"Date range: {date_start} to {date_end}")
-    
+
     statuses = ['Scheduled', 'Complete', 'Broken']
     filtered_ops = config.clinic_operatory_filters.get(clinic_num, [])
+
     all_appointments = []
-    
-    # Fetch appointments
+
     if filtered_ops:
         logger.info(f"Filtering to operatories: {filtered_ops}")
         for op_num in filtered_ops:
@@ -313,7 +313,6 @@ def fetch_appointments_for_clinic(clinic_num: int, since: datetime.datetime, is_
                 try:
                     batch = fetch_appointments_batch(clinic_num, date_start, date_end, status, op_num)
                     all_appointments.extend(batch)
-                    logger.debug(f"Fetched {len(batch)} {status} appointments for operatory {op_num}")
                 except Exception as e:
                     logger.error(f"Failed to fetch {status} appointments for operatory {op_num}: {e}")
     else:
@@ -322,27 +321,22 @@ def fetch_appointments_for_clinic(clinic_num: int, since: datetime.datetime, is_
             try:
                 batch = fetch_appointments_batch(clinic_num, date_start, date_end, status)
                 all_appointments.extend(batch)
-                logger.debug(f"Fetched {len(batch)} {status} appointments")
             except Exception as e:
                 logger.error(f"Failed to fetch {status} appointments: {e}")
-    
-    # Convert to structured data and filter
+
     structured_appointments = []
     for apt_data in all_appointments:
         try:
             apt = AppointmentData.from_api_response(apt_data)
-            
-            # Apply operatory filter if needed
             if filtered_ops and apt.operatory_num not in filtered_ops:
                 continue
-            
             structured_appointments.append(apt)
         except Exception as e:
             logger.warning(f"Failed to parse appointment {apt_data.get('AptNum', 'unknown')}: {e}")
-    
+
     logger.info(f"Parsed {len(structured_appointments)} valid appointments for clinic {clinic_num}")
     return structured_appointments
-
+    
 @retry_request
 def fetch_patient_details(patient_num: int) -> Dict[str, Any]:
     """Fetch detailed patient information"""
