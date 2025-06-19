@@ -105,11 +105,13 @@ def fetch_fhir_appointment(appt_id: str) -> Dict[str, Any]:
     url = f"{config.fhir_base_url}/appointment/{appt_id}"
     headers = {
         'Authorization': f'ODFHIR {config.developer_key}/{config.customer_key}',
-        'Accept': 'application/fhir+json'
+        'Accept': 'application/json',  # Changed from 'application/fhir+json'
+        'Content-Type': 'application/json'  # Added Content-Type header
     }
     resp = requests.get(url, headers=headers, timeout=config.request_timeout)
     resp.raise_for_status()
     return resp.json()
+
 
 # === CHARTMODULES PROGNOTES FETCH ===
 @retry
