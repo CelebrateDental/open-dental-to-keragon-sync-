@@ -65,6 +65,7 @@ def retry(fn):
     return wrapper
 
 # === STATE MANAGEMENT ===
+
 def load_state() -> Tuple[Dict[int, datetime.datetime], bool]:
     if not os.path.exists(config.state_file):
         return {}, True
@@ -83,6 +84,7 @@ def save_state(state: Dict[int, datetime.datetime]):
     os.replace(tmp, config.state_file)
 
 # === UTILITIES ===
+
 def make_headers() -> Dict[str, str]:
     return {'Authorization': f'ODFHIR {config.developer_key}/{config.customer_key}'}
 
@@ -121,14 +123,13 @@ def fetch_prognotes(pat_num: int) -> List[Dict[str, Any]]:
 # === DURATION & TIMES ===
 @retry
 def get_times(appt: Dict[str, Any]) -> Tuple[Optional[datetime.datetime], Optional[datetime.datetime], int]:
-    # Try FHIR
+    # Try FHIR first
     try:
-        fhir_res = fetch_fhir_appointment(str(appt.get('AptNum')))
-        start = parse_iso(fhir_res.get('start'))
-        end = parse_iso(fhir_res.get('end'))
+        f_res = fetch_fhir_appointment(str(appt.get('AptNum')))
+        start = parse_iso(f_res.get('start'))
+        end = parse_iso(f_res.get('end'))
         if start and end:
-            duration = int((end - start).total_seconds() / 60)
-            return start, end, duration
+            return start, end, int((end - start).total_seconds() / 60)
     except Exception:
         pass
     # Fallback to ProgNotes
@@ -140,7 +141,7 @@ def get_times(appt: Dict[str, Any]) -> Tuple[Optional[datetime.datetime], Option
             for note in notes:
                 if note.get('AptNum') == appt.get('AptNum'):
                     h, m = note.get('Length', '0:60').split(':')
-                    duration = int(h) * 60 + int(m)
+                    duration = int(h)*60 + int(m)
                     break
         except Exception:
             pass
@@ -152,36 +153,32 @@ def get_times(appt: Dict[str, Any]) -> Tuple[Optional[datetime.datetime], Option
 def fetch_appointments(clinic: int, since: Optional[datetime.datetime], first_run: bool) -> List[Dict[str, Any]]:
     now = datetime.datetime.utcnow()
     start_str = now.strftime("%Y-%m-%d")
-    end_dt = now + datetime.timedelta(hours=config.lookahead_hours)
-    end_str = end_dt.strftime("%Y-%m-%d")
+    end_str = (now + datetime.timedelta(hours=config.lookahead_hours)).strftime("%Y-%m-%d")
     logger.info(f"Clinic {clinic}: fetching appointments from {start_str} to {end_str}")
+
     all_appts = []
     statuses = ['Scheduled', 'Complete', 'Broken']
     oper_list = config.operatory_filters.get(clinic, [None])
-    base_params = {'ClinicNum': clinic, 'dateStart': start_str, 'dateEnd': end_str}
+    base = {'ClinicNum': clinic, 'dateStart': start_str, 'dateEnd': end_str}
 
     for status in statuses:
         for oper in oper_list:
-            params = base_params.copy()
-            params['AptStatus'] = status
+            params = {**base, 'AptStatus': status}
             if oper:
                 params['Op'] = oper
             if not first_run and since:
                 params['DateTStamp'] = since.isoformat()
+
             headers = {**make_headers(), 'Content-Type': 'application/json'}
-            resp = requests.get(
-                f"{config.api_base_url}/appointments",
-                headers=headers,
-                params=params,
-                timeout=config.request_timeout
-            )
+            resp = requests.get(f"{config.api_base_url}/appointments", headers=headers, params=params, timeout=config.request_timeout)
             resp.raise_for_status()
             data = resp.json()
             items = data if isinstance(data, list) else [data]
-            for appt in items:
-                appt['_clinic'] = clinic
-                appt['_operatory'] = oper
-                all_appts.append(appt)
+
+            for ap in items:
+                ap['_clinic'] = clinic
+                ap['_operatory'] = oper
+                all_appts.append(ap)
 
     return all_appts
 
@@ -195,13 +192,8 @@ def fetch_patient(pat_num: int) -> Dict[str, Any]:
         r = requests.get(f"{config.api_base_url}/patients/{pat_num}", headers=headers, timeout=config.request_timeout)
         r.raise_for_status()
         return r.json()
-    except:
-        r = requests.get(
-            f"{config.api_base_url}/patients",
-            headers=headers,
-            params={'PatNum': pat_num},
-            timeout=config.request_timeout
-        )
+    except Exception:
+        r = requests.get(f"{config.api_base_url}/patients", headers=headers, params={'PatNum': pat_num}, timeout=config.request_timeout)
         r.raise_for_status()
         arr = r.json()
         return arr[0] if isinstance(arr, list) else {}
@@ -228,8 +220,9 @@ def send_to_keragon(appt: Dict[str, Any], patient: Dict[str, Any]) -> Dict[str, 
         'zipCode': patient.get('Zip', ''),
         'balance': patient.get('Balance', 0),
     }
-    clean_payload = {k: v for k, v in payload.items() if v not in (None, '', 0)}
-    requests.post(config.keragon_webhook_url, json=clean_payload, timeout=config.request_timeout).raise_for_status()
+    clean = {k: v for k, v in payload.items() if v not in (None, '', 0)}
+    requests.post(config.keragon_webhook_url, json=clean, timeout=config.request_timeout).raise_for_status()
+
     return {
         'clinic': appt.get('_clinic'),
         'operatory': appt.get('_operatory'),
