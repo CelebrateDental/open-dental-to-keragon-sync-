@@ -1,18 +1,25 @@
 #!/usr/bin/env python3
 """
-OpenDental → Keragon Sync (Pattern only, per clinic, per operatory)
-- Gets ALL operatories for each clinic, filters by allowed IDs
-- Processes each allowed operatory one-by-one
-- Uses Pattern ONLY for duration (each X or / = 10 mins)
+OpenDental → Keragon Appointment Sync
+- Uses official Pattern method (5 mins per character) to calculate end time
+- No FHIR, no ProgNotes
+- Processes clinics separately, fetches all operatories, then filters
+- Logs detailed info per clinic and operatory
 """
 
-import os, sys, json, logging, datetime, requests, time
+import os
+import sys
+import json
+import logging
+import datetime
+import requests
+import time
 from typing import List, Dict, Any, Optional, Tuple
 from requests.exceptions import HTTPError, RequestException
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# === CONFIG ===
+# === CONFIGURATION ===
 @dataclass
 class Config:
     api_base_url: str = os.environ.get('OPEN_DENTAL_API_URL', 'https://api.opendental.com/api/v1')
@@ -25,40 +32,42 @@ class Config:
     max_workers: int = int(os.environ.get('MAX_WORKERS', '5'))
     request_timeout: int = int(os.environ.get('REQUEST_TIMEOUT', '30'))
     retry_attempts: int = int(os.environ.get('RETRY_ATTEMPTS', '3'))
-    clinic_nums: List[int] = field(default_factory=lambda: [
-        int(x) for x in os.environ.get('CLINIC_NUMS', '').split(',') if x.strip().isdigit()
-    ])
+    clinic_nums: List[int] = field(default_factory=lambda: [int(x) for x in os.environ.get('CLINIC_NUMS','').split(',') if x.strip().isdigit()])
     operatory_filters: Dict[int, List[int]] = field(default_factory=lambda: {
         9034: [11579, 11580, 11588],
         9035: [11574, 11576, 11577],
     })
 
 config = Config()
-logger = logging.getLogger('opendental_perclinic')
+logger = logging.getLogger('opendental_sync')
 handler = logging.StreamHandler(sys.stdout)
 handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 logger.addHandler(handler)
 logger.setLevel(getattr(logging, config.log_level.upper(), logging.INFO))
+logging.getLogger('urllib3').setLevel(logging.WARNING)
 
-# === RETRY ===
+# === RETRY DECORATOR ===
 def retry(fn):
-    def wrapper(*a, **kw):
-        last = None
+    def wrapper(*args, **kwargs):
+        last_exc = None
         for i in range(config.retry_attempts):
-            try: return fn(*a, **kw)
+            try:
+                return fn(*args, **kwargs)
             except (RequestException, HTTPError) as e:
-                last = e; time.sleep(2**i)
-        logger.error(f"All retries failed: {last}")
-        raise last
+                last_exc = e
+                time.sleep(2 ** i)
+        logger.error(f"All retries failed: {last_exc}")
+        raise last_exc
     return wrapper
 
 # === STATE ===
 def load_state() -> Tuple[Dict[int, datetime.datetime], bool]:
-    if not os.path.exists(config.state_file): return {}, True
+    if not os.path.exists(config.state_file):
+        return {}, True
     try:
         with open(config.state_file) as f:
-            d = json.load(f)
-        return {int(k): datetime.datetime.fromisoformat(v) for k, v in d.items()}, False
+            data = json.load(f)
+        return {int(k): datetime.datetime.fromisoformat(v) for k, v in data.items()}, False
     except:
         return {}, True
 
@@ -69,139 +78,160 @@ def save_state(state: Dict[int, datetime.datetime]):
     os.replace(tmp, config.state_file)
 
 def make_headers() -> Dict[str, str]:
-    return {'Authorization': f'ODFHIR {config.developer_key}/{config.customer_key}'}
+    return {'Authorization': f'ODFHIR {config.developer_key}/{config.customer_key}', 'Content-Type': 'application/json'}
 
-def parse_iso(s: Optional[str]) -> Optional[datetime.datetime]:
-    if not s: return None
-    for f in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-        try: return datetime.datetime.strptime(s, f)
-        except: pass
+def parse_iso(dt_str: Optional[str]) -> Optional[datetime.datetime]:
+    if not dt_str:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try: return datetime.datetime.strptime(dt_str, fmt)
+        except ValueError: continue
     return None
 
-# === GET ALL OPERATORIES ===
-@retry
-def get_all_operatories(clinic: int) -> List[int]:
-    resp = requests.get(f"{config.api_base_url}/operatories",
-                        headers=make_headers(),
-                        params={'ClinicNum': clinic},
-                        timeout=config.request_timeout)
-    resp.raise_for_status()
-    ops = resp.json()
-    return [op['OperatoryNum'] for op in ops] if isinstance(ops, list) else []
-
-# === PATTERN ONLY ===
-def get_times_by_pattern(appt: Dict[str, Any]) -> Tuple[Optional[datetime.datetime], Optional[datetime.datetime], int]:
+# === OFFICIAL PATTERN METHOD ===
+def get_times_pattern(appt: Dict[str, Any]) -> Tuple[Optional[datetime.datetime], Optional[datetime.datetime], int]:
     start = parse_iso(appt.get('AptDateTime'))
     pattern = appt.get('Pattern') or ''
-    count = pattern.count('X') + pattern.count('/')
-    duration = max(count * 10, 10)
+    duration = max(len(pattern) * 5, 5)  # fallback minimum
     end = start + datetime.timedelta(minutes=duration) if start else None
     return start, end, duration
 
-# === FETCH APPTS ===
+# === FETCH OPERATORIES ===
 @retry
-def fetch_appointments(clinic: int, oper: int, since: Optional[datetime.datetime], first: bool) -> List[Dict[str, Any]]:
-    now = datetime.datetime.utcnow()
-    start, end = now.strftime("%Y-%m-%d"), (now + datetime.timedelta(hours=config.lookahead_hours)).strftime("%Y-%m-%d")
-    base = {'ClinicNum': clinic, 'Op': oper, 'dateStart': start, 'dateEnd': end}
-    statuses = ['Scheduled', 'Complete', 'Broken']
-    all = []
-    for status in statuses:
-        params = base.copy(); params['AptStatus'] = status
-        if not first and since: params['DateTStamp'] = since.isoformat()
-        resp = requests.get(f"{config.api_base_url}/appointments", headers=make_headers(),
-                            params=params, timeout=config.request_timeout)
-        resp.raise_for_status()
-        data = resp.json()
-        items = data if isinstance(data, list) else [data]
-        for ap in items: ap['_clinic'] = clinic; ap['_operatory'] = oper; all.append(ap)
-    return all
+def fetch_operatories(clinic: int) -> List[int]:
+    params = {'ClinicNum': clinic}
+    resp = requests.get(f"{config.api_base_url}/operatories", headers=make_headers(), params=params, timeout=config.request_timeout)
+    resp.raise_for_status()
+    data = resp.json()
+    return [op['OperatoryNum'] for op in data] if isinstance(data, list) else []
 
-# === PATIENT ===
+# === FETCH APPOINTMENTS ===
+@retry
+def fetch_appointments(clinic: int, ops: List[int], since: Optional[datetime.datetime], first_run: bool) -> List[Dict[str, Any]]:
+    now = datetime.datetime.utcnow()
+    start_str = now.strftime("%Y-%m-%d")
+    end_str = (now + datetime.timedelta(hours=config.lookahead_hours)).strftime("%Y-%m-%d")
+    logger.info(f"Clinic {clinic}: fetching appointments from {start_str} to {end_str}")
+
+    all_appts = []
+    statuses = ['Scheduled', 'Complete', 'Broken']
+    base = {'ClinicNum': clinic, 'dateStart': start_str, 'dateEnd': end_str}
+
+    for status in statuses:
+        for oper in ops:
+            params = base.copy()
+            params['AptStatus'] = status
+            params['Op'] = oper
+            if not first_run and since:
+                params['DateTStamp'] = since.isoformat()
+            resp = requests.get(f"{config.api_base_url}/appointments", headers=make_headers(), params=params, timeout=config.request_timeout)
+            resp.raise_for_status()
+            data = resp.json()
+            items = data if isinstance(data, list) else [data]
+            for ap in items:
+                ap['_clinic'] = clinic
+                ap['_operatory'] = oper
+                all_appts.append(ap)
+    return all_appts
+
+# === FETCH PATIENT ===
 @retry
 def fetch_patient(pat_num: int) -> Dict[str, Any]:
-    if not pat_num: return {}
-    resp = requests.get(f"{config.api_base_url}/patients/{pat_num}",
-                        headers=make_headers(),
-                        timeout=config.request_timeout)
+    if not pat_num:
+        return {}
+    resp = requests.get(f"{config.api_base_url}/patients/{pat_num}", headers=make_headers(), timeout=config.request_timeout)
     resp.raise_for_status()
     return resp.json()
 
 # === SEND ===
 @retry
-def send_to_keragon(appt: Dict[str, Any], pat: Dict[str, Any]) -> Dict[str, Any]:
-    s, e, d = get_times_by_pattern(appt)
+def send_to_keragon(appt: Dict[str, Any], patient: Dict[str, Any]) -> Dict[str, Any]:
+    start, end, duration = get_times_pattern(appt)
     payload = {
         'appointmentId': str(appt.get('AptNum')),
-        'appointmentTime': s.isoformat() if s else '',
-        'appointmentEndTime': e.isoformat() if e else '',
-        'appointmentDurationMinutes': d,
+        'appointmentTime': start.isoformat() if start else '',
+        'appointmentEndTime': end.isoformat() if end else '',
+        'appointmentDurationMinutes': duration,
         'status': appt.get('AptStatus'),
-        'notes': (appt.get('Note') or '') + ' [fromOD]',
+        'notes': appt.get('Note', '') + ' [fromOD]',
         'patientId': str(appt.get('PatNum')),
-        'firstName': pat.get('FName', ''),
-        'lastName': pat.get('LName', ''),
-        'gender': pat.get('Gender', ''),
-        'address': pat.get('Address', ''),
-        'address2': pat.get('Address2', ''),
-        'city': pat.get('City', ''),
-        'state': pat.get('State', ''),
-        'zipCode': pat.get('Zip', ''),
-        'balance': pat.get('Balance', 0),
+        'firstName': patient.get('FName', ''),
+        'lastName': patient.get('LName', ''),
+        'gender': patient.get('Gender', ''),
+        'address': patient.get('Address', ''),
+        'address2': patient.get('Address2', ''),
+        'city': patient.get('City', ''),
+        'state': patient.get('State', ''),
+        'zipCode': patient.get('Zip', ''),
+        'balance': patient.get('Balance', 0),
     }
     clean = {k: v for k, v in payload.items() if v not in (None, '', 0)}
     requests.post(config.keragon_webhook_url, json=clean, timeout=config.request_timeout).raise_for_status()
-    return {'clinic': appt.get('_clinic'), 'operatory': appt.get('_operatory'),
-            'apt': appt.get('AptNum'), 'first': pat.get('FName', ''),
-            'last': pat.get('LName', ''), 'start': s.isoformat() if s else '',
-            'end': e.isoformat() if e else ''}
+    return {
+        'clinic': appt.get('_clinic'),
+        'operatory': appt.get('_operatory'),
+        'apt': appt.get('AptNum'),
+        'first': patient.get('FName', ''),
+        'last': patient.get('LName', ''),
+        'start': start.isoformat() if start else '',
+        'end': end.isoformat() if end else ''
+    }
 
 # === MAIN ===
-def run(force_first=False):
+def run(force_first: bool = False):
     if not all([config.developer_key, config.customer_key, config.keragon_webhook_url]):
         logger.critical("Missing credentials or webhook URL")
         sys.exit(1)
 
     last_state, first_run = load_state()
-    new_state, processed = {}, []
+    overall_first = force_first or first_run
+    new_state: Dict[int, datetime.datetime] = {}
+
     for clinic in config.clinic_nums:
-        allowed = set(config.operatory_filters.get(clinic, []))
-        all_ops = get_all_operatories(clinic)
-        ops = [op for op in all_ops if op in allowed]
-        logger.info(f"Clinic {clinic} operatories: {ops}")
-        since = None if (force_first or first_run) else last_state.get(clinic)
+        # get ALL operatories first
+        all_ops = fetch_operatories(clinic)
+        logger.info(f"Clinic {clinic}: found operatories: {all_ops}")
 
-        for op in ops:
-            appts = fetch_appointments(clinic, op, since, force_first or first_run)
-            logger.info(f"Processing operatory {op} with {len(appts)} appointments")
-            patients = {}
-            with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
-                futures = {executor.submit(fetch_patient, ap['PatNum']): ap['PatNum'] for ap in appts}
-                for fut in as_completed(futures):
-                    patients[futures[fut]] = fut.result() or {}
+        # filter to our list if specified
+        ops_to_process = config.operatory_filters.get(clinic, all_ops)
+        logger.info(f"Clinic {clinic}: processing operatories: {ops_to_process}")
 
-            for appt in appts:
-                try: processed.append(send_to_keragon(appt, patients.get(appt['PatNum'], {})))
-                except Exception as e: logger.error(f"Error: {e}")
+        since = None if overall_first else last_state.get(clinic)
+        appts = fetch_appointments(clinic, ops_to_process, since, overall_first)
+        logger.info(f"Clinic {clinic}: processing {len(appts)} appointments")
 
-        logger.info(f"Finished clinic {clinic}")
+        patients = {}
+        with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
+            futures = {executor.submit(fetch_patient, ap['PatNum']): ap['PatNum'] for ap in appts}
+            for fut in as_completed(futures):
+                patients[futures[fut]] = fut.result()
+
+        for appt in appts:
+            try:
+                info = send_to_keragon(appt, patients.get(appt.get('PatNum'), {}))
+                logger.info(
+                    f"Synced apt {info['apt']} (clinic {info['clinic']}, op {info['operatory']}) "
+                    f"for {info['first']} {info['last']} from {info['start']} to {info['end']}"
+                )
+            except Exception as e:
+                logger.error(f"Error sending apt {appt.get('AptNum')}: {e}")
+
+        logger.info(f"Clinic {clinic}: finished")
         new_state[clinic] = datetime.datetime.utcnow()
 
     save_state(new_state)
-    for rec in processed:
-        logger.info(f"Synced apt {rec['apt']} (clinic {rec['clinic']}, op {rec['operatory']}) "
-                    f"for {rec['first']} {rec['last']} from {rec['start']} to {rec['end']}")
 
 if __name__ == '__main__':
     import argparse
-    p = argparse.ArgumentParser()
-    p.add_argument('--once', action='store_true')
-    p.add_argument('--reset', action='store_true')
-    p.add_argument('--verbose', action='store_true')
-    args = p.parse_args()
-    if args.verbose: logger.setLevel(logging.DEBUG)
+    parser = argparse.ArgumentParser(description='OpenDental → Keragon Sync')
+    parser.add_argument('--once', action='store_true', help='First-run fetch')
+    parser.add_argument('--reset', action='store_true', help='Clear sync state')
+    parser.add_argument('--verbose', action='store_true', help='Debug logging')
+    args = parser.parse_args()
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
     if args.reset:
         try: os.remove(config.state_file)
-        except: pass
+        except FileNotFoundError: pass
         sys.exit(0)
     run(force_first=args.once)
