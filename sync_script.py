@@ -174,12 +174,32 @@ def get_patient_details(pat_num: int) -> Dict[str, Any]:
     except Exception:
         return {}
 
+# === PROVIDER FETCH ===
+def get_provider_name(prov_id: Optional[int]) -> str:
+    if not prov_id:
+        return ''
+    try:
+        rprov = requests.get(
+            f"{API_BASE_URL}/providers/{prov_id}",
+            headers=make_auth_header(), timeout=15
+        )
+        rprov.raise_for_status()
+        pr = rprov.json()
+        return f"{pr.get('FName','').strip()} {pr.get('LName','').strip()}".strip()
+    except Exception:
+        logger.warning(f"Could not fetch provider {prov_id}")
+        return ''
+
 # === KERAGON SYNC ===
 def send_to_keragon(appt: Dict[str, Any]) -> bool:
     patient = get_patient_details(appt.get('PatNum'))
     first = patient.get('FName') or appt.get('FName', '')
     last = patient.get('LName') or appt.get('LName', '')
     name = f"{first} {last}".strip() or 'Unknown'
+
+    # provider
+    prov_id = appt.get('ProvNum') or appt.get('ProviderNum')
+    provider_name = get_provider_name(prov_id)
 
     st = parse_time(appt.get('AptDateTime'))
     if not st:
@@ -189,7 +209,7 @@ def send_to_keragon(appt: Dict[str, Any]) -> bool:
     en = calculate_end_time(st, appt.get('Pattern', ''))
 
     logger.info(f"Syncing Apt {appt.get('AptNum')} for {name} "
-                f"from {st.isoformat()} to {en.isoformat()}")
+                f"({provider_name}) from {st.isoformat()} to {en.isoformat()}")
 
     payload = {
         'appointmentId': str(appt.get('AptNum')),
@@ -201,6 +221,7 @@ def send_to_keragon(appt: Dict[str, Any]) -> bool:
         'patientId': str(appt.get('PatNum')),
         'firstName': first,
         'lastName': last,
+        'providerName': provider_name,
         'email': patient.get('Email', ''),
         'phone': patient.get('WirelessPhone', '') or patient.get('HmPhone', ''),
         'gender': patient.get('Gender', ''),
@@ -237,7 +258,6 @@ def run_sync():
             if send_to_keragon(appt):
                 sent += 1
         logger.info(f"Clinic {clinic}: sent {sent} appointment(s)")
-        # mark clinic as synced at this moment
         new_syncs[clinic] = datetime.datetime.utcnow()
 
     save_last_sync_times(new_syncs)
