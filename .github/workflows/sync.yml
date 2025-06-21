@@ -2,38 +2,28 @@ name: Open Dental to Keragon Sync
 
 on:
   schedule:
-    # Run every 10 minutes - note the space between */10 and *
+    # Run every 10 minutes
     - cron: '*/10 * * * *'
   workflow_dispatch:
-    # Allow manual triggering
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Check out repository code
         uses: actions/checkout@v3
-        
+
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
-          
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install requests
-          
-      - name: Set up sync state
-        id: sync-state
-        run: |
-          # Check if sync state file exists in repository
-          if [ ! -f "last_sync_state.json" ]; then
-            # Create initial sync state (24 hours ago)
-            python -c "import json, datetime; json.dump({'${{ secrets.CLINIC_NUM_1 }}': (datetime.datetime.utcnow() - datetime.timedelta(hours=24)).isoformat(), '${{ secrets.CLINIC_NUM_2 }}': (datetime.datetime.utcnow() - datetime.timedelta(hours=24)).isoformat()}, open('last_sync_state.json', 'w'))"
-          fi
-          
+
       - name: Run sync script
         env:
           OPEN_DENTAL_DEVELOPER_KEY: ${{ secrets.OPEN_DENTAL_DEVELOPER_KEY }}
@@ -42,17 +32,17 @@ jobs:
           CLINIC_NUMS: "${{ secrets.CLINIC_NUM_1 }},${{ secrets.CLINIC_NUM_2 }}"
           LOG_LEVEL: "INFO"
         run: python sync_script.py
-            
+
       - name: Commit and push sync state
         run: |
           git config --global user.name "GitHub Actions Bot"
           git config --global user.email "actions@github.com"
-          
+
           # Pull the latest changes from the remote repository to avoid conflicts
           git pull origin main
 
           # Add changes to staging
           git add last_sync_state.json
-          
+
           # Only commit if there are changes
           git diff --quiet && git diff --staged --quiet || (git commit -m "Update sync state [skip ci]" && git push)
