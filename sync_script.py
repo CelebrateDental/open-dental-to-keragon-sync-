@@ -3,7 +3,7 @@
 OpenDental → Keragon Appointment Sync
 ✅ Uses pattern length for duration
 ✅ On first-ever run: fetch all for next 30 days, send all
-✅ On subsequent runs: send those with DateTStamp > last sync OR missing DateTStamp OR SecDateTEntry > last sync
+✅ On subsequent runs: send only those that are genuinely new or modified
 ✅ Logs patient name + appointment start/end
 """
 
@@ -63,16 +63,21 @@ def retry(fn):
         raise last_exc
     return wrapper
 
-def load_state() -> Tuple[Dict[str, str], bool]:
+def load_state() -> Tuple[Dict[str, Any], bool]:
     if not os.path.exists(config.state_file):
         return {}, True
     try:
         with open(config.state_file) as f:
-            return json.load(f), False
+            data = json.load(f)
+            # Convert old format to new format if needed
+            if isinstance(data, dict) and all(isinstance(v, str) for v in data.values()):
+                # Old format: just timestamps
+                return {'last_sync': data, 'synced_appointments': {}}, False
+            return data, False
     except:
         return {}, True
 
-def save_state(state: Dict[str, str]):
+def save_state(state: Dict[str, Any]):
     tmp = config.state_file + '.tmp'
     with open(tmp, 'w') as f:
         json.dump(state, f, indent=2)
@@ -148,26 +153,52 @@ def fetch_appointments(clinic: int, ops: List[int]) -> List[Dict[str, Any]]:
                 all_appts.append(a)
     return all_appts
 
-def should_sync_appointment(appt: Dict[str, Any], last_sync_dt: datetime.datetime) -> bool:
+def should_sync_appointment(
+    appt: Dict[str, Any], 
+    last_sync_dt: datetime.datetime, 
+    synced_appointments: Dict[str, Dict[str, Any]]
+) -> Tuple[bool, str]:
     """
-    Determine if an appointment should be synced based on:
-    1. DateTStamp (modification time) is newer than last sync OR missing
-    2. SecDateTEntry (creation time) is newer than last sync OR missing
-    3. Conservative approach: if ANY timestamp is missing or newer, sync it
+    Determine if an appointment should be synced.
+    Returns (should_sync, reason)
     """
+    apt_num = str(appt.get('AptNum', ''))
+    if not apt_num:
+        return False, "No AptNum"
+    
+    # Check if we've seen this appointment before
+    if apt_num not in synced_appointments:
+        return True, "New appointment (not previously synced)"
+    
+    prev_sync = synced_appointments[apt_num]
+    
+    # Compare key fields to detect changes
+    current_fields = {
+        'AptDateTime': appt.get('AptDateTime'),
+        'AptStatus': appt.get('AptStatus'),
+        'Pattern': appt.get('Pattern'),
+        'Note': appt.get('Note'),
+        'PatNum': appt.get('PatNum'),
+        'Op': appt.get('Op')
+    }
+    
+    # Check if any key field has changed
+    for field, current_val in current_fields.items():
+        prev_val = prev_sync.get(field)
+        if current_val != prev_val:
+            return True, f"Changed field: {field} (was: {prev_val}, now: {current_val})"
+    
+    # Check timestamps if available
     date_tstamp = parse_iso(appt.get('DateTStamp'))
     sec_date_tentry = parse_iso(appt.get('SecDateTEntry'))
     
-    # If modification timestamp is missing OR newer than last sync
-    if date_tstamp is None or date_tstamp > last_sync_dt:
-        return True
+    if date_tstamp and date_tstamp > last_sync_dt:
+        return True, f"DateTStamp newer than last sync: {date_tstamp.isoformat()}"
     
-    # If creation timestamp is missing OR newer than last sync  
-    if sec_date_tentry is None or sec_date_tentry > last_sync_dt:
-        return True
+    if sec_date_tentry and sec_date_tentry > last_sync_dt:
+        return True, f"SecDateTEntry newer than last sync: {sec_date_tentry.isoformat()}"
     
-    # If we get here, both timestamps exist and are older than last sync
-    return False
+    return False, "No changes detected"
 
 @retry
 def fetch_patient(pat_num: int) -> Dict[str, Any]:
@@ -191,7 +222,7 @@ def send_to_keragon(appt: Dict[str, Any], patient: Dict[str, Any]) -> Dict[str, 
         'appointmentDurationMinutes': duration,
         'status': appt.get('AptStatus'),
         'notes': appt.get('Note', '') + ' [fromOD]',
-        # Full patient payload restored:
+        # Full patient payload:
         'patientId': str(appt.get('PatNum')),
         'firstName': patient.get('FName', ''),
         'lastName': patient.get('LName', ''),
@@ -225,8 +256,13 @@ def send_to_keragon(appt: Dict[str, Any], patient: Dict[str, Any]) -> Dict[str, 
     }
 
 def run():
-    last_state, first_run_flag = load_state()
-    new_state: Dict[str, str] = {}
+    state, first_run_flag = load_state()
+    
+    # Initialize state structure
+    if 'last_sync' not in state:
+        state['last_sync'] = {}
+    if 'synced_appointments' not in state:
+        state['synced_appointments'] = {}
 
     for clinic in config.clinic_nums:
         all_ops = fetch_operatories(clinic)
@@ -240,52 +276,62 @@ def run():
             to_send = appts
             logger.info(f"Clinic {clinic}: first-ever run → sending all {len(to_send)} appointments")
         else:
-            since_str = last_state.get(str(clinic), '')
-            since_dt = parse_iso(since_str) or datetime.datetime(1970,1,1)
-            to_send = [a for a in appts if should_sync_appointment(a, since_dt)]
+            since_str = state['last_sync'].get(str(clinic), '')
+            since_dt = parse_iso(since_str) or datetime.datetime(1970, 1, 1)
+            synced_appointments = state['synced_appointments']
             
-            # Debug logging to show what's being filtered
+            to_send = []
+            sync_reasons = []
+            
+            for appt in appts:
+                should_sync, reason = should_sync_appointment(appt, since_dt, synced_appointments)
+                if should_sync:
+                    to_send.append(appt)
+                    sync_reasons.append((appt.get('AptNum'), reason))
+            
             logger.info(f"Clinic {clinic}: last sync was at {since_dt.isoformat()}")
             logger.info(
                 f"Clinic {clinic}: subsequent run → filtered to {len(to_send)} "
                 f"appointments (out of {len(appts)} total) that are new/modified since last sync"
             )
             
-            if len(to_send) > 0:
-                # Show some examples of what's being synced and why
-                for i, apt in enumerate(to_send[:3]):  # Show first 3 examples
-                    mod_dt = parse_iso(apt.get('DateTStamp'))
-                    create_dt = parse_iso(apt.get('SecDateTEntry'))
-                    reason = []
-                    if mod_dt is None:
-                        reason.append("missing DateTStamp")
-                    elif mod_dt > since_dt:
-                        reason.append(f"modified {mod_dt.isoformat()}")
-                    
-                    if create_dt is None:
-                        reason.append("missing SecDateTEntry")
-                    elif create_dt > since_dt:
-                        reason.append(f"created {create_dt.isoformat()}")
-                    
-                    logger.info(f"  Example {i+1}: AptNum {apt.get('AptNum')} - {', '.join(reason)}")
-                
-                if len(to_send) > 3:
-                    logger.info(f"  ... and {len(to_send) - 3} more appointments")
+            # Show examples of what's being synced and why
+            for i, (apt_num, reason) in enumerate(sync_reasons[:3]):
+                logger.info(f"  Example {i+1}: AptNum {apt_num} - {reason}")
+            
+            if len(sync_reasons) > 3:
+                logger.info(f"  ... and {len(sync_reasons) - 3} more appointments")
 
+        # Fetch patients for appointments to sync
         patients: Dict[int, Dict[str, Any]] = {}
-        with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
-            futures = {executor.submit(fetch_patient, a['PatNum']): a for a in to_send}
-            for fut in as_completed(futures):
-                ap = futures[fut]
-                patients[ap['PatNum']] = fut.result()
+        if to_send:
+            with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
+                futures = {executor.submit(fetch_patient, a['PatNum']): a for a in to_send}
+                for fut in as_completed(futures):
+                    ap = futures[fut]
+                    patients[ap['PatNum']] = fut.result()
 
-        for appt in to_send:
-            info = send_to_keragon(appt, patients.get(appt['PatNum'], {}))
-            logger.info(f"[KERAGON] {info['first']} {info['last']} | {info['start']} → {info['end']} | Mod: {info['date_tstamp']} | Created: {info['sec_date_tentry']}")
+            # Send to Keragon and update state
+            for appt in to_send:
+                info = send_to_keragon(appt, patients.get(appt['PatNum'], {}))
+                logger.info(f"[KERAGON] {info['first']} {info['last']} | {info['start']} → {info['end']} | Mod: {info['date_tstamp']} | Created: {info['sec_date_tentry']}")
+                
+                # Track this appointment in our state
+                apt_num = str(appt.get('AptNum'))
+                state['synced_appointments'][apt_num] = {
+                    'AptDateTime': appt.get('AptDateTime'),
+                    'AptStatus': appt.get('AptStatus'),
+                    'Pattern': appt.get('Pattern'),
+                    'Note': appt.get('Note'),
+                    'PatNum': appt.get('PatNum'),
+                    'Op': appt.get('Op'),
+                    'last_synced': datetime.datetime.utcnow().isoformat()
+                }
 
-        new_state[str(clinic)] = datetime.datetime.utcnow().isoformat()
+        # Update last sync time for this clinic
+        state['last_sync'][str(clinic)] = datetime.datetime.utcnow().isoformat()
 
-    save_state(new_state)
+    save_state(state)
 
 if __name__ == '__main__':
     import argparse
