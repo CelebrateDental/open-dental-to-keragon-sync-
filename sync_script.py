@@ -83,6 +83,10 @@ def convert_to_tz(dt: datetime.datetime) -> datetime.datetime:
         return dt.astimezone(timezone.utc).astimezone(FIXED_MINUS_5)
     return dt.replace(tzinfo=FIXED_MINUS_5)
 
+
+def make_auth_header() -> Dict[str, str]:
+    return {'Authorization': f'ODFHIR {DEVELOPER_KEY}/{CUSTOMER_KEY}', 'Content-Type': 'application/json'}
+
 # === DURATION CALCULATION ===
 def calculate_pattern_duration(pattern: str, minutes_per_slot: int = 5) -> int:
     return sum(1 for ch in (pattern or '').upper() if ch in ('X', '/')) * minutes_per_slot
