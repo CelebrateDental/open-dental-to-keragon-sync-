@@ -1,11 +1,6 @@
-# Rewriting the entire script with the requested modifications:
-# - On first run: fetch all appointments in the window regardless of DateTStamp
-# - On subsequent runs: fetch only appointments modified since last sync using DateTStamp
-# - Log how many appointments are sent to Keragon after each run
-
 #!/usr/bin/env python3
 """
-OpenDental → Keragon Appointment Sync (Incremental Updates using DateTStamp)
+OpenDental → Keragon Appointment Sync with Appointment Detail Logging
 """
 
 import os
@@ -19,9 +14,8 @@ from typing import List, Dict, Any, Optional, Tuple
 from requests.exceptions import HTTPError, RequestException
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo  # Python 3.9+
 
-# === CONFIGURATION ===
 @dataclass
 class Config:
     api_base_url: str = os.environ.get('OPEN_DENTAL_API_URL', 'https://api.opendental.com/api/v1')
@@ -62,20 +56,20 @@ def retry(fn):
         raise last_exc
     return wrapper
 
-def load_state() -> Tuple[Dict[int, str], bool]:
+def load_state() -> Tuple[Dict[int, datetime.datetime], bool]:
     if not os.path.exists(config.state_file):
         return {}, True
     try:
         with open(config.state_file) as f:
             data = json.load(f)
-        return data, False
+        return {int(k): datetime.datetime.fromisoformat(v) for k, v in data.items()}, False
     except:
         return {}, True
 
-def save_state(state: Dict[int, str]):
+def save_state(state: Dict[int, datetime.datetime]):
     tmp = config.state_file + '.tmp'
     with open(tmp, 'w') as f:
-        json.dump(state, f, indent=2)
+        json.dump({str(k): v.isoformat() for k, v in state.items()}, f, indent=2)
     os.replace(tmp, config.state_file)
 
 def make_headers() -> Dict[str, str]:
@@ -109,7 +103,7 @@ def fetch_operatories(clinic: int) -> List[int]:
     return [op['OperatoryNum'] for op in data] if isinstance(data, list) else []
 
 @retry
-def fetch_appointments(clinic: int, ops: List[int], since: Optional[str], first_run: bool) -> List[Dict[str, Any]]:
+def fetch_appointments(clinic: int, ops: List[int], since: Optional[datetime.datetime], first_run: bool) -> List[Dict[str, Any]]:
     now = datetime.datetime.utcnow()
     start_str = now.strftime("%Y-%m-%d")
     end_str = (now + datetime.timedelta(hours=config.lookahead_hours)).strftime("%Y-%m-%d")
@@ -125,7 +119,7 @@ def fetch_appointments(clinic: int, ops: List[int], since: Optional[str], first_
             params['AptStatus'] = status
             params['Op'] = oper
             if not first_run and since:
-                params['DateTStamp'] = since
+                params['DateTStamp'] = since.isoformat()
             resp = requests.get(f"{config.api_base_url}/appointments", headers=make_headers(), params=params, timeout=config.request_timeout)
             resp.raise_for_status()
             data = resp.json()
@@ -145,7 +139,7 @@ def fetch_patient(pat_num: int) -> Dict[str, Any]:
     return resp.json()
 
 @retry
-def send_to_keragon(appt: Dict[str, Any], patient: Dict[str, Any]) -> None:
+def send_to_keragon(appt: Dict[str, Any], patient: Dict[str, Any]) -> Dict[str, Any]:
     start, end, duration = get_times_pattern(appt)
     payload = {
         'appointmentId': str(appt.get('AptNum')),
@@ -167,6 +161,15 @@ def send_to_keragon(appt: Dict[str, Any], patient: Dict[str, Any]) -> None:
     }
     clean = {k: v for k, v in payload.items() if v not in (None, '', 0)}
     requests.post(config.keragon_webhook_url, json=clean, timeout=config.request_timeout).raise_for_status()
+    return {
+        'clinic': appt.get('_clinic'),
+        'operatory': appt.get('_operatory'),
+        'apt': appt.get('AptNum'),
+        'first': patient.get('FName', ''),
+        'last': patient.get('LName', ''),
+        'start': start.isoformat() if start else '',
+        'end': end.isoformat() if end else ''
+    }
 
 def run(force_first: bool = False):
     if not all([config.developer_key, config.customer_key, config.keragon_webhook_url]):
@@ -175,8 +178,7 @@ def run(force_first: bool = False):
 
     last_state, first_run = load_state()
     overall_first = force_first or first_run
-    new_state: Dict[int, str] = {}
-    total_sent = 0
+    new_state: Dict[int, datetime.datetime] = {}
 
     for clinic in config.clinic_nums:
         all_ops = fetch_operatories(clinic)
@@ -184,7 +186,7 @@ def run(force_first: bool = False):
         ops_to_process = config.operatory_filters.get(clinic, all_ops)
         logger.info(f"Clinic {clinic}: processing operatories: {ops_to_process}")
 
-        since = None if overall_first else last_state.get(str(clinic))
+        since = None if overall_first else last_state.get(clinic)
         appts = fetch_appointments(clinic, ops_to_process, since, overall_first)
         logger.info(f"Clinic {clinic}: found {len(appts)} appointments to process")
 
@@ -194,31 +196,41 @@ def run(force_first: bool = False):
             for fut in as_completed(futures):
                 patients[futures[fut]] = fut.result()
 
+        sent_count = 0
+        sent_appointments = []
+
         for appt in appts:
             try:
-                send_to_keragon(appt, patients.get(appt.get('PatNum'), {}))
-                total_sent += 1
+                info = send_to_keragon(appt, patients.get(appt.get('PatNum'), {}))
+                sent_count += 1
+                sent_appointments.append(f"{info['first']} {info['last']} | {info['start']} → {info['end']}")
+                logger.debug(
+                    f"Synced apt {info['apt']} (clinic {info['clinic']}, op {info['operatory']}) "
+                    f"for {info['first']} {info['last']} from {info['start']} to {info['end']}"
+                )
             except Exception as e:
                 logger.error(f"Error sending apt {appt.get('AptNum')}: {e}")
 
-        logger.info(f"Clinic {clinic}: done. {len(appts)} appointments processed.")
-        new_state[str(clinic)] = datetime.datetime.utcnow().isoformat()
+        for detail in sent_appointments:
+            logger.info(f"[KERAGON SYNCED] {detail}")
+        logger.info(f"Clinic {clinic}: done. {sent_count} appointments processed.")
+        new_state[clinic] = datetime.datetime.utcnow()
 
     save_state(new_state)
-    logger.info(f"Total appointments sent to Keragon in this run: {total_sent}")
 
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='OpenDental → Keragon Sync')
-    parser.add_argument('--once', action='store_true', help='First-run full fetch')
+    parser.add_argument('--once', action='store_true', help='First-run fetch')
     parser.add_argument('--reset', action='store_true', help='Clear sync state')
     parser.add_argument('--verbose', action='store_true', help='Debug logging')
     args = parser.parse_args()
     if args.verbose:
         logger.setLevel(logging.DEBUG)
     if args.reset:
-        try: os.remove(config.state_file)
-        except FileNotFoundError: pass
+        try:
+            os.remove(config.state_file)
+        except FileNotFoundError:
+            pass
         sys.exit(0)
     run(force_first=args.once)
-
