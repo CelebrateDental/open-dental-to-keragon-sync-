@@ -39,38 +39,41 @@ logging.basicConfig(
 logger = logging.getLogger('opendental_sync')
 
 # === STATE MANAGEMENT ===
-def load_last_sync_time() -> Optional[datetime.datetime]:
+def load_last_sync_times() -> Dict[int, Optional[datetime.datetime]]:
     """
-    Supports both new format ('lastSync') and legacy per-clinic state.
-    Returns the most recent timestamp; migrates legacy state to new format.
+    Load a per-clinic map of last-sync timestamps. Unknown or missing entries become None.
     """
+    state: Dict[int, Optional[datetime.datetime]] = {}
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE) as f:
                 data = json.load(f)
-            # new format
-            if 'lastSync' in data and data['lastSync']:
-                return datetime.datetime.fromisoformat(data['lastSync'])
-            # legacy per-clinic
-            times = []
-            for v in data.values():
-                ts = v.get('lastSync')
+            for c in CLINIC_NUMS:
+                ts = data.get(str(c))
                 if ts:
-                    times.append(datetime.datetime.fromisoformat(ts))
-            if times:
-                last = max(times)
-                save_last_sync_time(last)
-                logger.info(f"Migrated legacy state; setting lastSync to {last.isoformat()}")
-                return last
+                    try:
+                        state[c] = datetime.datetime.fromisoformat(ts)
+                    except ValueError:
+                        logger.warning(f"Invalid timestamp for clinic {c}: {ts}")
+                        state[c] = None
+                else:
+                    state[c] = None
         except Exception as e:
             logger.error(f"Error reading state file: {e}")
-    return None
+            state = {c: None for c in CLINIC_NUMS}
+    else:
+        state = {c: None for c in CLINIC_NUMS}
+    return state
 
 
-def save_last_sync_time(dt: datetime.datetime) -> None:
+def save_last_sync_times(times: Dict[int, Optional[datetime.datetime]]) -> None:
+    """Save a per-clinic map of last-sync timestamps (ISO format or null)."""
+    out: Dict[str, Optional[str]] = {}
+    for c, dt in times.items():
+        out[str(c)] = dt.isoformat() if dt else None
     try:
         with open(STATE_FILE, 'w') as f:
-            json.dump({'lastSync': dt.isoformat()}, f, indent=2)
+            json.dump(out, f, indent=2)
     except Exception as e:
         logger.error(f"Error saving state file: {e}")
 
@@ -97,7 +100,7 @@ def make_auth_header() -> Dict[str, str]:
         'Content-Type': 'application/json'
     }
 
-# === PATTERN-BASED DURATION ===
+# === DURATION CALCULATION ===
 def calculate_pattern_duration(pattern: str, minutes_per_slot: int = 5) -> int:
     if not pattern:
         return 0
@@ -112,7 +115,7 @@ def calculate_end_time(start_dt: datetime.datetime, pattern: str) -> datetime.da
         dur = 60
     return start_dt + datetime.timedelta(minutes=dur)
 
-# === DATA FETCHERS ===
+# === APPOINTMENT FETCHING ===
 def get_filtered_ops(clinic: int) -> List[int]:
     return CLINIC_OPERATORY_FILTERS.get(clinic, [])
 
@@ -129,11 +132,9 @@ def fetch_appointments(
         'dateEnd':   (now + datetime.timedelta(hours=LOOKAHEAD_HOURS)).strftime("%Y-%m-%d")
     }
     if since:
-        # bump by 1 second for strict '>' semantics
         eff = since + datetime.timedelta(seconds=1)
         params['DateTStamp'] = eff.strftime("%Y-%m-%d %H:%M:%S")
-        logger.info(f"Clinic {clinic}: fetching appointments strictly after {since.isoformat()}")
-
+        logger.info(f"Clinic {clinic}: fetching after {since.isoformat()}")
     try:
         r = requests.get(
             f"{API_BASE_URL}/appointments",
@@ -148,16 +149,16 @@ def fetch_appointments(
         logger.error(f"Error fetching appointments for {clinic}: {e}")
         return []
 
-    filtered = []
+    valid = []
     for a in appts:
         if a.get('AptStatus') not in VALID_STATUSES:
             continue
         op = a.get('Op') or a.get('OperatoryNum')
         if ops and op not in ops:
             continue
-        filtered.append(a)
-    logger.info(f"Clinic {clinic}: {len(filtered)} valid appointment(s)")
-    return filtered
+        valid.append(a)
+    logger.info(f"Clinic {clinic}: {len(valid)} appointment(s) to sync")
+    return valid
 
 
 def get_patient_details(pat_num: int) -> Dict[str, Any]:
@@ -170,29 +171,25 @@ def get_patient_details(pat_num: int) -> Dict[str, Any]:
         )
         r.raise_for_status()
         return r.json()
-    except:
+    except Exception:
         return {}
 
 # === KERAGON SYNC ===
 def send_to_keragon(appt: Dict[str, Any]) -> bool:
-    # Fetch patient info first
     patient = get_patient_details(appt.get('PatNum'))
     first = patient.get('FName') or appt.get('FName', '')
     last = patient.get('LName') or appt.get('LName', '')
     name = f"{first} {last}".strip() or 'Unknown'
 
-    st_raw = appt.get('AptDateTime')
-    st = parse_time(st_raw)
+    st = parse_time(appt.get('AptDateTime'))
     if not st:
         logger.error(f"Invalid start time for Apt {appt.get('AptNum')}")
         return False
     st = convert_to_tz(st)
     en = calculate_end_time(st, appt.get('Pattern', ''))
 
-    logger.info(
-        f"Syncing Apt {appt.get('AptNum')} for {name} "
-        f"from {st.isoformat()} to {en.isoformat()}"
-    )
+    logger.info(f"Syncing Apt {appt.get('AptNum')} for {name} "
+                f"from {st.isoformat()} to {en.isoformat()}")
 
     payload = {
         'appointmentId': str(appt.get('AptNum')),
@@ -228,36 +225,37 @@ def run_sync():
         logger.critical("Missing configuration – check your environment variables")
         sys.exit(1)
 
-    last_sync = load_last_sync_time()
-    now_utc = datetime.datetime.utcnow()
-    logger.info(f"Starting sync; last_sync={last_sync}")
+    last_syncs = load_last_sync_times()
+    new_syncs: Dict[int, datetime.datetime] = {}
 
-    total_sent = 0
     for clinic in CLINIC_NUMS:
         logger.info(f"--- Clinic {clinic} ---")
-        ops = get_filtered_ops(clinic)
-        appts = fetch_appointments(clinic, last_sync, ops)
-        for a in appts:
-            if send_to_keragon(a):
-                total_sent += 1
+        last = last_syncs.get(clinic)
+        appointments = fetch_appointments(clinic, last, get_filtered_ops(clinic))
+        sent = 0
+        for appt in appointments:
+            if send_to_keragon(appt):
+                sent += 1
+        logger.info(f"Clinic {clinic}: sent {sent} appointment(s)")
+        # mark clinic as synced at this moment
+        new_syncs[clinic] = datetime.datetime.utcnow()
 
-    save_last_sync_time(now_utc)
-    logger.info(f"Sync complete: sent {total_sent} appointments. Updated lastSync to {now_utc.isoformat()}")
+    save_last_sync_times(new_syncs)
+    logger.info("All clinics synced; state file updated.")
 
 # === CLI ===
 if __name__ == '__main__':
     import argparse
-    p = argparse.ArgumentParser(description='Sync OpenDental → Keragon')
-    p.add_argument('--reset', action='store_true', help='Clear saved last sync timestamp and exit')
-    p.add_argument('--verbose', action='store_true', help='Enable DEBUG logging')
-    args = p.parse_args()
+    parser = argparse.ArgumentParser(description='Sync OpenDental → Keragon')
+    parser.add_argument('--reset', action='store_true', help='Clear saved last sync timestamps and exit')
+    parser.add_argument('--verbose', action='store_true', help='Enable DEBUG logging')
+    args = parser.parse_args()
 
     if args.verbose:
         logger.setLevel(logging.DEBUG)
-    if args.reset:
-        if os.path.exists(STATE_FILE):
-            os.remove(STATE_FILE)
-            logger.info("State file cleared")
+    if args.reset and os.path.exists(STATE_FILE):
+        os.remove(STATE_FILE)
+        logger.info("State file cleared")
         sys.exit(0)
 
     run_sync()
