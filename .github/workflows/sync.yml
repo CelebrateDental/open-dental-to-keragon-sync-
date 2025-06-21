@@ -41,7 +41,7 @@ jobs:
           KERAGON_WEBHOOK_URL: ${{ secrets.KERAGON_WEBHOOK_URL }}
           CLINIC_NUMS: "${{ secrets.CLINIC_NUM_1 }},${{ secrets.CLINIC_NUM_2 }}"
           LOG_LEVEL: "INFO"
-        run: python sync_script.py --once
+        run: python sync_script.py
             
       - name: Commit and push sync state
         run: |
