@@ -3,7 +3,7 @@
 OpenDental → Keragon Appointment Sync
 ✅ Uses pattern length for duration
 ✅ On first-ever run: fetch all for next 30 days, send all
-✅ On subsequent runs: send those with DateTStamp > last sync OR missing DateTStamp
+✅ On subsequent runs: send those with DateTStamp > last sync OR missing DateTStamp OR SecDateTEntry > last sync
 ✅ Logs patient name + appointment start/end
 """
 
@@ -148,6 +148,25 @@ def fetch_appointments(clinic: int, ops: List[int]) -> List[Dict[str, Any]]:
                 all_appts.append(a)
     return all_appts
 
+def should_sync_appointment(appt: Dict[str, Any], last_sync_dt: datetime.datetime) -> bool:
+    """
+    Determine if an appointment should be synced based on:
+    1. DateTStamp (modification time) is newer than last sync
+    2. DateTStamp is missing/null (should be synced)
+    3. SecDateTEntry (creation time) is newer than last sync
+    """
+    # Check modification timestamp
+    date_tstamp = parse_iso(appt.get('DateTStamp'))
+    if date_tstamp is None or date_tstamp > last_sync_dt:
+        return True
+    
+    # Check creation timestamp (for newly created appointments)
+    sec_date_tentry = parse_iso(appt.get('SecDateTEntry'))
+    if sec_date_tentry is None or sec_date_tentry > last_sync_dt:
+        return True
+    
+    return False
+
 @retry
 def fetch_patient(pat_num: int) -> Dict[str, Any]:
     if not pat_num:
@@ -198,7 +217,9 @@ def send_to_keragon(appt: Dict[str, Any], patient: Dict[str, Any]) -> Dict[str, 
         'first': patient.get('FName', ''),
         'last': patient.get('LName', ''),
         'start': start.isoformat() if start else '',
-        'end': end.isoformat() if end else ''
+        'end': end.isoformat() if end else '',
+        'date_tstamp': appt.get('DateTStamp', ''),
+        'sec_date_tentry': appt.get('SecDateTEntry', '')
     }
 
 def run():
@@ -219,10 +240,7 @@ def run():
         else:
             since_str = last_state.get(str(clinic), '')
             since_dt = parse_iso(since_str) or datetime.datetime(1970,1,1)
-            to_send = [
-                a for a in appts
-                if ((dt := parse_iso(a.get('DateTStamp'))) is None or dt > since_dt)
-            ]
+            to_send = [a for a in appts if should_sync_appointment(a, since_dt)]
             logger.info(
                 f"Clinic {clinic}: subsequent run → filtered to {len(to_send)} "
                 f"appointments since {since_dt.isoformat()}"
@@ -237,7 +255,7 @@ def run():
 
         for appt in to_send:
             info = send_to_keragon(appt, patients.get(appt['PatNum'], {}))
-            logger.info(f"[KERAGON] {info['first']} {info['last']} | {info['start']} → {info['end']}")
+            logger.info(f"[KERAGON] {info['first']} {info['last']} | {info['start']} → {info['end']} | Mod: {info['date_tstamp']} | Created: {info['sec_date_tentry']}")
 
         new_state[str(clinic)] = datetime.datetime.utcnow().isoformat()
 
