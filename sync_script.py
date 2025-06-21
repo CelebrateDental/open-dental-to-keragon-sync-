@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 """
-OpenDental → Keragon Appointment Sync
-- Uses official Pattern method (5 mins per character) to calculate end time
-- No FHIR, no ProgNotes
-- Processes clinics separately, fetches all operatories, then filters
-- Logs detailed info per clinic and operatory
+OpenDental → Keragon Appointment Sync with ZoneInfo timezone support
 """
 
 import os
@@ -18,6 +14,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from requests.exceptions import HTTPError, RequestException
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from zoneinfo import ZoneInfo  # Modern timezone support (Python 3.9+)
 
 # === CONFIGURATION ===
 @dataclass
@@ -32,6 +29,7 @@ class Config:
     max_workers: int = int(os.environ.get('MAX_WORKERS', '5'))
     request_timeout: int = int(os.environ.get('REQUEST_TIMEOUT', '30'))
     retry_attempts: int = int(os.environ.get('RETRY_ATTEMPTS', '3'))
+    timezone: str = os.environ.get('CLINIC_TIMEZONE', 'America/Chicago')  # Default to Central Time
     clinic_nums: List[int] = field(default_factory=lambda: [int(x) for x in os.environ.get('CLINIC_NUMS','').split(',') if x.strip().isdigit()])
     operatory_filters: Dict[int, List[int]] = field(default_factory=lambda: {
         9034: [11579, 11580, 11588],
@@ -84,15 +82,19 @@ def parse_iso(dt_str: Optional[str]) -> Optional[datetime.datetime]:
     if not dt_str:
         return None
     for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-        try: return datetime.datetime.strptime(dt_str, fmt)
-        except ValueError: continue
+        try:
+            return datetime.datetime.strptime(dt_str, fmt)
+        except ValueError:
+            continue
     return None
 
 # === OFFICIAL PATTERN METHOD ===
 def get_times_pattern(appt: Dict[str, Any]) -> Tuple[Optional[datetime.datetime], Optional[datetime.datetime], int]:
     start = parse_iso(appt.get('AptDateTime'))
+    if start:
+        start = start.replace(tzinfo=ZoneInfo(config.timezone))
     pattern = appt.get('Pattern') or ''
-    duration = max(len(pattern) * 5, 5)  # fallback minimum
+    duration = max(len(pattern) * 5, 5)
     end = start + datetime.timedelta(minutes=duration) if start else None
     return start, end, duration
 
@@ -188,11 +190,8 @@ def run(force_first: bool = False):
     new_state: Dict[int, datetime.datetime] = {}
 
     for clinic in config.clinic_nums:
-        # get ALL operatories first
         all_ops = fetch_operatories(clinic)
         logger.info(f"Clinic {clinic}: found operatories: {all_ops}")
-
-        # filter to our list if specified
         ops_to_process = config.operatory_filters.get(clinic, all_ops)
         logger.info(f"Clinic {clinic}: processing operatories: {ops_to_process}")
 
