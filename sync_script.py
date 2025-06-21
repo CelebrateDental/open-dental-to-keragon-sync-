@@ -40,13 +40,28 @@ logger = logging.getLogger('opendental_sync')
 
 # === STATE MANAGEMENT ===
 def load_last_sync_time() -> Optional[datetime.datetime]:
+    """
+    Supports both new format ('lastSync') and legacy per-clinic state.
+    Returns the most recent timestamp; migrates legacy state to new format.
+    """
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE) as f:
                 data = json.load(f)
-            ts = data.get('lastSync')
-            if ts:
-                return datetime.datetime.fromisoformat(ts)
+            # new format
+            if 'lastSync' in data and data['lastSync']:
+                return datetime.datetime.fromisoformat(data['lastSync'])
+            # legacy per-clinic
+            times = []
+            for v in data.values():
+                ts = v.get('lastSync')
+                if ts:
+                    times.append(datetime.datetime.fromisoformat(ts))
+            if times:
+                last = max(times)
+                save_last_sync_time(last)
+                logger.info(f"Migrated legacy state; setting lastSync to {last.isoformat()}")
+                return last
         except Exception as e:
             logger.error(f"Error reading state file: {e}")
     return None
@@ -114,10 +129,10 @@ def fetch_appointments(
         'dateEnd':   (now + datetime.timedelta(hours=LOOKAHEAD_HOURS)).strftime("%Y-%m-%d")
     }
     if since:
-        # bump by 1 second to ensure strict > lastSync
+        # bump by 1 second for strict '>' semantics
         eff = since + datetime.timedelta(seconds=1)
         params['DateTStamp'] = eff.strftime("%Y-%m-%d %H:%M:%S")
-        logger.info(f"Clinic {clinic}: fetching since strictly after {since.isoformat()}")
+        logger.info(f"Clinic {clinic}: fetching appointments strictly after {since.isoformat()}")
 
     try:
         r = requests.get(
@@ -160,7 +175,12 @@ def get_patient_details(pat_num: int) -> Dict[str, Any]:
 
 # === KERAGON SYNC ===
 def send_to_keragon(appt: Dict[str, Any]) -> bool:
-    name = f"{appt.get('FName','')} {appt.get('LName','')}".strip() or 'Unknown'
+    # Fetch patient info first
+    patient = get_patient_details(appt.get('PatNum'))
+    first = patient.get('FName') or appt.get('FName', '')
+    last = patient.get('LName') or appt.get('LName', '')
+    name = f"{first} {last}".strip() or 'Unknown'
+
     st_raw = appt.get('AptDateTime')
     st = parse_time(st_raw)
     if not st:
@@ -174,7 +194,6 @@ def send_to_keragon(appt: Dict[str, Any]) -> bool:
         f"from {st.isoformat()} to {en.isoformat()}"
     )
 
-    patient = get_patient_details(appt.get('PatNum'))
     payload = {
         'appointmentId': str(appt.get('AptNum')),
         'appointmentTime': st.isoformat(),
@@ -183,8 +202,8 @@ def send_to_keragon(appt: Dict[str, Any]) -> bool:
         'status': appt.get('AptStatus'),
         'notes': appt.get('Note', '') + ' [fromOD]',
         'patientId': str(appt.get('PatNum')),
-        'firstName': patient.get('FName', appt.get('FName', '')),
-        'lastName': patient.get('LName', appt.get('LName', '')),
+        'firstName': first,
+        'lastName': last,
         'email': patient.get('Email', ''),
         'phone': patient.get('WirelessPhone', '') or patient.get('HmPhone', ''),
         'gender': patient.get('Gender', ''),
