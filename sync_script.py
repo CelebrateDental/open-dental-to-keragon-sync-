@@ -8,6 +8,10 @@ import requests
 from zoneinfo import ZoneInfo
 from typing import List, Dict, Any, Optional
 
+# For a fixed GMT-05:00 offset (no DST)
+from datetime import timezone, timedelta
+FIXED_MINUS_5 = timezone(timedelta(hours=-5))
+
 # === CONFIGURATION ===
 API_BASE_URL        = os.environ.get('OPEN_DENTAL_API_URL', 'https://api.opendental.com/api/v1')
 DEVELOPER_KEY       = os.environ.get('OPEN_DENTAL_DEVELOPER_KEY')
@@ -66,35 +70,36 @@ def save_last_sync_times(times: Dict[int, Optional[datetime.datetime]]) -> None:
 
 # === UTILITIES ===
 def parse_time(s: Optional[str]) -> Optional[datetime.datetime]:
+    """
+    Parse API timestamp; if it ends with Z, treat as UTC.
+    """
     if not s:
         return None
     try:
-        return datetime.datetime.fromisoformat(s.rstrip('Z'))
+        if s.endswith('Z'):
+            # replace Z with +00:00 for fromisoformat
+            s = s[:-1] + '+00:00'
+        return datetime.datetime.fromisoformat(s)
     except ValueError:
         logger.warning(f"Unrecognized time format: {s}")
         return None
 
 
-def convert_to_tz(dt: datetime.datetime, tz: str = "America/Chicago") -> datetime.datetime:
-    return dt.astimezone(ZoneInfo(tz)) if dt.tzinfo else dt.replace(tzinfo=ZoneInfo(tz))
+def convert_to_tz(dt: datetime.datetime) -> datetime.datetime:
+    """
+    Convert any datetime into a fixed GMT-05:00 offset.
+    """
+    if dt.tzinfo:
+        # normalize to UTC then to fixed -05:00
+        return dt.astimezone(timezone.utc).astimezone(FIXED_MINUS_5)
+    # naive -> assume local and tag as -05:00
+    return dt.replace(tzinfo=FIXED_MINUS_5)
 
 
 def make_auth_header() -> Dict[str, str]:
     return {'Authorization': f'ODFHIR {DEVELOPER_KEY}/{CUSTOMER_KEY}', 'Content-Type': 'application/json'}
 
-# === DURATION CALCULATION ===
-def calculate_pattern_duration(pattern: str, minutes_per_slot: int = 5) -> int:
-    return sum(1 for ch in (pattern or '').upper() if ch in ('X', '/')) * minutes_per_slot
-
-
-def calculate_end_time(start_dt: datetime.datetime, pattern: str) -> datetime.datetime:
-    dur = calculate_pattern_duration(pattern)
-    if dur <= 0:
-        logger.warning(f"No slots in pattern '{pattern}', defaulting to 60 minutes")
-        dur = 60
-    return start_dt + datetime.timedelta(minutes=dur)
-
-# === FETCH & FILTER ===
+# === APPOINTMENT FETCHING ===
 def get_filtered_ops(clinic: int) -> List[int]:
     return CLINIC_OPERATORY_FILTERS.get(clinic, [])
 
@@ -104,13 +109,14 @@ def fetch_appointments(
     since: Optional[datetime.datetime],
     ops: List[int]
 ) -> List[Dict[str, Any]]:
-    now = datetime.datetime.utcnow()
-    params = {'ClinicNum': clinic, 'dateStart': now.strftime('%Y-%m-%d'),
-              'dateEnd': (now + datetime.timedelta(hours=LOOKAHEAD_HOURS)).strftime('%Y-%m-%d')}
+    now = datetime.datetime.utcnow().replace(tzinfo=timezone.utc)
+    params = {'ClinicNum': clinic,
+              'dateStart': now.astimezone(FIXED_MINUS_5).strftime('%Y-%m-%d'),
+              'dateEnd': (now + datetime.timedelta(hours=LOOKAHEAD_HOURS)).astimezone(FIXED_MINUS_5).strftime('%Y-%m-%d')}
     if since:
         eff = since + datetime.timedelta(seconds=1)
-        params['DateTStamp'] = eff.strftime('%Y-%m-%d %H:%M:%S')
-        logger.info(f"Clinic {clinic}: fetching after {since.isoformat()}")
+        params['DateTStamp'] = eff.astimezone(FIXED_MINUS_5).strftime('%Y-%m-%d %H:%M:%S')
+        logger.info(f"Clinic {clinic}: fetching after {eff.isoformat()}")
     try:
         r = requests.get(f"{API_BASE_URL}/appointments", headers=make_auth_header(), params=params, timeout=30)
         r.raise_for_status()
@@ -138,16 +144,13 @@ def get_patient_details(pat_num: int) -> Dict[str, Any]:
 
 # === SYNC ===
 def send_to_keragon(appt: Dict[str, Any], clinic: int) -> bool:
-    # Patient name
     patient = get_patient_details(appt.get('PatNum'))
     first = patient.get('FName') or appt.get('FName', '')
     last = patient.get('LName') or appt.get('LName', '')
     name = f"{first} {last}".strip() or 'Unknown'
 
-    # Constant provider per clinic
     provider_name = 'Dr. Gharbi' if clinic == 9034 else 'Dr. Ensley'
 
-    # Times
     st = parse_time(appt.get('AptDateTime'))
     if not st:
         logger.error(f"Invalid start time for Apt {appt.get('AptNum')}")
@@ -204,7 +207,7 @@ def run_sync():
             if send_to_keragon(appt, clinic):
                 sent += 1
         logger.info(f"Clinic {clinic}: sent {sent} appointment(s)")
-        new_syncs[clinic] = datetime.datetime.utcnow()
+        new_syncs[clinic] = datetime.datetime.utcnow().replace(tzinfo=FIXED_MINUS_5)
 
     save_last_sync_times(new_syncs)
     logger.info("All clinics synced; state file updated.")
