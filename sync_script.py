@@ -2,8 +2,8 @@
 """
 OpenDental → Keragon Appointment Sync
 ✅ Uses pattern length for duration
-✅ On first-ever run (no state file): fetch all for next 30 days, no filter
-✅ On subsequent runs: fetch all, then filter locally by DateTStamp
+✅ On first-ever run: fetch all for next 30 days, send all
+✅ On subsequent runs: send those with DateTStamp > last sync OR missing DateTStamp
 ✅ Logs patient name + appointment start/end
 """
 
@@ -42,6 +42,7 @@ class Config:
     })
 
 config = Config()
+
 logger = logging.getLogger('opendental_sync')
 handler = logging.StreamHandler(sys.stdout)
 handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
@@ -86,7 +87,7 @@ def make_headers() -> Dict[str, str]:
 def parse_iso(dt_str: Optional[str]) -> Optional[datetime.datetime]:
     if not dt_str:
         return None
-    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f","%Y-%m-%dT%H:%M:%S"):
         try:
             return datetime.datetime.strptime(dt_str, fmt)
         except ValueError:
@@ -122,7 +123,7 @@ def fetch_appointments(clinic: int, ops: List[int]) -> List[Dict[str, Any]]:
     logger.info(f"Clinic {clinic}: fetching appointments from {start_str} to {end_str}")
 
     all_appts: List[Dict[str, Any]] = []
-    for status in ['Scheduled', 'Complete', 'Broken']:
+    for status in ['Scheduled','Complete','Broken']:
         for op in ops:
             params = {
                 'ClinicNum': clinic,
@@ -169,13 +170,25 @@ def send_to_keragon(appt: Dict[str, Any], patient: Dict[str, Any]) -> Dict[str, 
         'appointmentDurationMinutes': duration,
         'status': appt.get('AptStatus'),
         'notes': appt.get('Note', '') + ' [fromOD]',
+        # Full patient payload restored:
         'patientId': str(appt.get('PatNum')),
         'firstName': patient.get('FName', ''),
         'lastName': patient.get('LName', ''),
+        'email': patient.get('Email', ''),
+        'phone': patient.get('WirelessPhone') or patient.get('HmPhone') or '',
+        'gender': patient.get('Gender', ''),
+        'birthdate': patient.get('Birthdate', ''),
+        'address': patient.get('Address', ''),
+        'address2': patient.get('Address2', ''),
+        'city': patient.get('City', ''),
+        'state': patient.get('State', ''),
+        'zipCode': patient.get('Zip', ''),
+        'balance': patient.get('Balance', 0),
     }
+    clean = {k: v for k, v in payload.items() if v not in (None, '', 0)}
     requests.post(
         config.keragon_webhook_url,
-        json=payload,
+        json=clean,
         timeout=config.request_timeout
     ).raise_for_status()
     return {
@@ -200,28 +213,30 @@ def run():
         appts = fetch_appointments(clinic, ops)
         logger.info(f"Clinic {clinic}: total fetched appointments: {len(appts)}")
 
-        since = last_state.get(str(clinic))
         if first_run_flag:
             to_send = appts
-            logger.info(f"Clinic {clinic}: first-ever run, sending all fetched appointments")
+            logger.info(f"Clinic {clinic}: first-ever run → sending all {len(to_send)} appointments")
         else:
-            since_dt = parse_iso(since) or datetime.datetime(1970,1,1)
-            to_send = []
-            for a in appts:
-                dt = parse_iso(a.get('DateTStamp'))
-                # include if no timestamp (dt None) OR dt > since_dt
-                if dt is None or dt > since_dt:
-                    to_send.append(a)
-            logger.info(f"Clinic {clinic}: subsequent run, filtered to {len(to_send)} new/updated appointments since {since_dt.isoformat()}")
+            since_str = last_state.get(str(clinic), '')
+            since_dt = parse_iso(since_str) or datetime.datetime(1970,1,1)
+            to_send = [
+                a for a in appts
+                if ((dt := parse_iso(a.get('DateTStamp'))) is None or dt > since_dt)
+            ]
+            logger.info(
+                f"Clinic {clinic}: subsequent run → filtered to {len(to_send)} "
+                f"appointments since {since_dt.isoformat()}"
+            )
 
         patients: Dict[int, Dict[str, Any]] = {}
         with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
-            futures = {executor.submit(fetch_patient, a['PatNum']): a['PatNum'] for a in to_send}
+            futures = {executor.submit(fetch_patient, a['PatNum']): a for a in to_send}
             for fut in as_completed(futures):
-                patients[futures[fut]] = fut.result()
+                ap = futures[fut]
+                patients[ap['PatNum']] = fut.result()
 
         for appt in to_send:
-            info = send_to_keragon(appt, patients.get(appt.get('PatNum'), {}))
+            info = send_to_keragon(appt, patients.get(appt['PatNum'], {}))
             logger.info(f"[KERAGON] {info['first']} {info['last']} | {info['start']} → {info['end']}")
 
         new_state[str(clinic)] = datetime.datetime.utcnow().isoformat()
