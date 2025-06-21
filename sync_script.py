@@ -151,20 +151,22 @@ def fetch_appointments(clinic: int, ops: List[int]) -> List[Dict[str, Any]]:
 def should_sync_appointment(appt: Dict[str, Any], last_sync_dt: datetime.datetime) -> bool:
     """
     Determine if an appointment should be synced based on:
-    1. DateTStamp (modification time) is newer than last sync
-    2. DateTStamp is missing/null (should be synced)
-    3. SecDateTEntry (creation time) is newer than last sync
+    1. DateTStamp (modification time) is newer than last sync OR missing
+    2. SecDateTEntry (creation time) is newer than last sync OR missing
+    3. Conservative approach: if ANY timestamp is missing or newer, sync it
     """
-    # Check modification timestamp
     date_tstamp = parse_iso(appt.get('DateTStamp'))
+    sec_date_tentry = parse_iso(appt.get('SecDateTEntry'))
+    
+    # If modification timestamp is missing OR newer than last sync
     if date_tstamp is None or date_tstamp > last_sync_dt:
         return True
     
-    # Check creation timestamp (for newly created appointments)
-    sec_date_tentry = parse_iso(appt.get('SecDateTEntry'))
+    # If creation timestamp is missing OR newer than last sync  
     if sec_date_tentry is None or sec_date_tentry > last_sync_dt:
         return True
     
+    # If we get here, both timestamps exist and are older than last sync
     return False
 
 @retry
@@ -241,10 +243,34 @@ def run():
             since_str = last_state.get(str(clinic), '')
             since_dt = parse_iso(since_str) or datetime.datetime(1970,1,1)
             to_send = [a for a in appts if should_sync_appointment(a, since_dt)]
+            
+            # Debug logging to show what's being filtered
+            logger.info(f"Clinic {clinic}: last sync was at {since_dt.isoformat()}")
             logger.info(
                 f"Clinic {clinic}: subsequent run → filtered to {len(to_send)} "
-                f"appointments since {since_dt.isoformat()}"
+                f"appointments (out of {len(appts)} total) that are new/modified since last sync"
             )
+            
+            if len(to_send) > 0:
+                # Show some examples of what's being synced and why
+                for i, apt in enumerate(to_send[:3]):  # Show first 3 examples
+                    mod_dt = parse_iso(apt.get('DateTStamp'))
+                    create_dt = parse_iso(apt.get('SecDateTEntry'))
+                    reason = []
+                    if mod_dt is None:
+                        reason.append("missing DateTStamp")
+                    elif mod_dt > since_dt:
+                        reason.append(f"modified {mod_dt.isoformat()}")
+                    
+                    if create_dt is None:
+                        reason.append("missing SecDateTEntry")
+                    elif create_dt > since_dt:
+                        reason.append(f"created {create_dt.isoformat()}")
+                    
+                    logger.info(f"  Example {i+1}: AptNum {apt.get('AptNum')} - {', '.join(reason)}")
+                
+                if len(to_send) > 3:
+                    logger.info(f"  ... and {len(to_send) - 3} more appointments")
 
         patients: Dict[int, Dict[str, Any]] = {}
         with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
