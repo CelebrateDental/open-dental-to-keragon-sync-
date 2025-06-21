@@ -1,352 +1,348 @@
 #!/usr/bin/env python3
-"""
-OpenDental → Keragon Appointment Sync
-✅ Uses pattern length for duration
-✅ On first-ever run: fetch all for next 30 days, send all
-✅ On subsequent runs: send only those that are genuinely new or modified
-✅ Logs patient name + appointment start/end
-"""
-
 import os
 import sys
 import json
 import logging
 import datetime
 import requests
-import time
-from typing import List, Dict, Any, Optional, Tuple
-from requests.exceptions import HTTPError, RequestException
-from dataclasses import dataclass, field
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from zoneinfo import ZoneInfo
+from typing import List, Dict, Any, Optional
+from requests.exceptions import HTTPError, RequestException
 
-@dataclass
-class Config:
-    api_base_url: str = os.environ.get('OPEN_DENTAL_API_URL', 'https://api.opendental.com/api/v1')
-    developer_key: str = os.environ.get('OPEN_DENTAL_DEVELOPER_KEY', '')
-    customer_key: str = os.environ.get('OPEN_DENTAL_CUSTOMER_KEY', '')
-    keragon_webhook_url: str = os.environ.get('KERAGON_WEBHOOK_URL', '')
-    state_file: str = os.environ.get('STATE_FILE', 'last_sync_state.json')
-    log_level: str = os.environ.get('LOG_LEVEL', 'INFO')
-    lookahead_hours: int = int(os.environ.get('LOOKAHEAD_HOURS', '720'))
-    max_workers: int = int(os.environ.get('MAX_WORKERS', '5'))
-    request_timeout: int = int(os.environ.get('REQUEST_TIMEOUT', '30'))
-    retry_attempts: int = int(os.environ.get('RETRY_ATTEMPTS', '3'))
-    timezone: str = os.environ.get('CLINIC_TIMEZONE', 'America/Chicago')
-    clinic_nums: List[int] = field(default_factory=lambda: [
-        int(x) for x in os.environ.get('CLINIC_NUMS','').split(',') if x.strip().isdigit()
-    ])
-    operatory_filters: Dict[int, List[int]] = field(default_factory=lambda: {
-        9034: [11579, 11580, 11588],
-        9035: [11574, 11576, 11577],
-    })
+# === CONFIGURATION ===
+API_BASE_URL        = os.environ.get('OPEN_DENTAL_API_URL', 'https://api.opendental.com/api/v1')
+DEVELOPER_KEY       = os.environ.get('OPEN_DENTAL_DEVELOPER_KEY')
+CUSTOMER_KEY        = os.environ.get('OPEN_DENTAL_CUSTOMER_KEY')
+KERAGON_WEBHOOK_URL = os.environ.get('KERAGON_WEBHOOK_URL')
 
-config = Config()
+STATE_FILE      = 'last_sync_state.json'
+LOG_LEVEL       = os.environ.get('LOG_LEVEL', 'INFO')
+LOOKAHEAD_HOURS = int(os.environ.get('LOOKAHEAD_HOURS', '720'))
 
+CLINIC_NUMS = [
+    int(x) for x in os.environ.get('CLINIC_NUMS', '').split(',')
+    if x.strip().isdigit()
+]
+
+CLINIC_OPERATORY_FILTERS: Dict[int, List[int]] = {
+    9034: [11579, 11580, 11588],
+    9035: [11574, 11576, 11577],
+}
+
+VALID_STATUSES = {'Scheduled', 'Complete', 'Broken'}
+
+# === LOGGING ===
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL),
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
 logger = logging.getLogger('opendental_sync')
-handler = logging.StreamHandler(sys.stdout)
-handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-logger.addHandler(handler)
-logger.setLevel(getattr(logging, config.log_level.upper(), logging.INFO))
-logging.getLogger('urllib3').setLevel(logging.WARNING)
 
-def retry(fn):
-    def wrapper(*args, **kwargs):
-        last_exc = None
-        for i in range(config.retry_attempts):
-            try:
-                return fn(*args, **kwargs)
-            except (RequestException, HTTPError) as e:
-                last_exc = e
-                time.sleep(2 ** i)
-        logger.error(f"All retries failed: {last_exc}")
-        raise last_exc
-    return wrapper
+# === STATE MANAGEMENT ===
+def load_last_sync_state() -> Dict[int, Dict[str, Any]]:
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE) as f:
+                data = json.load(f)
+            state = {}
+            for k, v in data.items():
+                c = int(k)
+                last = v.get('lastSync')
+                state[c] = {
+                    'lastSync': datetime.datetime.fromisoformat(last) if last else None,
+                    'didFull': v.get('didFull', False)
+                }
+            for c in CLINIC_NUMS:
+                if c not in state:
+                    state[c] = {'lastSync': None, 'didFull': False}
+            return state
+        except Exception as e:
+            logger.error(f"Error reading state: {e}")
+    return {c: {'lastSync': None, 'didFull': False} for c in CLINIC_NUMS}
 
-def load_state() -> Tuple[Dict[str, Any], bool]:
-    if not os.path.exists(config.state_file):
-        return {}, True
+def save_last_sync_state(state: Dict[int, Dict[str, Any]]) -> None:
+    out = {}
+    for c, v in state.items():
+        out[str(c)] = {
+            'lastSync': v['lastSync'].isoformat() if v['lastSync'] else None,
+            'didFull': v['didFull']
+        }
     try:
-        with open(config.state_file) as f:
-            data = json.load(f)
-            # Convert old format to new format if needed
-            if isinstance(data, dict) and all(isinstance(v, str) for v in data.values()):
-                # Old format: just timestamps
-                return {'last_sync': data, 'synced_appointments': {}}, False
-            return data, False
-    except:
-        return {}, True
+        with open(STATE_FILE, 'w') as f:
+            json.dump(out, f, indent=2)
+    except Exception as e:
+        logger.error(f"Error saving state: {e}")
 
-def save_state(state: Dict[str, Any]):
-    tmp = config.state_file + '.tmp'
-    with open(tmp, 'w') as f:
-        json.dump(state, f, indent=2)
-    os.replace(tmp, config.state_file)
+# === UTILITIES ===
+def parse_time(s: Optional[str]) -> Optional[datetime.datetime]:
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S","%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    logger.warning(f"Unrecognized time format: {s}")
+    return None
 
-def make_headers() -> Dict[str, str]:
+def convert_to_tz(dt: datetime.datetime, tz: str = "America/Chicago") -> datetime.datetime:
+    if dt.tzinfo:
+        return dt.astimezone(ZoneInfo(tz))
+    return dt.replace(tzinfo=ZoneInfo(tz))
+
+def make_auth_header() -> Dict[str, str]:
     return {
-        'Authorization': f'ODFHIR {config.developer_key}/{config.customer_key}',
+        'Authorization': f'ODFHIR {DEVELOPER_KEY}/{CUSTOMER_KEY}',
         'Content-Type': 'application/json'
     }
 
-def parse_iso(dt_str: Optional[str]) -> Optional[datetime.datetime]:
-    if not dt_str:
+# === PATTERN DURATION ONLY ===
+def calculate_pattern_duration(pattern: str, minutes_per_slot: int = 5) -> int:
+    """
+    Count both 'X' and '/' in the primary pattern.
+    Each represents one slot of minutes_per_slot (default 5 min).
+    """
+    if not pattern:
+        return 0
+    slots = sum(1 for ch in pattern.upper() if ch in ('X','/'))
+    duration = slots * minutes_per_slot
+    logger.debug(f"Pattern '{pattern}' → {slots} slots → {duration} minutes")
+    return duration
+
+def calculate_end_time(start_dt: datetime.datetime, pattern: str) -> datetime.datetime:
+    """
+    End = start + duration from pattern only.
+    Falls back to 60 min if pattern yields zero.
+    """
+    if not start_dt:
         return None
-    for fmt in ("%Y-%m-%dT%H:%M:%S.%f","%Y-%m-%dT%H:%M:%S"):
-        try:
-            return datetime.datetime.strptime(dt_str, fmt)
-        except ValueError:
-            continue
-    return None
+    dur = calculate_pattern_duration(pattern)
+    if dur <= 0:
+        dur = 60
+        logger.warning(f"No slots in pattern '{pattern}', defaulting 60m")
+    return start_dt + datetime.timedelta(minutes=dur)
 
-def get_times_pattern(appt: Dict[str, Any]) -> Tuple[Optional[datetime.datetime], Optional[datetime.datetime], int]:
-    start = parse_iso(appt.get('AptDateTime'))
-    if start:
-        start = start.replace(tzinfo=ZoneInfo(config.timezone))
-    pattern = appt.get('Pattern') or ''
-    duration = max(len(pattern) * 5, 5)
-    end = start + datetime.timedelta(minutes=duration) if start else None
-    return start, end, duration
+# === DATA FETCHERS ===
+def list_operatories_for_clinic(clinic: int) -> List[int]:
+    try:
+        r = requests.get(
+            f"{API_BASE_URL}/operatories",
+            headers=make_auth_header(),
+            params={'ClinicNum': clinic},
+            timeout=15
+        )
+        r.raise_for_status()
+        ops = r.json()
+        nums = [o['OperatoryNum'] for o in ops]
+        logger.info(f"Clinic {clinic}: operatory list = {nums}")
+        return nums
+    except Exception as e:
+        logger.error(f"Failed to list operatories for {clinic}: {e}")
+        return []
 
-@retry
-def fetch_operatories(clinic: int) -> List[int]:
-    resp = requests.get(
-        f"{config.api_base_url}/operatories",
-        headers=make_headers(),
-        params={'ClinicNum': clinic},
-        timeout=config.request_timeout
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    return [op['OperatoryNum'] for op in data] if isinstance(data, list) else []
+def get_filtered_ops(clinic: int) -> List[int]:
+    f = CLINIC_OPERATORY_FILTERS.get(clinic)
+    if f:
+        logger.info(f"Clinic {clinic}: filtering to ops {f}")
+        return f
+    logger.info(f"Clinic {clinic}: no operatory filter")
+    return []
 
-@retry
-def fetch_appointments(clinic: int, ops: List[int]) -> List[Dict[str, Any]]:
+def fetch_appointments(
+    clinic: int,
+    since: Optional[datetime.datetime],
+    ops: List[int]
+) -> List[Dict[str, Any]]:
+    """
+    First run (didFull=False): fetch next 30 days, no DateTStamp param.
+    Subsequent: include DateTStamp=since to only pull new/updated.
+    """
     now = datetime.datetime.utcnow()
-    start_str = now.strftime("%Y-%m-%d")
-    end_str = (now + datetime.timedelta(hours=config.lookahead_hours)).strftime("%Y-%m-%d")
-    logger.info(f"Clinic {clinic}: fetching appointments from {start_str} to {end_str}")
-
-    all_appts: List[Dict[str, Any]] = []
-    for status in ['Scheduled','Complete','Broken']:
-        for op in ops:
-            params = {
-                'ClinicNum': clinic,
-                'dateStart': start_str,
-                'dateEnd': end_str,
-                'AptStatus': status,
-                'Op': op
-            }
-            resp = requests.get(
-                f"{config.api_base_url}/appointments",
-                headers=make_headers(),
-                params=params,
-                timeout=config.request_timeout
-            )
-            resp.raise_for_status()
-            items = resp.json()
-            if isinstance(items, dict):
-                items = [items]
-            for a in items:
-                a['_clinic'] = clinic
-                a['_operatory'] = op
-                all_appts.append(a)
-    return all_appts
-
-def should_sync_appointment(
-    appt: Dict[str, Any], 
-    last_sync_dt: datetime.datetime, 
-    synced_appointments: Dict[str, Dict[str, Any]]
-) -> Tuple[bool, str]:
-    """
-    Determine if an appointment should be synced.
-    Returns (should_sync, reason)
-    """
-    apt_num = str(appt.get('AptNum', ''))
-    if not apt_num:
-        return False, "No AptNum"
-    
-    # Check if we've seen this appointment before
-    if apt_num not in synced_appointments:
-        return True, "New appointment (not previously synced)"
-    
-    prev_sync = synced_appointments[apt_num]
-    
-    # Compare key fields to detect changes
-    current_fields = {
-        'AptDateTime': appt.get('AptDateTime'),
-        'AptStatus': appt.get('AptStatus'),
-        'Pattern': appt.get('Pattern'),
-        'Note': appt.get('Note'),
-        'PatNum': appt.get('PatNum'),
-        'Op': appt.get('Op')
+    start = now.strftime("%Y-%m-%d")
+    end   = (now + datetime.timedelta(hours=LOOKAHEAD_HOURS)).strftime("%Y-%m-%d")
+    params = {
+        'ClinicNum': clinic,
+        'dateStart': start,
+        'dateEnd':   end
     }
-    
-    # Check if any key field has changed
-    for field, current_val in current_fields.items():
-        prev_val = prev_sync.get(field)
-        if current_val != prev_val:
-            return True, f"Changed field: {field} (was: {prev_val}, now: {current_val})"
-    
-    # Check timestamps if available
-    date_tstamp = parse_iso(appt.get('DateTStamp'))
-    sec_date_tentry = parse_iso(appt.get('SecDateTEntry'))
-    
-    if date_tstamp and date_tstamp > last_sync_dt:
-        return True, f"DateTStamp newer than last sync: {date_tstamp.isoformat()}"
-    
-    if sec_date_tentry and sec_date_tentry > last_sync_dt:
-        return True, f"SecDateTEntry newer than last sync: {sec_date_tentry.isoformat()}"
-    
-    return False, "No changes detected"
+    if since:
+        params['DateTStamp'] = since.strftime("%Y-%m-%d %H:%M:%S")
+        logger.info(f"Clinic {clinic}: fetching updates since {params['DateTStamp']}")
 
-@retry
-def fetch_patient(pat_num: int) -> Dict[str, Any]:
+    try:
+        r = requests.get(
+            f"{API_BASE_URL}/appointments",
+            headers=make_auth_header(),
+            params=params,
+            timeout=30
+        )
+        r.raise_for_status()
+        data = r.json()
+        appts = data if isinstance(data, list) else [data]
+    except Exception as e:
+        logger.error(f"Error fetching appts for clinic {clinic}: {e}")
+        return []
+
+    # filter status + op
+    out = []
+    for a in appts:
+        if a.get('AptStatus') not in VALID_STATUSES:
+            continue
+        op = a.get('Op') or a.get('OperatoryNum')
+        if ops and op not in ops:
+            continue
+        out.append(a)
+    logger.info(f"Clinic {clinic}: fetched {len(appts)} raw, {len(out)} after filter")
+    return out
+
+def filter_new_appointments(
+    appts: List[Dict[str, Any]],
+    since: datetime.datetime
+) -> List[Dict[str, Any]]:
+    if not since:
+        return appts
+    new = []
+    for a in appts:
+        mod = parse_time(a.get('DateTStamp'))
+        if mod and mod > since:
+            new.append(a)
+    logger.info(f"{len(new)}/{len(appts)} are new/updated since {since.isoformat()}")
+    return new
+
+def get_patient_details(pat_num: int) -> Dict[str, Any]:
     if not pat_num:
         return {}
-    resp = requests.get(
-        f"{config.api_base_url}/patients/{pat_num}",
-        headers=make_headers(),
-        timeout=config.request_timeout
-    )
-    resp.raise_for_status()
-    return resp.json()
+    try:
+        r = requests.get(
+            f"{API_BASE_URL}/patients/{pat_num}",
+            headers=make_auth_header(), timeout=15
+        )
+        r.raise_for_status()
+        return r.json()
+    except:
+        try:
+            r = requests.get(
+                f"{API_BASE_URL}/patients",
+                headers=make_auth_header(),
+                params={'PatNum': pat_num}, timeout=15
+            )
+            r.raise_for_status()
+            d = r.json()
+            if isinstance(d, list) and d:
+                return d[0]
+        except Exception:
+            pass
+    return {}
 
-@retry
-def send_to_keragon(appt: Dict[str, Any], patient: Dict[str, Any]) -> Dict[str, Any]:
-    start, end, duration = get_times_pattern(appt)
+# === KERAGON SYNC ===
+def send_to_keragon(appt: Dict[str, Any]) -> bool:
+    # patient name
+    name = f"{appt.get('FName','')} {appt.get('LName','')}".strip() or "Unknown"
+    # start/end
+    raw = appt.get('AptDateTime')
+    st = parse_time(raw)
+    if not st:
+        logger.error(f"Invalid start time for apt {appt.get('AptNum')}")
+        return False
+    st = convert_to_tz(st)
+    en = calculate_end_time(st, appt.get('Pattern',''))
+    # log
+    logger.info(
+        f"Syncing Apt {appt.get('AptNum')} for {name} "
+        f"on {st.date()} from {st.time()} to {en.time()}"
+    )
+    # build payload
+    patient = get_patient_details(appt.get('PatNum'))
     payload = {
         'appointmentId': str(appt.get('AptNum')),
-        'appointmentTime': start.isoformat() if start else '',
-        'appointmentEndTime': end.isoformat() if end else '',
-        'appointmentDurationMinutes': duration,
+        'appointmentTime': st.isoformat(),
+        'appointmentEndTime': en.isoformat(),
+        'appointmentDurationMinutes': int((en-st).total_seconds()/60),
         'status': appt.get('AptStatus'),
-        'notes': appt.get('Note', '') + ' [fromOD]',
-        # Full patient payload:
+        'notes': appt.get('Note','') + ' [fromOD]',
         'patientId': str(appt.get('PatNum')),
-        'firstName': patient.get('FName', ''),
-        'lastName': patient.get('LName', ''),
-        'email': patient.get('Email', ''),
-        'phone': patient.get('WirelessPhone') or patient.get('HmPhone') or '',
-        'gender': patient.get('Gender', ''),
-        'birthdate': patient.get('Birthdate', ''),
-        'address': patient.get('Address', ''),
-        'address2': patient.get('Address2', ''),
-        'city': patient.get('City', ''),
-        'state': patient.get('State', ''),
-        'zipCode': patient.get('Zip', ''),
-        'balance': patient.get('Balance', 0),
+        'firstName': patient.get('FName', appt.get('FName','')),
+        'lastName': patient.get('LName', appt.get('LName','')),
+        'email': patient.get('Email',''),
+        'phone': patient.get('WirelessPhone','') or patient.get('HmPhone',''),
+        'gender': patient.get('Gender',''),
+        'birthdate': patient.get('Birthdate',''),
+        'address': patient.get('Address',''),
+        'city': patient.get('City',''),
+        'state': patient.get('State',''),
+        'zipCode': patient.get('Zip',''),
+        'balance': patient.get('Balance', 0)
     }
-    clean = {k: v for k, v in payload.items() if v not in (None, '', 0)}
-    requests.post(
-        config.keragon_webhook_url,
-        json=clean,
-        timeout=config.request_timeout
-    ).raise_for_status()
-    return {
-        'clinic': appt.get('_clinic'),
-        'operatory': appt.get('_operatory'),
-        'apt': appt.get('AptNum'),
-        'first': patient.get('FName', ''),
-        'last': patient.get('LName', ''),
-        'start': start.isoformat() if start else '',
-        'end': end.isoformat() if end else '',
-        'date_tstamp': appt.get('DateTStamp', ''),
-        'sec_date_tentry': appt.get('SecDateTEntry', '')
-    }
+    try:
+        r = requests.post(KERAGON_WEBHOOK_URL, json=payload, timeout=30)
+        r.raise_for_status()
+        logger.debug(f"Payload sent: {payload}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to send Apt {appt.get('AptNum')}: {e}")
+        return False
 
-def run():
-    state, first_run_flag = load_state()
-    
-    # Initialize state structure
-    if 'last_sync' not in state:
-        state['last_sync'] = {}
-    if 'synced_appointments' not in state:
-        state['synced_appointments'] = {}
+def process_appointments(
+    clinic: int,
+    appts: List[Dict[str, Any]],
+    lastSync: Optional[datetime.datetime],
+    didFull: bool
+) -> Dict[str, Any]:
+    now = datetime.datetime.utcnow()
+    to_send = appts if not didFull or lastSync is None else filter_new_appointments(appts, lastSync)
+    if not to_send:
+        logger.info(f"Clinic {clinic}: no new appointments to sync")
+        return {'newLastSync': lastSync, 'didFull': True}
+    logger.info(f"Clinic {clinic}: syncing {len(to_send)} appointment(s)")
+    for a in to_send:
+        send_to_keragon(a)
+    return {'newLastSync': now, 'didFull': True}
 
-    for clinic in config.clinic_nums:
-        all_ops = fetch_operatories(clinic)
-        ops = config.operatory_filters.get(clinic, all_ops)
-        logger.info(f"Clinic {clinic}: found ops {all_ops}, using {ops}")
+# === MAIN SYNC ===
+def run_sync():
+    if not (DEVELOPER_KEY and CUSTOMER_KEY and KERAGON_WEBHOOK_URL):
+        logger.critical("Missing API keys or webhook URL")
+        sys.exit(1)
+    if not CLINIC_NUMS:
+        logger.critical("No CLINIC_NUMS configured")
+        sys.exit(1)
 
-        appts = fetch_appointments(clinic, ops)
-        logger.info(f"Clinic {clinic}: total fetched appointments: {len(appts)}")
+    logger.info(f"Starting sync for clinics: {CLINIC_NUMS}")
+    state = load_last_sync_state()
+    new_state = {}
 
-        if first_run_flag:
-            to_send = appts
-            logger.info(f"Clinic {clinic}: first-ever run → sending all {len(to_send)} appointments")
-        else:
-            since_str = state['last_sync'].get(str(clinic), '')
-            since_dt = parse_iso(since_str) or datetime.datetime(1970, 1, 1)
-            synced_appointments = state['synced_appointments']
-            
-            to_send = []
-            sync_reasons = []
-            
-            for appt in appts:
-                should_sync, reason = should_sync_appointment(appt, since_dt, synced_appointments)
-                if should_sync:
-                    to_send.append(appt)
-                    sync_reasons.append((appt.get('AptNum'), reason))
-            
-            logger.info(f"Clinic {clinic}: last sync was at {since_dt.isoformat()}")
-            logger.info(
-                f"Clinic {clinic}: subsequent run → filtered to {len(to_send)} "
-                f"appointments (out of {len(appts)} total) that are new/modified since last sync"
-            )
-            
-            # Show examples of what's being synced and why
-            for i, (apt_num, reason) in enumerate(sync_reasons[:3]):
-                logger.info(f"  Example {i+1}: AptNum {apt_num} - {reason}")
-            
-            if len(sync_reasons) > 3:
-                logger.info(f"  ... and {len(sync_reasons) - 3} more appointments")
+    for clinic in CLINIC_NUMS:
+        logger.info(f"--- Clinic {clinic} ---")
+        _ = list_operatories_for_clinic(clinic)
+        ops = get_filtered_ops(clinic)
 
-        # Fetch patients for appointments to sync
-        patients: Dict[int, Dict[str, Any]] = {}
-        if to_send:
-            with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
-                futures = {executor.submit(fetch_patient, a['PatNum']): a for a in to_send}
-                for fut in as_completed(futures):
-                    ap = futures[fut]
-                    patients[ap['PatNum']] = fut.result()
+        lastSync = state[clinic]['lastSync']
+        didFull   = state[clinic]['didFull']
+        appts = fetch_appointments(clinic, lastSync, ops)
 
-            # Send to Keragon and update state
-            for appt in to_send:
-                info = send_to_keragon(appt, patients.get(appt['PatNum'], {}))
-                logger.info(f"[KERAGON] {info['first']} {info['last']} | {info['start']} → {info['end']} | Mod: {info['date_tstamp']} | Created: {info['sec_date_tentry']}")
-                
-                # Track this appointment in our state
-                apt_num = str(appt.get('AptNum'))
-                state['synced_appointments'][apt_num] = {
-                    'AptDateTime': appt.get('AptDateTime'),
-                    'AptStatus': appt.get('AptStatus'),
-                    'Pattern': appt.get('Pattern'),
-                    'Note': appt.get('Note'),
-                    'PatNum': appt.get('PatNum'),
-                    'Op': appt.get('Op'),
-                    'last_synced': datetime.datetime.utcnow().isoformat()
-                }
+        result = process_appointments(clinic, appts, lastSync, didFull)
+        new_state[clinic] = {
+            'lastSync': result['newLastSync'],
+            'didFull': result['didFull']
+        }
 
-        # Update last sync time for this clinic
-        state['last_sync'][str(clinic)] = datetime.datetime.utcnow().isoformat()
+    save_last_sync_state(new_state)
+    logger.info("Sync complete")
 
-    save_state(state)
-
-if __name__ == '__main__':
+# === CLI ===
+if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description='OpenDental → Keragon Sync')
-    parser.add_argument('--reset', action='store_true', help='Clear sync state')
-    parser.add_argument('--verbose', action='store_true', help='Debug logging')
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description='Sync OpenDental → Keragon')
+    p.add_argument('--reset', action='store_true', help='Clear state file')
+    p.add_argument('--verbose', action='store_true', help='Debug logging')
+    args = p.parse_args()
 
     if args.verbose:
         logger.setLevel(logging.DEBUG)
-    if args.reset:
-        try:
-            os.remove(config.state_file)
-        except FileNotFoundError:
-            pass
+    if args.reset and os.path.exists(STATE_FILE):
+        os.remove(STATE_FILE)
+        logger.info("State file cleared")
         sys.exit(0)
 
-    run()
+    run_sync()
