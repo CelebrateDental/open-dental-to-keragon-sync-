@@ -40,9 +40,6 @@ logger = logging.getLogger('opendental_sync')
 
 # === STATE MANAGEMENT ===
 def load_last_sync_times() -> Dict[int, Optional[datetime.datetime]]:
-    """
-    Load a per-clinic map of last-sync timestamps. Unknown or missing entries become None.
-    """
     state: Dict[int, Optional[datetime.datetime]] = {}
     if os.path.exists(STATE_FILE):
         try:
@@ -67,7 +64,6 @@ def load_last_sync_times() -> Dict[int, Optional[datetime.datetime]]:
 
 
 def save_last_sync_times(times: Dict[int, Optional[datetime.datetime]]) -> None:
-    """Save a per-clinic map of last-sync timestamps (ISO format or null)."""
     out: Dict[str, Optional[str]] = {}
     for c, dt in times.items():
         out[str(c)] = dt.isoformat() if dt else None
@@ -176,15 +172,22 @@ def get_patient_details(pat_num: int) -> Dict[str, Any]:
 
 # === PROVIDER FETCH ===
 def get_provider_name(prov_id: Optional[int]) -> str:
+    """
+    Fetch provider via list endpoint by filter, since direct GET may not be supported.
+    """
     if not prov_id:
         return ''
     try:
         rprov = requests.get(
-            f"{API_BASE_URL}/providers/{prov_id}",
-            headers=make_auth_header(), timeout=15
+            f"{API_BASE_URL}/providers",
+            headers=make_auth_header(),
+            params={'ProvNum': prov_id},
+            timeout=15
         )
         rprov.raise_for_status()
-        pr = rprov.json()
+        data = rprov.json()
+        # data may be a list
+        pr = data[0] if isinstance(data, list) and data else data
         return f"{pr.get('FName','').strip()} {pr.get('LName','').strip()}".strip()
     except Exception:
         logger.warning(f"Could not fetch provider {prov_id}")
@@ -197,7 +200,6 @@ def send_to_keragon(appt: Dict[str, Any]) -> bool:
     last = patient.get('LName') or appt.get('LName', '')
     name = f"{first} {last}".strip() or 'Unknown'
 
-    # provider
     prov_id = appt.get('ProvNum') or appt.get('ProviderNum')
     provider_name = get_provider_name(prov_id)
 
