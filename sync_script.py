@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-OpenDental → Keragon Appointment Sync with Appointment Detail Logging
+OpenDental → Keragon Appointment Sync (Pattern duration, NO skip for note tags, detailed logs)
 """
 
 import os
@@ -118,8 +118,6 @@ def fetch_appointments(clinic: int, ops: List[int], since: Optional[datetime.dat
             params = base.copy()
             params['AptStatus'] = status
             params['Op'] = oper
-            if not first_run and since:
-                params['DateTStamp'] = since.isoformat()
             resp = requests.get(f"{config.api_base_url}/appointments", headers=make_headers(), params=params, timeout=config.request_timeout)
             resp.raise_for_status()
             data = resp.json()
@@ -128,6 +126,16 @@ def fetch_appointments(clinic: int, ops: List[int], since: Optional[datetime.dat
                 ap['_clinic'] = clinic
                 ap['_operatory'] = oper
                 all_appts.append(ap)
+
+    logger.info(f"Clinic {clinic}: total fetched appointments: {len(all_appts)}")
+
+    if not first_run and since:
+        before = len(all_appts)
+        all_appts = [a for a in all_appts if parse_iso(a.get('DateTStamp')) and parse_iso(a['DateTStamp']) > since]
+        logger.info(f"Clinic {clinic}: after filter by DateTStamp: {len(all_appts)} (filtered out {before - len(all_appts)})")
+    else:
+        logger.info(f"Clinic {clinic}: first run, no filter")
+
     return all_appts
 
 @retry
@@ -188,7 +196,6 @@ def run(force_first: bool = False):
 
         since = None if overall_first else last_state.get(clinic)
         appts = fetch_appointments(clinic, ops_to_process, since, overall_first)
-        logger.info(f"Clinic {clinic}: found {len(appts)} appointments to process")
 
         patients = {}
         with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
@@ -197,23 +204,16 @@ def run(force_first: bool = False):
                 patients[futures[fut]] = fut.result()
 
         sent_count = 0
-        sent_appointments = []
 
         for appt in appts:
             try:
                 info = send_to_keragon(appt, patients.get(appt.get('PatNum'), {}))
                 sent_count += 1
-                sent_appointments.append(f"{info['first']} {info['last']} | {info['start']} → {info['end']}")
-                logger.debug(
-                    f"Synced apt {info['apt']} (clinic {info['clinic']}, op {info['operatory']}) "
-                    f"for {info['first']} {info['last']} from {info['start']} to {info['end']}"
-                )
+                logger.info(f"[KERAGON SYNCED] {info['first']} {info['last']} | {info['start']} → {info['end']}")
             except Exception as e:
                 logger.error(f"Error sending apt {appt.get('AptNum')}: {e}")
 
-        for detail in sent_appointments:
-            logger.info(f"[KERAGON SYNCED] {detail}")
-        logger.info(f"Clinic {clinic}: done. {sent_count} appointments processed.")
+        logger.info(f"Clinic {clinic}: TOTAL pulled: {len(appts)}, sent: {sent_count}")
         new_state[clinic] = datetime.datetime.utcnow()
 
     save_state(new_state)
