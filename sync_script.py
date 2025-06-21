@@ -5,11 +5,11 @@ import json
 import logging
 import datetime
 import requests
+from datetime import timezone, timedelta
 from zoneinfo import ZoneInfo
 from typing import List, Dict, Any, Optional
 
 # For a fixed GMT-05:00 offset (no DST)
-from datetime import timezone, timedelta
 FIXED_MINUS_5 = timezone(timedelta(hours=-5))
 
 # === CONFIGURATION ===
@@ -22,10 +22,7 @@ STATE_FILE      = 'last_sync_state.json'
 LOG_LEVEL       = os.environ.get('LOG_LEVEL', 'INFO')
 LOOKAHEAD_HOURS = int(os.environ.get('LOOKAHEAD_HOURS', '720'))
 
-CLINIC_NUMS = [
-    int(x) for x in os.environ.get('CLINIC_NUMS', '').split(',')
-    if x.strip().isdigit()
-]
+CLINIC_NUMS = [int(x) for x in os.environ.get('CLINIC_NUMS', '').split(',') if x.strip().isdigit()]
 
 CLINIC_OPERATORY_FILTERS: Dict[int, List[int]] = {
     9034: [11579, 11580, 11588],
@@ -61,7 +58,7 @@ def load_last_sync_times() -> Dict[int, Optional[datetime.datetime]]:
 
 
 def save_last_sync_times(times: Dict[int, Optional[datetime.datetime]]) -> None:
-    out: Dict[str, Optional[str]] = {str(c): dt.isoformat() if dt else None for c, dt in times.items()}
+    out = {str(c): dt.isoformat() if dt else None for c, dt in times.items()}
     try:
         with open(STATE_FILE, 'w') as f:
             json.dump(out, f, indent=2)
@@ -70,14 +67,10 @@ def save_last_sync_times(times: Dict[int, Optional[datetime.datetime]]) -> None:
 
 # === UTILITIES ===
 def parse_time(s: Optional[str]) -> Optional[datetime.datetime]:
-    """
-    Parse API timestamp; if it ends with Z, treat as UTC.
-    """
     if not s:
         return None
     try:
         if s.endswith('Z'):
-            # replace Z with +00:00 for fromisoformat
             s = s[:-1] + '+00:00'
         return datetime.datetime.fromisoformat(s)
     except ValueError:
@@ -86,18 +79,21 @@ def parse_time(s: Optional[str]) -> Optional[datetime.datetime]:
 
 
 def convert_to_tz(dt: datetime.datetime) -> datetime.datetime:
-    """
-    Convert any datetime into a fixed GMT-05:00 offset.
-    """
     if dt.tzinfo:
-        # normalize to UTC then to fixed -05:00
         return dt.astimezone(timezone.utc).astimezone(FIXED_MINUS_5)
-    # naive -> assume local and tag as -05:00
     return dt.replace(tzinfo=FIXED_MINUS_5)
 
+# === DURATION CALCULATION ===
+def calculate_pattern_duration(pattern: str, minutes_per_slot: int = 5) -> int:
+    return sum(1 for ch in (pattern or '').upper() if ch in ('X', '/')) * minutes_per_slot
 
-def make_auth_header() -> Dict[str, str]:
-    return {'Authorization': f'ODFHIR {DEVELOPER_KEY}/{CUSTOMER_KEY}', 'Content-Type': 'application/json'}
+
+def calculate_end_time(start_dt: datetime.datetime, pattern: str) -> datetime.datetime:
+    dur = calculate_pattern_duration(pattern)
+    if dur <= 0:
+        logger.warning(f"No slots in pattern '{pattern}', defaulting to 60 minutes")
+        dur = 60
+    return start_dt + datetime.timedelta(minutes=dur)
 
 # === APPOINTMENT FETCHING ===
 def get_filtered_ops(clinic: int) -> List[int]:
@@ -110,9 +106,11 @@ def fetch_appointments(
     ops: List[int]
 ) -> List[Dict[str, Any]]:
     now = datetime.datetime.utcnow().replace(tzinfo=timezone.utc)
-    params = {'ClinicNum': clinic,
-              'dateStart': now.astimezone(FIXED_MINUS_5).strftime('%Y-%m-%d'),
-              'dateEnd': (now + datetime.timedelta(hours=LOOKAHEAD_HOURS)).astimezone(FIXED_MINUS_5).strftime('%Y-%m-%d')}
+    params = {
+        'ClinicNum': clinic,
+        'dateStart': now.astimezone(FIXED_MINUS_5).strftime('%Y-%m-%d'),
+        'dateEnd': (now + datetime.timedelta(hours=LOOKAHEAD_HOURS)).astimezone(FIXED_MINUS_5).strftime('%Y-%m-%d')
+    }
     if since:
         eff = since + datetime.timedelta(seconds=1)
         params['DateTStamp'] = eff.astimezone(FIXED_MINUS_5).strftime('%Y-%m-%d %H:%M:%S')
@@ -120,7 +118,8 @@ def fetch_appointments(
     try:
         r = requests.get(f"{API_BASE_URL}/appointments", headers=make_auth_header(), params=params, timeout=30)
         r.raise_for_status()
-        appts = r.json() if isinstance(r.json(), list) else [r.json()]
+        data = r.json()
+        appts = data if isinstance(data, list) else [data]
     except Exception as e:
         logger.error(f"Error fetching appointments for {clinic}: {e}")
         return []
@@ -131,7 +130,7 @@ def fetch_appointments(
     logger.info(f"Clinic {clinic}: {len(valid)} appointment(s) to sync")
     return valid
 
-
+# === PATIENT ===
 def get_patient_details(pat_num: int) -> Dict[str, Any]:
     if not pat_num:
         return {}
@@ -148,7 +147,6 @@ def send_to_keragon(appt: Dict[str, Any], clinic: int) -> bool:
     first = patient.get('FName') or appt.get('FName', '')
     last = patient.get('LName') or appt.get('LName', '')
     name = f"{first} {last}".strip() or 'Unknown'
-
     provider_name = 'Dr. Gharbi' if clinic == 9034 else 'Dr. Ensley'
 
     st = parse_time(appt.get('AptDateTime'))
@@ -158,8 +156,7 @@ def send_to_keragon(appt: Dict[str, Any], clinic: int) -> bool:
     st = convert_to_tz(st)
     en = calculate_end_time(st, appt.get('Pattern', ''))
 
-    logger.info(f"Syncing Apt {appt.get('AptNum')} for {name} ({provider_name}) "
-                f"from {st.isoformat()} to {en.isoformat()}")
+    logger.info(f"Syncing Apt {appt.get('AptNum')} for {name} ({provider_name}) from {st.isoformat()} to {en.isoformat()}")
 
     payload = {
         'appointmentId': str(appt.get('AptNum')),
@@ -190,7 +187,7 @@ def send_to_keragon(appt: Dict[str, Any], clinic: int) -> bool:
         logger.error(f"Failed to send Apt {appt.get('AptNum')}: {e}")
         return False
 
-
+# === MAIN ===
 def run_sync():
     if not (DEVELOPER_KEY and CUSTOMER_KEY and KERAGON_WEBHOOK_URL and CLINIC_NUMS):
         logger.critical("Missing configuration – check your environment variables")
