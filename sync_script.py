@@ -78,12 +78,6 @@ def parse_time(s: Optional[str]) -> Optional[datetime.datetime]:
         return None
 
 
-def convert_to_tz(dt: datetime.datetime) -> datetime.datetime:
-    if dt.tzinfo:
-        return dt.astimezone(timezone.utc).astimezone(FIXED_MINUS_5)
-    return dt.replace(tzinfo=FIXED_MINUS_5)
-
-
 def make_auth_header() -> Dict[str, str]:
     return {'Authorization': f'ODFHIR {DEVELOPER_KEY}/{CUSTOMER_KEY}', 'Content-Type': 'application/json'}
 
@@ -109,18 +103,25 @@ def fetch_appointments(
     since: Optional[datetime.datetime],
     ops: List[int]
 ) -> List[Dict[str, Any]]:
-    now = datetime.datetime.utcnow().replace(tzinfo=timezone.utc)
+    # Use UTC for date range and DateTStamp
+    now_utc = datetime.datetime.utcnow().replace(tzinfo=timezone.utc)
     params = {
         'ClinicNum': clinic,
-        'dateStart': now.astimezone(FIXED_MINUS_5).strftime('%Y-%m-%d'),
-        'dateEnd': (now + datetime.timedelta(hours=LOOKAHEAD_HOURS)).astimezone(FIXED_MINUS_5).strftime('%Y-%m-%d')
+        'dateStart': now_utc.strftime('%Y-%m-%d'),
+        'dateEnd': (now_utc + datetime.timedelta(hours=LOOKAHEAD_HOURS)).strftime('%Y-%m-%d')
     }
     if since:
-        eff = since + datetime.timedelta(seconds=1)
-        params['DateTStamp'] = eff.astimezone(FIXED_MINUS_5).strftime('%Y-%m-%d %H:%M:%S')
-        logger.info(f"Clinic {clinic}: fetching after {eff.isoformat()}")
+        # bump by 1s then convert to UTC string
+        eff_utc = (since + datetime.timedelta(seconds=1)).astimezone(timezone.utc)
+        params['DateTStamp'] = eff_utc.strftime('%Y-%m-%d %H:%M:%S')
+        logger.info(f"Clinic {clinic}: fetching after UTC {params['DateTStamp']}")
     try:
-        r = requests.get(f"{API_BASE_URL}/appointments", headers=make_auth_header(), params=params, timeout=30)
+        r = requests.get(
+            f"{API_BASE_URL}/appointments",
+            headers=make_auth_header(),
+            params=params,
+            timeout=30
+        )
         r.raise_for_status()
         data = r.json()
         appts = data if isinstance(data, list) else [data]
@@ -132,6 +133,7 @@ def fetch_appointments(
              if a.get('AptStatus') in VALID_STATUSES
              and ((a.get('Op') or a.get('OperatoryNum')) in ops if ops else True)]
     logger.info(f"Clinic {clinic}: {len(valid)} appointment(s) to sync")
+    logger.debug(f"Returned IDs: {[a.get('AptNum') for a in valid]}")
     return valid
 
 # === PATIENT ===
@@ -139,7 +141,11 @@ def get_patient_details(pat_num: int) -> Dict[str, Any]:
     if not pat_num:
         return {}
     try:
-        r = requests.get(f"{API_BASE_URL}/patients/{pat_num}", headers=make_auth_header(), timeout=15)
+        r = requests.get(
+            f"{API_BASE_URL}/patients/{pat_num}",
+            headers=make_auth_header(),
+            timeout=15
+        )
         r.raise_for_status()
         return r.json()
     except Exception:
@@ -157,16 +163,24 @@ def send_to_keragon(appt: Dict[str, Any], clinic: int) -> bool:
     if not st:
         logger.error(f"Invalid start time for Apt {appt.get('AptNum')}")
         return False
-    st = convert_to_tz(st)
-    en = calculate_end_time(st, appt.get('Pattern', ''))
+    # assume dt is UTC or includes offset
+    st_utc = st.astimezone(timezone.utc)
+    # convert for payload: use UTC ISO (with Z)
+    st_payload = st_utc.isoformat(timespec='seconds').replace('+00:00', 'Z')
 
-    logger.info(f"Syncing Apt {appt.get('AptNum')} for {name} ({provider_name}) from {st.isoformat()} to {en.isoformat()}")
+    en_utc = calculate_end_time(st_utc, appt.get('Pattern', ''))
+    en_payload = en_utc.isoformat(timespec='seconds').replace('+00:00', 'Z')
+
+    logger.info(
+        f"Syncing Apt {appt.get('AptNum')} for {name} "
+        f"({provider_name}) from {st_payload} to {en_payload}"
+    )
 
     payload = {
         'appointmentId': str(appt.get('AptNum')),
-        'appointmentTime': st.isoformat(),
-        'appointmentEndTime': en.isoformat(),
-        'appointmentDurationMinutes': int((en - st).total_seconds() / 60),
+        'appointmentTime': st_payload,
+        'appointmentEndTime': en_payload,
+        'appointmentDurationMinutes': int((en_utc - st_utc).total_seconds() / 60),
         'status': appt.get('AptStatus'),
         'notes': appt.get('Note', '') + ' [fromOD]',
         'patientId': str(appt.get('PatNum')),
@@ -208,7 +222,7 @@ def run_sync():
             if send_to_keragon(appt, clinic):
                 sent += 1
         logger.info(f"Clinic {clinic}: sent {sent} appointment(s)")
-        new_syncs[clinic] = datetime.datetime.utcnow().replace(tzinfo=FIXED_MINUS_5)
+        new_syncs[clinic] = datetime.datetime.now(timezone.utc)
 
     save_last_sync_times(new_syncs)
     logger.info("All clinics synced; state file updated.")
