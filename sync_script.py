@@ -9,9 +9,6 @@ from datetime import timezone, timedelta
 from zoneinfo import ZoneInfo
 from typing import List, Dict, Any, Optional
 
-# For a fixed GMT-05:00 offset (no DST)
-FIXED_MINUS_5 = timezone(timedelta(hours=-5))
-
 # === CONFIGURATION ===
 API_BASE_URL        = os.environ.get('OPEN_DENTAL_API_URL', 'https://api.opendental.com/api/v1')
 DEVELOPER_KEY       = os.environ.get('OPEN_DENTAL_DEVELOPER_KEY')
@@ -23,12 +20,10 @@ LOG_LEVEL       = os.environ.get('LOG_LEVEL', 'INFO')
 LOOKAHEAD_HOURS = int(os.environ.get('LOOKAHEAD_HOURS', '720'))
 
 CLINIC_NUMS = [int(x) for x in os.environ.get('CLINIC_NUMS', '').split(',') if x.strip().isdigit()]
-
 CLINIC_OPERATORY_FILTERS: Dict[int, List[int]] = {
     9034: [11579, 11580, 11588],
     9035: [11574, 11576, 11577],
 }
-
 VALID_STATUSES = {'Scheduled', 'Complete', 'Broken'}
 
 # === LOGGING ===
@@ -56,7 +51,6 @@ def load_last_sync_times() -> Dict[int, Optional[datetime.datetime]]:
         state = {c: None for c in CLINIC_NUMS}
     return state
 
-
 def save_last_sync_times(times: Dict[int, Optional[datetime.datetime]]) -> None:
     out = {str(c): dt.isoformat() if dt else None for c, dt in times.items()}
     try:
@@ -77,14 +71,12 @@ def parse_time(s: Optional[str]) -> Optional[datetime.datetime]:
         logger.warning(f"Unrecognized time format: {s}")
         return None
 
-
 def make_auth_header() -> Dict[str, str]:
     return {'Authorization': f'ODFHIR {DEVELOPER_KEY}/{CUSTOMER_KEY}', 'Content-Type': 'application/json'}
 
 # === DURATION CALCULATION ===
 def calculate_pattern_duration(pattern: str, minutes_per_slot: int = 5) -> int:
     return sum(1 for ch in (pattern or '').upper() if ch in ('X', '/')) * minutes_per_slot
-
 
 def calculate_end_time(start_dt: datetime.datetime, pattern: str) -> datetime.datetime:
     dur = calculate_pattern_duration(pattern)
@@ -97,12 +89,9 @@ def calculate_end_time(start_dt: datetime.datetime, pattern: str) -> datetime.da
 def get_filtered_ops(clinic: int) -> List[int]:
     return CLINIC_OPERATORY_FILTERS.get(clinic, [])
 
-
-def fetch_appointments(
-    clinic: int,
-    since: Optional[datetime.datetime],
-    ops: List[int]
-) -> List[Dict[str, Any]]:
+def fetch_appointments(clinic: int,
+                       since: Optional[datetime.datetime],
+                       ops: List[int]) -> List[Dict[str, Any]]:
     now_utc = datetime.datetime.utcnow().replace(tzinfo=timezone.utc)
     params = {
         'ClinicNum': clinic,
@@ -110,24 +99,21 @@ def fetch_appointments(
         'dateEnd': (now_utc + datetime.timedelta(hours=LOOKAHEAD_HOURS)).strftime('%Y-%m-%d')
     }
     if since:
+        # bump by 1s, convert to UTC for server filter
         eff_utc = (since + datetime.timedelta(seconds=1)).astimezone(timezone.utc)
         params['DateTStamp'] = eff_utc.strftime('%Y-%m-%d %H:%M:%S')
         logger.info(f"Clinic {clinic}: fetching after UTC {params['DateTStamp']}")
     logger.debug(f"→ GET /appointments with params: {params}")
     try:
-        r = requests.get(
-            f"{API_BASE_URL}/appointments",
-            headers=make_auth_header(),
-            params=params,
-            timeout=30
-        )
+        r = requests.get(f"{API_BASE_URL}/appointments",
+                         headers=make_auth_header(),
+                         params=params, timeout=30)
         r.raise_for_status()
         data = r.json()
         appts = data if isinstance(data, list) else [data]
     except Exception as e:
         logger.error(f"Error fetching appointments for {clinic}: {e}")
         return []
-
     valid = [a for a in appts
              if a.get('AptStatus') in VALID_STATUSES
              and ((a.get('Op') or a.get('OperatoryNum')) in ops if ops else True)]
@@ -140,11 +126,8 @@ def get_patient_details(pat_num: int) -> Dict[str, Any]:
     if not pat_num:
         return {}
     try:
-        r = requests.get(
-            f"{API_BASE_URL}/patients/{pat_num}",
-            headers=make_auth_header(),
-            timeout=15
-        )
+        r = requests.get(f"{API_BASE_URL}/patients/{pat_num}",
+                         headers=make_auth_header(), timeout=15)
         r.raise_for_status()
         return r.json()
     except Exception:
@@ -158,14 +141,21 @@ def send_to_keragon(appt: Dict[str, Any], clinic: int) -> bool:
     name = f"{first} {last}".strip() or 'Unknown'
     provider_name = 'Dr. Gharbi' if clinic == 9034 else 'Dr. Ensley'
 
+    # parse and ensure tz-aware
     st = parse_time(appt.get('AptDateTime'))
     if not st:
         logger.error(f"Invalid start time for Apt {appt.get('AptNum')}")
         return False
+    if st.tzinfo is None:
+        st = st.replace(tzinfo=ZoneInfo('America/Chicago'))
+    # convert to UTC for payload
     st_utc = st.astimezone(timezone.utc)
     st_payload = st_utc.isoformat(timespec='seconds').replace('+00:00', 'Z')
 
-    en_utc = calculate_end_time(st_utc, appt.get('Pattern', ''))
+    en_local = calculate_end_time(st, appt.get('Pattern', ''))
+    if en_local.tzinfo is None:
+        en_local = en_local.replace(tzinfo=ZoneInfo('America/Chicago'))
+    en_utc = en_local.astimezone(timezone.utc)
     en_payload = en_utc.isoformat(timespec='seconds').replace('+00:00', 'Z')
 
     logger.info(
