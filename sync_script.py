@@ -10,7 +10,6 @@ from zoneinfo import ZoneInfo
 from typing import List, Dict, Any, Optional
 
 # === CONFIGURATION ===
-# (Ensure you set these env vars appropriately)
 API_BASE_URL        = os.environ.get('OPEN_DENTAL_API_URL', 'https://api.opendental.com/api/v1')
 DEVELOPER_KEY       = os.environ.get('OPEN_DENTAL_DEVELOPER_KEY')
 CUSTOMER_KEY        = os.environ.get('OPEN_DENTAL_CUSTOMER_KEY')
@@ -66,7 +65,6 @@ def parse_time(s: Optional[str]) -> Optional[datetime.datetime]:
     if not s:
         return None
     try:
-        # Handle UTC 'Z' suffix
         if s.endswith('Z'):
             s = s[:-1] + '+00:00'
         return datetime.datetime.fromisoformat(s)
@@ -76,10 +74,7 @@ def parse_time(s: Optional[str]) -> Optional[datetime.datetime]:
 
 
 def make_auth_header() -> Dict[str, str]:
-    return {
-        'Authorization': f'ODFHIR {DEVELOPER_KEY}/{CUSTOMER_KEY}',
-        'Content-Type': 'application/json'
-    }
+    return {'Authorization': f'ODFHIR {DEVELOPER_KEY}/{CUSTOMER_KEY}', 'Content-Type': 'application/json'}
 
 # === DURATION CALCULATION ===
 def calculate_pattern_duration(pattern: str, minutes_per_slot: int = 5) -> int:
@@ -110,18 +105,13 @@ def fetch_appointments(
         'dateEnd': (now_utc + datetime.timedelta(hours=LOOKAHEAD_HOURS)).strftime('%Y-%m-%d')
     }
     if since:
-        # Bump lastSync by 1s, then convert to UTC for the API filter
         eff_utc = (since + datetime.timedelta(seconds=1)).astimezone(timezone.utc)
         params['DateTStamp'] = eff_utc.strftime('%Y-%m-%d %H:%M:%S')
         logger.info(f"Clinic {clinic}: fetching after UTC {params['DateTStamp']}")
     logger.debug(f"→ GET /appointments with params: {params}")
     try:
-        r = requests.get(
-            f"{API_BASE_URL}/appointments",
-            headers=make_auth_header(),
-            params=params,
-            timeout=30
-        )
+        r = requests.get(f"{API_BASE_URL}/appointments",
+                         headers=make_auth_header(), params=params, timeout=30)
         r.raise_for_status()
         data = r.json()
         appts = data if isinstance(data, list) else [data]
@@ -141,11 +131,7 @@ def get_patient_details(pat_num: int) -> Dict[str, Any]:
     if not pat_num:
         return {}
     try:
-        r = requests.get(
-            f"{API_BASE_URL}/patients/{pat_num}",
-            headers=make_auth_header(),
-            timeout=15
-        )
+        r = requests.get(f"{API_BASE_URL}/patients/{pat_num}", headers=make_auth_header(), timeout=15)
         r.raise_for_status()
         return r.json()
     except Exception:
@@ -159,24 +145,24 @@ def send_to_keragon(appt: Dict[str, Any], clinic: int) -> bool:
     name = f"{first} {last}".strip() or 'Unknown'
     provider_name = 'Dr. Gharbi' if clinic == 9034 else 'Dr. Ensley'
 
-    # Parse and assign local tz (America/Chicago), then convert to UTC
+    # Parse raw time and assign America/Chicago timezone
     st = parse_time(appt.get('AptDateTime'))
     if not st:
         logger.error(f"Invalid start time for Apt {appt.get('AptNum')}")
         return False
     if st.tzinfo is None:
         st = st.replace(tzinfo=ZoneInfo('America/Chicago'))
-    st_utc = st.astimezone(timezone.utc)
-    st_payload = st_utc.isoformat(timespec='seconds').replace('+00:00', 'Z')
 
-    # Calculate end locally, then to UTC
-    en_local = calculate_end_time(st, appt.get('Pattern', ''))
-    if en_local.tzinfo is None:
-        en_local = en_local.replace(tzinfo=ZoneInfo('America/Chicago'))
-    en_utc = en_local.astimezone(timezone.utc)
-    en_payload = en_utc.isoformat(timespec='seconds').replace('+00:00', 'Z')
+    # Calculate end time in local
+    en = calculate_end_time(st, appt.get('Pattern', ''))
+    if en.tzinfo is None:
+        en = en.replace(tzinfo=ZoneInfo('America/Chicago'))
 
-    logger.debug(f"Converted local {st} → UTC Z {st_payload}")
+    # Payload uses local ISO with offset [-05:00]
+    st_payload = st.isoformat(timespec='seconds')
+    en_payload = en.isoformat(timespec='seconds')
+
+    logger.debug(f"Converted local start {st} → payload {st_payload}")
     logger.info(
         f"Syncing Apt {appt.get('AptNum')} for {name} "
         f"({provider_name}) from {st_payload} to {en_payload}"
@@ -186,7 +172,7 @@ def send_to_keragon(appt: Dict[str, Any], clinic: int) -> bool:
         'appointmentId': str(appt.get('AptNum')),
         'appointmentTime': st_payload,
         'appointmentEndTime': en_payload,
-        'appointmentDurationMinutes': int((en_utc - st_utc).total_seconds() / 60),
+        'appointmentDurationMinutes': int((en - st).total_seconds() / 60),
         'status': appt.get('AptStatus'),
         'notes': appt.get('Note', '') + ' [fromOD]',
         'patientId': str(appt.get('PatNum')),
