@@ -103,7 +103,6 @@ def fetch_appointments(
     since: Optional[datetime.datetime],
     ops: List[int]
 ) -> List[Dict[str, Any]]:
-    # Use UTC for date range and DateTStamp
     now_utc = datetime.datetime.utcnow().replace(tzinfo=timezone.utc)
     params = {
         'ClinicNum': clinic,
@@ -111,10 +110,10 @@ def fetch_appointments(
         'dateEnd': (now_utc + datetime.timedelta(hours=LOOKAHEAD_HOURS)).strftime('%Y-%m-%d')
     }
     if since:
-        # bump by 1s then convert to UTC string
         eff_utc = (since + datetime.timedelta(seconds=1)).astimezone(timezone.utc)
         params['DateTStamp'] = eff_utc.strftime('%Y-%m-%d %H:%M:%S')
         logger.info(f"Clinic {clinic}: fetching after UTC {params['DateTStamp']}")
+    logger.debug(f"→ GET /appointments with params: {params}")
     try:
         r = requests.get(
             f"{API_BASE_URL}/appointments",
@@ -133,7 +132,7 @@ def fetch_appointments(
              if a.get('AptStatus') in VALID_STATUSES
              and ((a.get('Op') or a.get('OperatoryNum')) in ops if ops else True)]
     logger.info(f"Clinic {clinic}: {len(valid)} appointment(s) to sync")
-    logger.debug(f"Returned IDs: {[a.get('AptNum') for a in valid]}")
+    logger.debug(f"← fetched IDs: {[a.get('AptNum') for a in valid]}")
     return valid
 
 # === PATIENT ===
@@ -163,9 +162,7 @@ def send_to_keragon(appt: Dict[str, Any], clinic: int) -> bool:
     if not st:
         logger.error(f"Invalid start time for Apt {appt.get('AptNum')}")
         return False
-    # assume dt is UTC or includes offset
     st_utc = st.astimezone(timezone.utc)
-    # convert for payload: use UTC ISO (with Z)
     st_payload = st_utc.isoformat(timespec='seconds').replace('+00:00', 'Z')
 
     en_utc = calculate_end_time(st_utc, appt.get('Pattern', ''))
