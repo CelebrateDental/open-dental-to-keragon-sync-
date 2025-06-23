@@ -314,8 +314,8 @@ def run_sync(dry_run: bool = False):
                     sent_appointments.add(apt_num)
                 
                 # Update latest timestamp based on DateTStamp or current time
-                        appt_timestamp = parse_time(appt.get('DateTStamp'))
-        if appt_timestamp:
+           appt_timestamp = parse_time(appt.get('DateTStamp'))
+           if appt_timestamp:
             if latest_timestamp and latest_timestamp.tzinfo is None:
                 latest_timestamp = latest_timestamp.replace(tzinfo=timezone.utc)
             if not latest_timestamp or appt_timestamp > latest_timestamp:
