@@ -314,11 +314,14 @@ def run_sync(dry_run: bool = False):
                     sent_appointments.add(apt_num)
                 
                 # Update latest timestamp based on DateTStamp or current time
-                appt_timestamp = parse_time(appt.get('DateTStamp'))
-                if appt_timestamp:
-                    if not latest_timestamp or appt_timestamp > latest_timestamp:
-                        latest_timestamp = appt_timestamp
-                        logger.debug(f"Updated latest timestamp to {latest_timestamp}")
+                        appt_timestamp = parse_time(appt.get('DateTStamp'))
+        if appt_timestamp:
+            if latest_timestamp and latest_timestamp.tzinfo is None:
+                latest_timestamp = latest_timestamp.replace(tzinfo=timezone.utc)
+            if not latest_timestamp or appt_timestamp > latest_timestamp:
+                latest_timestamp = appt_timestamp
+                logger.debug(f"Updated latest timestamp to {latest_timestamp}")
+
             else:
                 logger.warning(f"Failed to send appointment {apt_num}")
 
