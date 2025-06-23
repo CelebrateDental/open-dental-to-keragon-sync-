@@ -308,8 +308,8 @@ def run_sync(dry_run: bool = False):
                 continue
 
             # Try to send
-                if send_to_keragon(appt, clinic, dry_run):
-                   clinic_sent += 1
+            if send_to_keragon(appt, clinic, dry_run):
+                clinic_sent += 1
                 if not dry_run:
                     sent_appointments.add(apt_num)
                 
@@ -321,8 +321,6 @@ def run_sync(dry_run: bool = False):
                     if not latest_timestamp or appt_timestamp > latest_timestamp:
                         latest_timestamp = appt_timestamp
                         logger.debug(f"Updated latest timestamp to {latest_timestamp}")
-
-
             else:
                 logger.warning(f"Failed to send appointment {apt_num}")
 
