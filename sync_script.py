@@ -355,68 +355,71 @@ def run_sync(dry_run: bool = False):
             logger.info(f"Clinic {clinic}: No appointments to process")
             # Still update sync time to current time to avoid re-querying same period
             new_syncs[clinic] = datetime.datetime.now(timezone.utc)
-            continue
-
-        clinic_sent = 0
-        clinic_skipped = 0
-        clinic_processed = 0
-        
-        # Track the latest timestamp we've processed (not just sent successfully)
-        latest_processed_timestamp = last_syncs.get(clinic)
-
-        # Sort appointments by DateTStamp to process in chronological order
-        appointments.sort(key=lambda x: parse_time(x.get('DateTStamp')) or datetime.datetime.min.replace(tzinfo=timezone.utc))
-
-        for appt in appointments:
-            apt_num = str(appt.get('AptNum', ''))
-            clinic_processed += 1
+            # DON'T continue here - let the code flow through to save the state
+        else:
+            clinic_sent = 0
+            clinic_skipped = 0
+            clinic_processed = 0
             
-            # Update latest processed timestamp for ANY appointment we process
-            appt_timestamp = parse_time(appt.get('DateTStamp'))
-            if appt_timestamp:
-                if not latest_processed_timestamp or appt_timestamp > latest_processed_timestamp:
-                    latest_processed_timestamp = appt_timestamp
-                    logger.debug(f"Updated latest processed timestamp to {latest_processed_timestamp}")
+            # Track the latest timestamp we've processed (not just sent successfully)
+            latest_processed_timestamp = last_syncs.get(clinic)
+
+            # Sort appointments by DateTStamp to process in chronological order
+            appointments.sort(key=lambda x: parse_time(x.get('DateTStamp')) or datetime.datetime.min.replace(tzinfo=timezone.utc))
+
+            for appt in appointments:
+                apt_num = str(appt.get('AptNum', ''))
+                clinic_processed += 1
+                
+                # Update latest processed timestamp for ANY appointment we process
+                appt_timestamp = parse_time(appt.get('DateTStamp'))
+                if appt_timestamp:
+                    if not latest_processed_timestamp or appt_timestamp > latest_processed_timestamp:
+                        latest_processed_timestamp = appt_timestamp
+                        logger.debug(f"Updated latest processed timestamp to {latest_processed_timestamp}")
+                
+                # Skip if already sent
+                if apt_num in sent_appointments:
+                    logger.debug(f"Skipping appointment {apt_num}: already sent")
+                    clinic_skipped += 1
+                    continue
+
+                # Try to send
+                if send_to_keragon(appt, clinic, dry_run):
+                    clinic_sent += 1
+                    if not dry_run:
+                        sent_appointments.add(apt_num)
+                else:
+                    logger.warning(f"Failed to send appointment {apt_num}")
+                    # Continue processing other appointments instead of stopping
+
+            # ALWAYS update sync time if we processed any appointments
+            # This prevents getting stuck on failed appointments
+            if clinic_processed > 0:
+                if latest_processed_timestamp and validate_sync_time_update(clinic, last_syncs.get(clinic), latest_processed_timestamp):
+                    new_syncs[clinic] = latest_processed_timestamp
+                    logger.info(f"Clinic {clinic}: Processed {clinic_processed} appointments, updated sync time to {latest_processed_timestamp}")
+                else:
+                    # Fallback to current time if no valid timestamp found
+                    new_syncs[clinic] = datetime.datetime.now(timezone.utc)
+                    logger.info(f"Clinic {clinic}: Processed {clinic_processed} appointments, updated sync time to current time")
             
-            # Skip if already sent
-            if apt_num in sent_appointments:
-                logger.debug(f"Skipping appointment {apt_num}: already sent")
-                clinic_skipped += 1
-                continue
+            logger.info(f"Clinic {clinic}: ✓ Sent {clinic_sent}, Skipped {clinic_skipped}, Total processed {clinic_processed}")
 
-            # Try to send
-            if send_to_keragon(appt, clinic, dry_run):
-                clinic_sent += 1
-                if not dry_run:
-                    sent_appointments.add(apt_num)
-            else:
-                logger.warning(f"Failed to send appointment {apt_num}")
-                # Continue processing other appointments instead of stopping
+            total_sent += clinic_sent
+            total_skipped += clinic_skipped  
+            total_processed += clinic_processed
 
-        # ALWAYS update sync time if we processed any appointments
-        # This prevents getting stuck on failed appointments
-        if clinic_processed > 0:
-            if latest_processed_timestamp and validate_sync_time_update(clinic, last_syncs.get(clinic), latest_processed_timestamp):
-                new_syncs[clinic] = latest_processed_timestamp
-                logger.info(f"Clinic {clinic}: Processed {clinic_processed} appointments, updated sync time to {latest_processed_timestamp}")
-            else:
-                # Fallback to current time if no valid timestamp found
-                new_syncs[clinic] = datetime.datetime.now(timezone.utc)
-                logger.info(f"Clinic {clinic}: Processed {clinic_processed} appointments, updated sync time to current time")
-        
-        logger.info(f"Clinic {clinic}: ✓ Sent {clinic_sent}, Skipped {clinic_skipped}, Total processed {clinic_processed}")
-
-        total_sent += clinic_sent
-        total_skipped += clinic_skipped  
-        total_processed += clinic_processed
-
-    # Save state atomically
+    # Save state atomically - THIS NOW ALWAYS GETS CALLED
     if not dry_run:
         try:
             save_state_atomically(new_syncs, sent_appointments)
+            logger.info("Successfully saved state files")
         except Exception as e:
             logger.error(f"Failed to save state: {e}")
             # Don't exit - this sync run was still successful
+    else:
+        logger.info("DRY RUN: State files not updated")
     
     logger.info("=== Sync Complete ===")
     logger.info(f"Total sent: {total_sent}")
