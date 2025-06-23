@@ -5,6 +5,8 @@ import json
 import logging
 import datetime
 import requests
+import tempfile
+import shutil
 from datetime import timezone, timedelta
 from zoneinfo import ZoneInfo
 from typing import List, Dict, Any, Optional, Set
@@ -38,7 +40,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger('opendental_sync')
 
-# === STATE MANAGEMENT ===
+# === IMPROVED STATE MANAGEMENT ===
 def load_last_sync_times() -> Dict[int, Optional[datetime.datetime]]:
     state: Dict[int, Optional[datetime.datetime]] = {}
     if os.path.exists(STATE_FILE):
@@ -47,7 +49,14 @@ def load_last_sync_times() -> Dict[int, Optional[datetime.datetime]]:
                 data = json.load(f)
             for c in CLINIC_NUMS:
                 ts = data.get(str(c))
-                state[c] = datetime.datetime.fromisoformat(ts) if ts else None
+                if ts:
+                    dt = datetime.datetime.fromisoformat(ts)
+                    # Ensure timezone info is present
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    state[c] = dt
+                else:
+                    state[c] = None
         except Exception as e:
             logger.error(f"Error reading state file: {e}")
             state = {c: None for c in CLINIC_NUMS}
@@ -55,14 +64,65 @@ def load_last_sync_times() -> Dict[int, Optional[datetime.datetime]]:
         state = {c: None for c in CLINIC_NUMS}
     return state
 
-def save_last_sync_times(times: Dict[int, Optional[datetime.datetime]]) -> None:
-    out = {str(c): dt.isoformat() if dt else None for c, dt in times.items()}
+def validate_sync_time_update(clinic: int, old_time: Optional[datetime.datetime], 
+                             new_time: Optional[datetime.datetime]) -> bool:
+    """Ensure we don't accidentally move sync time backwards"""
+    if not old_time:
+        return True  # First sync is always valid
+    
+    if not new_time:
+        logger.warning(f"Clinic {clinic}: Attempted to set null sync time")
+        return False
+    
+    # Ensure both have timezone info
+    if old_time.tzinfo is None:
+        old_time = old_time.replace(tzinfo=timezone.utc)
+    if new_time.tzinfo is None:
+        new_time = new_time.replace(tzinfo=timezone.utc)
+    
+    if new_time < old_time:
+        logger.warning(f"Clinic {clinic}: Attempted to move sync time backwards from {old_time} to {new_time}")
+        return False
+    
+    return True
+
+def save_state_atomically(sync_times: Dict[int, Optional[datetime.datetime]], 
+                         sent_ids: Set[str]) -> None:
+    """Save both state files atomically to avoid corruption"""
+    temp_sync_file = None
+    temp_sent_file = None
+    
     try:
-        with open(STATE_FILE, 'w') as f:
-            json.dump(out, f, indent=2)
-        logger.debug(f"Saved sync times: {out}")
+        # Save sync times
+        sync_data = {str(c): dt.isoformat() if dt else None for c, dt in sync_times.items()}
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.tmp', 
+                                        dir=os.path.dirname(STATE_FILE) or '.') as f:
+            json.dump(sync_data, f, indent=2)
+            temp_sync_file = f.name
+        
+        # Save sent appointments
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.tmp',
+                                        dir=os.path.dirname(SENT_APPTS_FILE) or '.') as f:
+            json.dump(list(sent_ids), f, indent=2)
+            temp_sent_file = f.name
+        
+        # Atomic moves
+        shutil.move(temp_sync_file, STATE_FILE)
+        shutil.move(temp_sent_file, SENT_APPTS_FILE)
+        
+        logger.debug(f"Atomically saved state files - sync times: {sync_data}")
+        logger.debug(f"Saved {len(sent_ids)} sent appointment IDs")
+        
     except Exception as e:
-        logger.error(f"Error saving state file: {e}")
+        logger.error(f"Error in atomic save: {e}")
+        # Clean up temp files if they exist
+        for temp_file in [temp_sync_file, temp_sent_file]:
+            if temp_file and os.path.exists(temp_file):
+                try:
+                    os.unlink(temp_file)
+                except:
+                    pass
+        raise
 
 def load_sent_appointments() -> Set[str]:
     """Load set of already sent appointment IDs"""
@@ -75,15 +135,6 @@ def load_sent_appointments() -> Set[str]:
             logger.error(f"Error reading sent appointments file: {e}")
     return set()
 
-def save_sent_appointments(sent_ids: Set[str]) -> None:
-    """Save set of sent appointment IDs"""
-    try:
-        with open(SENT_APPTS_FILE, 'w') as f:
-            json.dump(list(sent_ids), f, indent=2)
-        logger.debug(f"Saved {len(sent_ids)} sent appointment IDs")
-    except Exception as e:
-        logger.error(f"Error saving sent appointments: {e}")
-
 # === UTILITIES ===
 def parse_time(s: Optional[str]) -> Optional[datetime.datetime]:
     if not s:
@@ -91,7 +142,11 @@ def parse_time(s: Optional[str]) -> Optional[datetime.datetime]:
     try:
         if s.endswith('Z'):
             s = s[:-1] + '+00:00'
-        return datetime.datetime.fromisoformat(s)
+        dt = datetime.datetime.fromisoformat(s)
+        # Ensure timezone info
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
     except ValueError:
         logger.warning(f"Unrecognized time format: {s}")
         return None
@@ -127,6 +182,9 @@ def fetch_appointments(
     }
     
     if since:
+        # Ensure timezone info
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=timezone.utc)
         eff_utc = (since + datetime.timedelta(seconds=1)).astimezone(timezone.utc)
         params['DateTStamp'] = eff_utc.strftime('%Y-%m-%d %H:%M:%S')
         logger.info(f"Clinic {clinic}: fetching appointments modified after UTC {params['DateTStamp']}")
@@ -265,7 +323,7 @@ def send_to_keragon(appt: Dict[str, Any], clinic: int, dry_run: bool = False) ->
                 pass
         return False
 
-# === MAIN ===
+# === IMPROVED MAIN SYNC LOGIC ===
 def run_sync(dry_run: bool = False):
     if not (DEVELOPER_KEY and CUSTOMER_KEY and KERAGON_WEBHOOK_URL and CLINIC_NUMS):
         logger.critical("Missing configuration – check your environment variables")
@@ -283,6 +341,7 @@ def run_sync(dry_run: bool = False):
     
     total_sent = 0
     total_skipped = 0
+    total_processed = 0
 
     for clinic in CLINIC_NUMS:
         logger.info(f"--- Processing Clinic {clinic} ---")
@@ -290,16 +349,34 @@ def run_sync(dry_run: bool = False):
         # Fetch appointments
         appointments = fetch_appointments(clinic, last_syncs.get(clinic), get_filtered_ops(clinic))
         
+        # CRITICAL FIX: Always advance sync time if we made a successful API call
+        # This prevents getting stuck on the same timeframe even if no appointments are returned
         if not appointments:
             logger.info(f"Clinic {clinic}: No appointments to process")
+            # Still update sync time to current time to avoid re-querying same period
+            new_syncs[clinic] = datetime.datetime.now(timezone.utc)
             continue
 
         clinic_sent = 0
         clinic_skipped = 0
-        latest_timestamp = last_syncs.get(clinic)
+        clinic_processed = 0
+        
+        # Track the latest timestamp we've processed (not just sent successfully)
+        latest_processed_timestamp = last_syncs.get(clinic)
+
+        # Sort appointments by DateTStamp to process in chronological order
+        appointments.sort(key=lambda x: parse_time(x.get('DateTStamp')) or datetime.datetime.min.replace(tzinfo=timezone.utc))
 
         for appt in appointments:
             apt_num = str(appt.get('AptNum', ''))
+            clinic_processed += 1
+            
+            # Update latest processed timestamp for ANY appointment we process
+            appt_timestamp = parse_time(appt.get('DateTStamp'))
+            if appt_timestamp:
+                if not latest_processed_timestamp or appt_timestamp > latest_processed_timestamp:
+                    latest_processed_timestamp = appt_timestamp
+                    logger.debug(f"Updated latest processed timestamp to {latest_processed_timestamp}")
             
             # Skip if already sent
             if apt_num in sent_appointments:
@@ -312,52 +389,43 @@ def run_sync(dry_run: bool = False):
                 clinic_sent += 1
                 if not dry_run:
                     sent_appointments.add(apt_num)
-                
-                # Update latest timestamp based on DateTStamp or current time
-                appt_timestamp = parse_time(appt.get('DateTStamp'))
-                if appt_timestamp:
-                    # Ensure both timestamps have timezone info before comparing
-                    if latest_timestamp and latest_timestamp.tzinfo is None:
-                        latest_timestamp = latest_timestamp.replace(tzinfo=timezone.utc)
-                        logger.debug(f"Added UTC to latest_timestamp: {latest_timestamp}")
-                    
-                    if appt_timestamp.tzinfo is None:
-                        appt_timestamp = appt_timestamp.replace(tzinfo=timezone.utc)
-                        logger.debug(f"Added UTC to appt_timestamp: {appt_timestamp}")
-                    
-                    if not latest_timestamp or appt_timestamp > latest_timestamp:
-                        latest_timestamp = appt_timestamp
-                        logger.debug(f"Updated latest timestamp to {latest_timestamp}")
             else:
                 logger.warning(f"Failed to send appointment {apt_num}")
+                # Continue processing other appointments instead of stopping
 
-        # Update sync time only if we successfully sent appointments
-        if clinic_sent > 0:
-            new_syncs[clinic] = latest_timestamp or datetime.datetime.now(timezone.utc)
-            logger.info(f"Clinic {clinic}: ✓ Sent {clinic_sent} appointments, updated sync time")
-        else:
-            logger.info(f"Clinic {clinic}: No new appointments sent, keeping previous sync time")
-
-        if clinic_skipped > 0:
-            logger.info(f"Clinic {clinic}: Skipped {clinic_skipped} already-sent appointments")
+        # ALWAYS update sync time if we processed any appointments
+        # This prevents getting stuck on failed appointments
+        if clinic_processed > 0:
+            if latest_processed_timestamp and validate_sync_time_update(clinic, last_syncs.get(clinic), latest_processed_timestamp):
+                new_syncs[clinic] = latest_processed_timestamp
+                logger.info(f"Clinic {clinic}: Processed {clinic_processed} appointments, updated sync time to {latest_processed_timestamp}")
+            else:
+                # Fallback to current time if no valid timestamp found
+                new_syncs[clinic] = datetime.datetime.now(timezone.utc)
+                logger.info(f"Clinic {clinic}: Processed {clinic_processed} appointments, updated sync time to current time")
+        
+        logger.info(f"Clinic {clinic}: ✓ Sent {clinic_sent}, Skipped {clinic_skipped}, Total processed {clinic_processed}")
 
         total_sent += clinic_sent
-        total_skipped += clinic_skipped
+        total_skipped += clinic_skipped  
+        total_processed += clinic_processed
 
-    # Save state
+    # Save state atomically
     if not dry_run:
-        save_last_sync_times(new_syncs)
-        save_sent_appointments(sent_appointments)
+        try:
+            save_state_atomically(new_syncs, sent_appointments)
+        except Exception as e:
+            logger.error(f"Failed to save state: {e}")
+            # Don't exit - this sync run was still successful
     
     logger.info("=== Sync Complete ===")
     logger.info(f"Total sent: {total_sent}")
     logger.info(f"Total skipped: {total_skipped}")
+    logger.info(f"Total processed: {total_processed}")
     logger.info(f"Total tracked appointments: {len(sent_appointments)}")
 
 def cleanup_old_sent_appointments(days_to_keep: int = 30):
     """Remove old appointment IDs from the sent appointments file"""
-    # This is a simple cleanup - you might want to implement more sophisticated logic
-    # based on actual appointment dates rather than just tracking IDs
     logger.info(f"Note: Sent appointments file contains {len(load_sent_appointments())} appointment IDs")
     logger.info("Consider implementing cleanup logic if this file grows too large")
 
