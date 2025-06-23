@@ -316,8 +316,15 @@ def run_sync(dry_run: bool = False):
                 # Update latest timestamp based on DateTStamp or current time
                 appt_timestamp = parse_time(appt.get('DateTStamp'))
                 if appt_timestamp:
+                    # Ensure both timestamps have timezone info before comparing
                     if latest_timestamp and latest_timestamp.tzinfo is None:
                         latest_timestamp = latest_timestamp.replace(tzinfo=timezone.utc)
+                        logger.debug(f"Added UTC to latest_timestamp: {latest_timestamp}")
+                    
+                    if appt_timestamp.tzinfo is None:
+                        appt_timestamp = appt_timestamp.replace(tzinfo=timezone.utc)
+                        logger.debug(f"Added UTC to appt_timestamp: {appt_timestamp}")
+                    
                     if not latest_timestamp or appt_timestamp > latest_timestamp:
                         latest_timestamp = appt_timestamp
                         logger.debug(f"Updated latest timestamp to {latest_timestamp}")
