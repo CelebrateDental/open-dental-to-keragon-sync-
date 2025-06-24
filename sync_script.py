@@ -143,7 +143,7 @@ def parse_time(s: Optional[str]) -> Optional[datetime.datetime]:
         if s.endswith('Z'):
             s = s[:-1] + '+00:00'
         dt = datetime.datetime.fromisoformat(s)
-        # Ensure timezone info
+        # Ensure timezone info is present
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt
@@ -242,7 +242,7 @@ def get_patient_details(pat_num: int) -> Dict[str, Any]:
         logger.warning(f"Failed to fetch patient {pat_num}: {e}")
         return {}
 
-# === SYNC ===
+# === FIXED SYNC FUNCTION - TIME MATCHING LOGIC ===
 def send_to_keragon(appt: Dict[str, Any], clinic: int, dry_run: bool = False) -> bool:
     apt_num = str(appt.get('AptNum', ''))
     
@@ -253,38 +253,44 @@ def send_to_keragon(appt: Dict[str, Any], clinic: int, dry_run: bool = False) ->
     name = f"{first} {last}".strip() or 'Unknown'
     provider_name = 'Dr. Gharbi' if clinic == 9034 else 'Dr. Ensley'
 
-    # Parse raw time and assign America/Chicago timezone (assuming OpenDental uses local time)
-    st = parse_time(appt.get('AptDateTime'))
-    if not st:
+    # FIXED: Parse time from OpenDental (comes as UTC) and preserve the exact time values
+    st_utc = parse_time(appt.get('AptDateTime'))
+    if not st_utc:
         logger.error(f"Invalid start time for appointment {apt_num}")
         return False
     
-    # If no timezone info, assume it's in Chicago time (OpenDental local time)
-    if st.tzinfo is None:
-        st = st.replace(tzinfo=ZoneInfo('America/Chicago'))
-
-    # Calculate end time in the same timezone
-    en = calculate_end_time(st, appt.get('Pattern', ''))
-    if en.tzinfo is None:
-        en = en.replace(tzinfo=ZoneInfo('America/Chicago'))
-
-    # Convert to GHL timezone (America/Chicago)
-    st_ghl = st.astimezone(GHL_TIMEZONE)
-    en_ghl = en.astimezone(GHL_TIMEZONE)
+    logger.debug(f"Appointment {apt_num} - Raw time from OpenDental: {appt.get('AptDateTime')}")
+    logger.debug(f"Appointment {apt_num} - Parsed UTC time: {st_utc}")
+    
+    # KEY FIX: Extract the time components from UTC and recreate in GHL timezone
+    # This ensures 8 AM UTC from OpenDental becomes 8 AM in GHL timezone
+    st_ghl = st_utc.replace(tzinfo=None)  # Remove UTC timezone
+    st_ghl = st_ghl.replace(tzinfo=GHL_TIMEZONE)  # Apply GHL timezone to same time values
+    
+    # Calculate duration and end time
+    duration_minutes = calculate_pattern_duration(appt.get('Pattern', ''))
+    if duration_minutes <= 0:
+        logger.warning(f"No slots in pattern '{appt.get('Pattern', '')}', defaulting to 60 minutes")
+        duration_minutes = 60
+    
+    # Calculate end time in GHL timezone
+    en_ghl = st_ghl + datetime.timedelta(minutes=duration_minutes)
 
     # Format for payload (ISO with timezone offset)
     st_payload = st_ghl.isoformat(timespec='seconds')
     en_payload = en_ghl.isoformat(timespec='seconds')
 
     logger.info(f"Appointment {apt_num} for {name} ({provider_name})")
-    logger.info(f"  Time: {st_payload} to {en_payload} (Chicago time)")
-    logger.debug(f"  Original time: {st} (Chicago) → {st_ghl} (Chicago)")
+    logger.info(f"  OpenDental UTC: {st_utc}")
+    logger.info(f"  GHL time (matching values): {st_ghl}")
+    logger.info(f"  Duration: {duration_minutes} minutes")
+    logger.info(f"  Payload: {st_payload} to {en_payload}")
 
     payload = {
         'appointmentId': apt_num,
         'appointmentTime': st_payload,
         'appointmentEndTime': en_payload,
-        'appointmentDurationMinutes': int((en - st).total_seconds() / 60),
+        'appointmentDurationMinutes': duration_minutes,
         'status': appt.get('AptStatus'),
         'notes': appt.get('Note', '') + ' [fromOD]',
         'patientId': str(appt.get('PatNum')),
@@ -323,7 +329,7 @@ def send_to_keragon(appt: Dict[str, Any], clinic: int, dry_run: bool = False) ->
                 pass
         return False
 
-# === FIXED MAIN SYNC LOGIC ===
+# === MAIN SYNC LOGIC ===
 def run_sync(dry_run: bool = False):
     if not (DEVELOPER_KEY and CUSTOMER_KEY and KERAGON_WEBHOOK_URL and CLINIC_NUMS):
         logger.critical("Missing configuration – check your environment variables")
@@ -331,13 +337,14 @@ def run_sync(dry_run: bool = False):
         sys.exit(1)
 
     logger.info("=== Starting OpenDental → Keragon Sync ===")
+    logger.info("Time values will match exactly: 8 AM OpenDental → 8 AM GHL")
     if dry_run:
         logger.info("DRY RUN MODE: No data will be sent to Keragon")
 
     # Load state
     last_syncs = load_last_sync_times()
     sent_appointments = load_sent_appointments()
-    new_syncs = last_syncs.copy()  # Start with existing sync times - this is important!
+    new_syncs = last_syncs.copy()  # Start with existing sync times
     
     total_sent = 0
     total_skipped = 0
@@ -352,17 +359,16 @@ def run_sync(dry_run: bool = False):
         # Fetch appointments
         appointments = fetch_appointments(clinic, last_syncs.get(clinic), get_filtered_ops(clinic))
         
-        # CRITICAL FIX: Only update sync time if we actually process appointments
+        # Only update sync time if we actually process appointments
         if not appointments:
             logger.info(f"Clinic {clinic}: No appointments to process - sync time unchanged")
-            # Do NOT update new_syncs[clinic] here - leave it as the original value
             continue
             
         clinic_sent = 0
         clinic_skipped = 0
         clinic_processed = 0
         
-        # Track the latest timestamp we've processed (not just sent successfully)
+        # Track the latest timestamp we've processed
         latest_processed_timestamp = last_syncs.get(clinic)
 
         # Sort appointments by DateTStamp to process in chronological order
@@ -402,7 +408,6 @@ def run_sync(dry_run: bool = False):
                 state_changed = True
                 logger.info(f"Clinic {clinic}: Processed {clinic_processed} appointments, updated sync time to {latest_processed_timestamp}")
             else:
-                # This should rarely happen, but log it clearly
                 logger.warning(f"Clinic {clinic}: Processed {clinic_processed} appointments but could not determine valid sync time - keeping previous sync time")
         
         logger.info(f"Clinic {clinic}: ✓ Sent {clinic_sent}, Skipped {clinic_skipped}, Total processed {clinic_processed}")
@@ -418,7 +423,6 @@ def run_sync(dry_run: bool = False):
             logger.info("Successfully saved state files")
         except Exception as e:
             logger.error(f"Failed to save state: {e}")
-            # Don't exit - this sync run was still successful
     elif not state_changed:
         logger.info("No state changes - state files not updated")
     else:
