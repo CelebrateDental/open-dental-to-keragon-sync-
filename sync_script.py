@@ -31,16 +31,20 @@ CLINIC_OPERATORY_FILTERS: Dict[int, List[int]] = {
     9035: [11574, 11576, 11577],
 }
 
-# Operatory-specific appointment type filters (using appointment type names)
-OPERATORY_APPOINTMENT_TYPE_FILTERS: Dict[int, List[str]] = {
-    11588: ["COMP EX", "COMP EX CHILD"],  # Clinic 9034, Operatory 11588
-    11574: ["Cash Consult", "Insurance Consult"]  # Clinic 9035, Operatory 11574
+# Clinic-specific operatory appointment type filters
+CLINIC_OPERATORY_APPOINTMENT_TYPE_FILTERS: Dict[int, Dict[int, List[str]]] = {
+    9034: {  # Clinic 9034 specific appointment type names
+        11588: ["COMP EX", "COMP EX CHILD"],  # Use actual names from clinic 9034
+    },
+    9035: {  # Clinic 9035 specific appointment type names  
+        11574: ["Cash Consult", "Insurance Consult"]  # Use actual names from clinic 9035
+    }
 }
 
 VALID_STATUSES = {'Scheduled', 'Complete', 'Broken'}
 
-# Global cache for appointment types
-_appointment_types_cache: Optional[Dict[int, str]] = None
+# Global cache for appointment types per clinic
+_appointment_types_cache: Dict[int, Dict[int, str]] = {}
 
 # === LOGGING ===
 logging.basicConfig(
@@ -51,59 +55,67 @@ logging.basicConfig(
 logger = logging.getLogger('opendental_sync')
 
 # === APPOINTMENT TYPES CACHE ===
-def get_appointment_types() -> Dict[int, str]:
-    """Fetch and cache appointment types mapping from AppointmentTypeNum to AppointmentTypeName"""
+def get_appointment_types(clinic_num: int) -> Dict[int, str]:
+    """Fetch and cache appointment types mapping for a specific clinic"""
     global _appointment_types_cache
     
-    if _appointment_types_cache is not None:
-        return _appointment_types_cache
+    if clinic_num in _appointment_types_cache:
+        return _appointment_types_cache[clinic_num]
     
     try:
-        logger.info("Fetching appointment types from OpenDental API...")
-        r = requests.get(f"{API_BASE_URL}/appointmenttypes", headers=make_auth_header(), timeout=30)
+        logger.info(f"Fetching appointment types for clinic {clinic_num} from OpenDental API...")
+        
+        # Try clinic-specific endpoint first
+        params = {'ClinicNum': clinic_num}
+        r = requests.get(f"{API_BASE_URL}/appointmenttypes", 
+                        headers=make_auth_header(), 
+                        params=params, 
+                        timeout=30)
         r.raise_for_status()
         data = r.json()
         
         # Handle both single object and list responses
         appt_types = data if isinstance(data, list) else [data]
         
-        # Create mapping from AppointmentTypeNum to AppointmentTypeName
-        _appointment_types_cache = {}
+        # Create mapping from AppointmentTypeNum to AppointmentTypeName for this clinic
+        clinic_cache = {}
         for apt_type in appt_types:
             type_num = apt_type.get('AppointmentTypeNum')
             type_name = apt_type.get('AppointmentTypeName', '')
             if type_num is not None:
-                _appointment_types_cache[type_num] = type_name
+                clinic_cache[type_num] = type_name
         
-        logger.info(f"Loaded {len(_appointment_types_cache)} appointment types")
-        logger.debug(f"Appointment types mapping: {_appointment_types_cache}")
+        _appointment_types_cache[clinic_num] = clinic_cache
         
-        return _appointment_types_cache
+        logger.info(f"Loaded {len(clinic_cache)} appointment types for clinic {clinic_num}")
+        logger.debug(f"Clinic {clinic_num} appointment types: {clinic_cache}")
+        
+        return clinic_cache
         
     except Exception as e:
-        logger.error(f"Failed to fetch appointment types: {e}")
+        logger.error(f"Failed to fetch appointment types for clinic {clinic_num}: {e}")
         # Return empty dict as fallback
-        _appointment_types_cache = {}
-        return _appointment_types_cache
+        _appointment_types_cache[clinic_num] = {}
+        return _appointment_types_cache[clinic_num]
 
-def get_appointment_type_name(appointment: Dict[str, Any]) -> str:
-    """Get the appointment type name for an appointment"""
-    # First try to get from cached appointment types using AppointmentTypeNum
+def get_appointment_type_name(appointment: Dict[str, Any], clinic_num: int) -> str:
+    """Get the appointment type name for an appointment in a specific clinic"""
+    # Get clinic-specific appointment types
     apt_type_num = appointment.get('AppointmentTypeNum')
     if apt_type_num is not None:
-        appointment_types = get_appointment_types()
+        appointment_types = get_appointment_types(clinic_num)
         apt_type_name = appointment_types.get(apt_type_num, '')
         if apt_type_name:
-            logger.debug(f"Found appointment type via AppointmentTypeNum {apt_type_num}: '{apt_type_name}'")
+            logger.debug(f"Found appointment type via AppointmentTypeNum {apt_type_num} for clinic {clinic_num}: '{apt_type_name}'")
             return apt_type_name
     
-    # Fallback to direct fields (though these seem to be empty in your case)
+    # Fallback to direct fields
     apt_type_direct = appointment.get('AptType', '') or appointment.get('AppointmentType', '')
     if apt_type_direct:
         logger.debug(f"Found appointment type via direct field: '{apt_type_direct}'")
         return apt_type_direct
     
-    logger.debug(f"No appointment type found for appointment {appointment.get('AptNum')}")
+    logger.debug(f"No appointment type found for appointment {appointment.get('AptNum')} in clinic {clinic_num}")
     return ''
 
 # === IMPROVED STATE MANAGEMENT ===
@@ -248,7 +260,6 @@ def fetch_appointments(
     }
     
     if since:
-        # Ensure timezone info
         if since.tzinfo is None:
             since = since.replace(tzinfo=timezone.utc)
         eff_utc = (since + datetime.timedelta(seconds=1)).astimezone(timezone.utc)
@@ -287,16 +298,17 @@ def fetch_appointments(
             logger.debug(f"Skipping apt {apt_num}: operatory {op_num} not in filter {ops}")
             continue
         
-        # IMPROVED: Check appointment type filter for specific operatories
-        if op_num in OPERATORY_APPOINTMENT_TYPE_FILTERS:
-            allowed_types = OPERATORY_APPOINTMENT_TYPE_FILTERS[op_num]
-            apt_type_name = get_appointment_type_name(a)
+        # Check appointment type filter using clinic-specific configuration
+        clinic_filters = CLINIC_OPERATORY_APPOINTMENT_TYPE_FILTERS.get(clinic, {})
+        if op_num in clinic_filters:
+            allowed_types = clinic_filters[op_num]
+            apt_type_name = get_appointment_type_name(a, clinic)
             
             if apt_type_name not in allowed_types:
-                logger.debug(f"Skipping apt {apt_num}: appointment type '{apt_type_name}' not in allowed types {allowed_types} for operatory {op_num}")
+                logger.debug(f"Skipping apt {apt_num}: appointment type '{apt_type_name}' not in allowed types {allowed_types} for operatory {op_num} in clinic {clinic}")
                 continue
             else:
-                logger.info(f"✓ Apt {apt_num}: appointment type '{apt_type_name}' matches filter for operatory {op_num}")
+                logger.info(f"✓ Apt {apt_num}: appointment type '{apt_type_name}' matches filter for operatory {op_num} in clinic {clinic}")
         
         valid.append(a)
     
@@ -418,9 +430,11 @@ def run_sync(dry_run: bool = False):
     if dry_run:
         logger.info("DRY RUN MODE: No data will be sent to Keragon")
 
-    # Load appointment types cache first
-    logger.info("Loading appointment types...")
-    get_appointment_types()
+    # Load appointment types cache for each clinic
+    logger.info("Loading appointment types for each clinic...")
+    for clinic in CLINIC_NUMS:
+        types = get_appointment_types(clinic)
+        logger.info(f"Clinic {clinic}: Loaded {len(types)} appointment types")
 
     # Load state
     last_syncs = load_last_sync_times()
@@ -527,7 +541,7 @@ if __name__ == '__main__':
     parser.add_argument('--reset-sent', action='store_true', help='Clear only sent appointments tracking')
     parser.add_argument('--verbose', action='store_true', help='Enable DEBUG logging')
     parser.add_argument('--dry-run', action='store_true', help='Show what would be sent without actually sending')
-    parser.add_argument('--show-appt-types', action='store_true', help='Display all appointment types and exit')
+    parser.add_argument('--show-appt-types', action='store_true', help='Display all appointment types for each clinic and exit')
     args = parser.parse_args()
 
     if args.verbose:
@@ -538,10 +552,12 @@ if __name__ == '__main__':
         if not (DEVELOPER_KEY and CUSTOMER_KEY):
             logger.critical("Missing API credentials - check OPEN_DENTAL_DEVELOPER_KEY and OPEN_DENTAL_CUSTOMER_KEY")
             sys.exit(1)
-        appt_types = get_appointment_types()
-        print("=== Available Appointment Types ===")
-        for type_num, type_name in sorted(appt_types.items()):
-            print(f"  {type_num}: {type_name}")
+        print("=== Available Appointment Types by Clinic ===")
+        for clinic in CLINIC_NUMS:
+            appt_types = get_appointment_types(clinic)
+            print(f"\nClinic {clinic}:")
+            for type_num, type_name in sorted(appt_types.items()):
+                print(f"  {type_num}: {type_name}")
         sys.exit(0)
 
     if args.reset:
