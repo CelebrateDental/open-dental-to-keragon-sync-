@@ -1,470 +1,216 @@
 #!/usr/bin/env python3
+"""
+OpenDental API Field Diagnostic Script
+This script will help you identify the exact field names and values 
+for appointment types and operatories in your OpenDental API responses.
+"""
+
 import os
 import sys
 import json
 import logging
 import datetime
 import requests
-import tempfile
-import shutil
 from datetime import timezone, timedelta
-from zoneinfo import ZoneInfo
-from typing import List, Dict, Any, Optional, Set
+from typing import List, Dict, Any, Optional
 
 # === CONFIGURATION ===
 API_BASE_URL        = os.environ.get('OPEN_DENTAL_API_URL', 'https://api.opendental.com/api/v1')
 DEVELOPER_KEY       = os.environ.get('OPEN_DENTAL_DEVELOPER_KEY')
 CUSTOMER_KEY        = os.environ.get('OPEN_DENTAL_CUSTOMER_KEY')
-KERAGON_WEBHOOK_URL = os.environ.get('KERAGON_WEBHOOK_URL')
+CLINIC_NUMS         = [int(x) for x in os.environ.get('CLINIC_NUMS', '').split(',') if x.strip().isdigit()]
 
-STATE_FILE      = 'last_sync_state.json'
-SENT_APPTS_FILE = 'sent_appointments.json'
-LOG_LEVEL       = os.environ.get('LOG_LEVEL', 'INFO')
-LOOKAHEAD_HOURS = int(os.environ.get('LOOKAHEAD_HOURS', '720'))
-CLINIC_NUMS     = [int(x) for x in os.environ.get('CLINIC_NUMS', '').split(',') if x.strip().isdigit()]
-
-# America/Chicago timezone for GHL (GMT-6 CST / GMT-5 CDT)
-GHL_TIMEZONE = ZoneInfo('America/Chicago')
-
-CLINIC_OPERATORY_FILTERS: Dict[int, List[int]] = {
-    9034: [11579, 11580, 11588],
-    9035: [11574, 11576, 11577],
-}
-VALID_STATUSES = {'Scheduled', 'Complete', 'Broken'}
-
-# === LOGGING ===
+# Set up logging
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL),
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger('opendental_sync')
-
-# === IMPROVED STATE MANAGEMENT ===
-def load_last_sync_times() -> Dict[int, Optional[datetime.datetime]]:
-    state: Dict[int, Optional[datetime.datetime]] = {}
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE) as f:
-                data = json.load(f)
-            for c in CLINIC_NUMS:
-                ts = data.get(str(c))
-                if ts:
-                    dt = datetime.datetime.fromisoformat(ts)
-                    # Ensure timezone info is present
-                    if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=timezone.utc)
-                    state[c] = dt
-                else:
-                    state[c] = None
-        except Exception as e:
-            logger.error(f"Error reading state file: {e}")
-            state = {c: None for c in CLINIC_NUMS}
-    else:
-        state = {c: None for c in CLINIC_NUMS}
-    return state
-
-def validate_sync_time_update(clinic: int, old_time: Optional[datetime.datetime], 
-                             new_time: Optional[datetime.datetime]) -> bool:
-    """Ensure we don't accidentally move sync time backwards"""
-    if not old_time:
-        return True  # First sync is always valid
-    
-    if not new_time:
-        logger.warning(f"Clinic {clinic}: Attempted to set null sync time")
-        return False
-    
-    # Ensure both have timezone info
-    if old_time.tzinfo is None:
-        old_time = old_time.replace(tzinfo=timezone.utc)
-    if new_time.tzinfo is None:
-        new_time = new_time.replace(tzinfo=timezone.utc)
-    
-    if new_time < old_time:
-        logger.warning(f"Clinic {clinic}: Attempted to move sync time backwards from {old_time} to {new_time}")
-        return False
-    
-    return True
-
-def save_state_atomically(sync_times: Dict[int, Optional[datetime.datetime]], 
-                         sent_ids: Set[str]) -> None:
-    """Save both state files atomically to avoid corruption"""
-    temp_sync_file = None
-    temp_sent_file = None
-    
-    try:
-        # Save sync times
-        sync_data = {str(c): dt.isoformat() if dt else None for c, dt in sync_times.items()}
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.tmp', 
-                                        dir=os.path.dirname(STATE_FILE) or '.') as f:
-            json.dump(sync_data, f, indent=2)
-            temp_sync_file = f.name
-        
-        # Save sent appointments
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.tmp',
-                                        dir=os.path.dirname(SENT_APPTS_FILE) or '.') as f:
-            json.dump(list(sent_ids), f, indent=2)
-            temp_sent_file = f.name
-        
-        # Atomic moves
-        shutil.move(temp_sync_file, STATE_FILE)
-        shutil.move(temp_sent_file, SENT_APPTS_FILE)
-        
-        logger.debug(f"Atomically saved state files - sync times: {sync_data}")
-        logger.debug(f"Saved {len(sent_ids)} sent appointment IDs")
-        
-    except Exception as e:
-        logger.error(f"Error in atomic save: {e}")
-        # Clean up temp files if they exist
-        for temp_file in [temp_sync_file, temp_sent_file]:
-            if temp_file and os.path.exists(temp_file):
-                try:
-                    os.unlink(temp_file)
-                except:
-                    pass
-        raise
-
-def load_sent_appointments() -> Set[str]:
-    """Load set of already sent appointment IDs"""
-    if os.path.exists(SENT_APPTS_FILE):
-        try:
-            with open(SENT_APPTS_FILE) as f:
-                data = json.load(f)
-                return set(str(x) for x in data)  # Ensure all IDs are strings
-        except Exception as e:
-            logger.error(f"Error reading sent appointments file: {e}")
-    return set()
-
-# === UTILITIES ===
-def parse_time(s: Optional[str]) -> Optional[datetime.datetime]:
-    if not s:
-        return None
-    try:
-        if s.endswith('Z'):
-            s = s[:-1] + '+00:00'
-        dt = datetime.datetime.fromisoformat(s)
-        # Ensure timezone info is present
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
-    except ValueError:
-        logger.warning(f"Unrecognized time format: {s}")
-        return None
+logger = logging.getLogger('opendental_diagnostic')
 
 def make_auth_header() -> Dict[str, str]:
     return {'Authorization': f'ODFHIR {DEVELOPER_KEY}/{CUSTOMER_KEY}', 'Content-Type': 'application/json'}
 
-# === DURATION CALCULATION ===
-def calculate_pattern_duration(pattern: str, minutes_per_slot: int = 5) -> int:
-    return sum(1 for ch in (pattern or '').upper() if ch in ('X', '/')) * minutes_per_slot
-
-def calculate_end_time(start_dt: datetime.datetime, pattern: str) -> datetime.datetime:
-    dur = calculate_pattern_duration(pattern)
-    if dur <= 0:
-        logger.warning(f"No slots in pattern '{pattern}', defaulting to 60 minutes")
-        dur = 60
-    return start_dt + datetime.timedelta(minutes=dur)
-
-# === APPOINTMENT FETCHING ===
-def get_filtered_ops(clinic: int) -> List[int]:
-    return CLINIC_OPERATORY_FILTERS.get(clinic, [])
-
-def fetch_appointments(
-    clinic: int,
-    since: Optional[datetime.datetime],
-    ops: List[int]
-) -> List[Dict[str, Any]]:
+def analyze_appointment_fields(clinic: int, limit: int = 10) -> None:
+    """Fetch and analyze appointment data to identify field names and values"""
+    
+    print(f"\n{'='*80}")
+    print(f"ANALYZING CLINIC {clinic}")
+    print(f"{'='*80}")
+    
+    # Fetch recent appointments
     now_utc = datetime.datetime.utcnow().replace(tzinfo=timezone.utc)
     params = {
         'ClinicNum': clinic,
-        'dateStart': now_utc.strftime('%Y-%m-%d'),
-        'dateEnd': (now_utc + datetime.timedelta(hours=LOOKAHEAD_HOURS)).strftime('%Y-%m-%d')
+        'dateStart': (now_utc - timedelta(days=7)).strftime('%Y-%m-%d'),  # Last 7 days
+        'dateEnd': (now_utc + timedelta(days=7)).strftime('%Y-%m-%d')     # Next 7 days
     }
     
-    if since:
-        # Ensure timezone info
-        if since.tzinfo is None:
-            since = since.replace(tzinfo=timezone.utc)
-        eff_utc = (since + datetime.timedelta(seconds=1)).astimezone(timezone.utc)
-        params['DateTStamp'] = eff_utc.strftime('%Y-%m-%d %H:%M:%S')
-        logger.info(f"Clinic {clinic}: fetching appointments modified after UTC {params['DateTStamp']}")
-    else:
-        logger.info(f"Clinic {clinic}: fetching all appointments (first run)")
-    
-    logger.debug(f"→ GET /appointments with params: {params}")
+    print(f"Fetching appointments for clinic {clinic} from {params['dateStart']} to {params['dateEnd']}")
     
     try:
         r = requests.get(f"{API_BASE_URL}/appointments",
                          headers=make_auth_header(), params=params, timeout=30)
         r.raise_for_status()
         data = r.json()
-        appts = data if isinstance(data, list) else [data]
-        logger.debug(f"← Raw API response: {len(appts)} appointments")
-    except Exception as e:
-        logger.error(f"Error fetching appointments for clinic {clinic}: {e}")
-        return []
-
-    # Filter appointments
-    valid = []
-    for a in appts:
-        apt_num = str(a.get('AptNum', ''))
-        status = a.get('AptStatus', '')
-        op_num = a.get('Op') or a.get('OperatoryNum')
+        appointments = data if isinstance(data, list) else [data]
         
-        # Check status
-        if status not in VALID_STATUSES:
-            logger.debug(f"Skipping apt {apt_num}: invalid status '{status}'")
-            continue
+        print(f"Found {len(appointments)} appointments")
+        
+        if not appointments:
+            print("No appointments found for this clinic in the date range.")
+            return
             
-        # Check operatory filter
-        if ops and op_num not in ops:
-            logger.debug(f"Skipping apt {apt_num}: operatory {op_num} not in filter {ops}")
-            continue
+        # Limit the number we analyze to avoid too much output
+        sample_appointments = appointments[:limit]
+        
+        print(f"\nAnalyzing first {len(sample_appointments)} appointments...")
+        print(f"\n{'='*80}")
+        print("APPOINTMENT FIELD ANALYSIS")
+        print(f"{'='*80}")
+        
+        # Track all unique field names and values
+        all_fields = set()
+        operatory_fields = {}
+        appointment_type_fields = {}
+        
+        for i, appt in enumerate(sample_appointments, 1):
+            apt_num = appt.get('AptNum', 'Unknown')
+            print(f"\n--- APPOINTMENT {i}: ID {apt_num} ---")
             
-        valid.append(a)
+            # Add all field names to our tracking set
+            all_fields.update(appt.keys())
+            
+            # Look for operatory-related fields
+            operatory_candidates = ['Op', 'OperatoryNum', 'Operatory', 'OpNum', 'OperatoryId']
+            for field in operatory_candidates:
+                if field in appt and appt[field] is not None:
+                    operatory_fields[field] = operatory_fields.get(field, set())
+                    operatory_fields[field].add(str(appt[field]))
+                    print(f"  Operatory field '{field}': {appt[field]}")
+            
+            # Look for appointment type fields
+            type_candidates = ['AptType', 'AppointmentType', 'Type', 'ApptType', 'ProcCode', 'Procedure']
+            for field in type_candidates:
+                if field in appt and appt[field] is not None:
+                    appointment_type_fields[field] = appointment_type_fields.get(field, set())
+                    appointment_type_fields[field].add(str(appt[field]))
+                    print(f"  Appointment type field '{field}': {appt[field]}")
+            
+            # Show other potentially relevant fields
+            other_interesting = ['AptStatus', 'Pattern', 'AptDateTime', 'Note', 'PatNum']
+            for field in other_interesting:
+                if field in appt:
+                    value = appt[field]
+                    if isinstance(value, str) and len(value) > 50:
+                        value = value[:50] + "..."
+                    print(f"  {field}: {value}")
+            
+            # Show a sample of all fields for the first appointment
+            if i == 1:
+                print(f"\n  ALL FIELDS IN FIRST APPOINTMENT:")
+                for field, value in sorted(appt.items()):
+                    if isinstance(value, str) and len(value) > 50:
+                        value = value[:50] + "..."
+                    print(f"    {field}: {value}")
+        
+        # Summary of findings
+        print(f"\n{'='*80}")
+        print("SUMMARY OF FINDINGS")
+        print(f"{'='*80}")
+        
+        print(f"\nAll unique field names found ({len(all_fields)}):")
+        for field in sorted(all_fields):
+            print(f"  - {field}")
+        
+        if operatory_fields:
+            print(f"\nOPERATORY FIELDS FOUND:")
+            for field, values in operatory_fields.items():
+                print(f"  Field '{field}' has values: {sorted(values)}")
+        else:
+            print(f"\nNO OPERATORY FIELDS FOUND!")
+            print("Check these field names in your API documentation:")
+            print("  - Op, OperatoryNum, Operatory, OpNum, OperatoryId")
+        
+        if appointment_type_fields:
+            print(f"\nAPPOINTMENT TYPE FIELDS FOUND:")
+            for field, values in appointment_type_fields.items():
+                print(f"  Field '{field}' has values: {sorted(values)}")
+        else:
+            print(f"\nNO APPOINTMENT TYPE FIELDS FOUND!")
+            print("Check these field names in your API documentation:")
+            print("  - AptType, AppointmentType, Type, ApptType, ProcCode")
+        
+        # Generate suggested configuration
+        print(f"\n{'='*80}")
+        print("SUGGESTED CONFIGURATION FOR YOUR SCRIPT")
+        print(f"{'='*80}")
+        
+        if operatory_fields:
+            primary_op_field = list(operatory_fields.keys())[0]
+            print(f"\n# Use this field name for operatory filtering:")
+            print(f"# op_num = a.get('{primary_op_field}') or a.get('OperatoryNum')")
+        
+        if appointment_type_fields:
+            primary_type_field = list(appointment_type_fields.keys())[0]
+            print(f"\n# Use this field name for appointment type filtering:")
+            print(f"# apt_type = a.get('{primary_type_field}') or a.get('AppointmentType', '')")
+        
+        if operatory_fields and appointment_type_fields:
+            print(f"\n# Your OPERATORY_APPOINTMENT_TYPE_FILTERS should use these values:")
+            print(f"OPERATORY_APPOINTMENT_TYPE_FILTERS: Dict[int, List[str]] = {{")
+            
+            # Show examples based on what we found
+            op_values = list(list(operatory_fields.values())[0])
+            type_values = list(list(appointment_type_fields.values())[0])
+            
+            if len(op_values) > 0 and len(type_values) > 0:
+                print(f"    {op_values[0]}: {type_values[:2]},  # Example operatory with example types")
+            print(f"    # Add your specific operatory numbers and appointment types here")
+            print(f"}}")
     
-    logger.info(f"Clinic {clinic}: {len(valid)} valid appointment(s) found")
-    if valid:
-        logger.debug(f"Valid appointment IDs: {[a.get('AptNum') for a in valid]}")
-    
-    return valid
-
-# === PATIENT ===
-def get_patient_details(pat_num: int) -> Dict[str, Any]:
-    if not pat_num:
-        return {}
-    try:
-        logger.debug(f"Fetching patient details for PatNum {pat_num}")
-        r = requests.get(f"{API_BASE_URL}/patients/{pat_num}", headers=make_auth_header(), timeout=15)
-        r.raise_for_status()
-        return r.json()
     except Exception as e:
-        logger.warning(f"Failed to fetch patient {pat_num}: {e}")
-        return {}
-
-# === FIXED SYNC FUNCTION - TIME MATCHING LOGIC ===
-def send_to_keragon(appt: Dict[str, Any], clinic: int, dry_run: bool = False) -> bool:
-    apt_num = str(appt.get('AptNum', ''))
-    
-    # Get patient details
-    patient = get_patient_details(appt.get('PatNum'))
-    first = patient.get('FName') or appt.get('FName', '')
-    last = patient.get('LName') or appt.get('LName', '')
-    name = f"{first} {last}".strip() or 'Unknown'
-    provider_name = 'Dr. Gharbi' if clinic == 9034 else 'Dr. Ensley'
-
-    # FIXED: Parse time from OpenDental (comes as UTC) and preserve the exact time values
-    st_utc = parse_time(appt.get('AptDateTime'))
-    if not st_utc:
-        logger.error(f"Invalid start time for appointment {apt_num}")
-        return False
-    
-    logger.debug(f"Appointment {apt_num} - Raw time from OpenDental: {appt.get('AptDateTime')}")
-    logger.debug(f"Appointment {apt_num} - Parsed UTC time: {st_utc}")
-    
-    # KEY FIX: Extract the time components from UTC and recreate in GHL timezone
-    # This ensures 8 AM UTC from OpenDental becomes 8 AM in GHL timezone
-    st_ghl = st_utc.replace(tzinfo=None)  # Remove UTC timezone
-    st_ghl = st_ghl.replace(tzinfo=GHL_TIMEZONE)  # Apply GHL timezone to same time values
-    
-    # Calculate duration and end time
-    duration_minutes = calculate_pattern_duration(appt.get('Pattern', ''))
-    if duration_minutes <= 0:
-        logger.warning(f"No slots in pattern '{appt.get('Pattern', '')}', defaulting to 60 minutes")
-        duration_minutes = 60
-    
-    # Calculate end time in GHL timezone
-    en_ghl = st_ghl + datetime.timedelta(minutes=duration_minutes)
-
-    # Format for payload (ISO with timezone offset)
-    st_payload = st_ghl.isoformat(timespec='seconds')
-    en_payload = en_ghl.isoformat(timespec='seconds')
-
-    logger.info(f"Appointment {apt_num} for {name} ({provider_name})")
-    logger.info(f"  OpenDental UTC: {st_utc}")
-    logger.info(f"  GHL time (matching values): {st_ghl}")
-    logger.info(f"  Duration: {duration_minutes} minutes")
-    logger.info(f"  Payload: {st_payload} to {en_payload}")
-
-    payload = {
-        'appointmentId': apt_num,
-        'appointmentTime': st_payload,
-        'appointmentEndTime': en_payload,
-        'appointmentDurationMinutes': duration_minutes,
-        'status': appt.get('AptStatus'),
-        'notes': appt.get('Note', '') + ' [fromOD]',
-        'patientId': str(appt.get('PatNum')),
-        'firstName': first,
-        'lastName': last,
-        'providerName': provider_name,
-        'email': patient.get('Email', ''),
-        'phone': patient.get('WirelessPhone', '') or patient.get('HmPhone', ''),
-        'gender': patient.get('Gender', ''),
-        'birthdate': patient.get('Birthdate', ''),
-        'address': patient.get('Address', ''),
-        'city': patient.get('City', ''),
-        'state': patient.get('State', ''),
-        'zipCode': patient.get('Zip', ''),
-        'balance': patient.get('Balance', 0)
-    }
-
-    if dry_run:
-        logger.info(f"DRY RUN: Would send appointment {apt_num}")
-        logger.debug(f"DRY RUN payload: {json.dumps(payload, indent=2)}")
-        return True
-
-    try:
-        logger.debug(f"Sending to Keragon: {json.dumps(payload, indent=2)}")
-        r = requests.post(KERAGON_WEBHOOK_URL, json=payload, timeout=30)
-        r.raise_for_status()
-        logger.info(f"✓ Successfully sent appointment {apt_num} to Keragon")
-        return True
-    except Exception as e:
-        logger.error(f"✗ Failed to send appointment {apt_num} to Keragon: {e}")
+        logger.error(f"Error analyzing clinic {clinic}: {e}")
         if hasattr(e, 'response') and e.response is not None:
             try:
                 error_detail = e.response.text
                 logger.error(f"  Response: {error_detail}")
             except:
                 pass
-        return False
 
-# === MAIN SYNC LOGIC ===
-def run_sync(dry_run: bool = False):
-    if not (DEVELOPER_KEY and CUSTOMER_KEY and KERAGON_WEBHOOK_URL and CLINIC_NUMS):
-        logger.critical("Missing configuration – check your environment variables")
-        logger.critical("Required: OPEN_DENTAL_DEVELOPER_KEY, OPEN_DENTAL_CUSTOMER_KEY, KERAGON_WEBHOOK_URL, CLINIC_NUMS")
+def main():
+    print("OpenDental API Field Diagnostic Tool")
+    print("="*50)
+    
+    # Check configuration
+    if not (DEVELOPER_KEY and CUSTOMER_KEY and CLINIC_NUMS):
+        print("❌ Missing configuration!")
+        print("Required environment variables:")
+        print("  - OPEN_DENTAL_DEVELOPER_KEY")
+        print("  - OPEN_DENTAL_CUSTOMER_KEY") 
+        print("  - CLINIC_NUMS")
         sys.exit(1)
-
-    logger.info("=== Starting OpenDental → Keragon Sync ===")
-    logger.info("Time values will match exactly: 8 AM OpenDental → 8 AM GHL")
-    if dry_run:
-        logger.info("DRY RUN MODE: No data will be sent to Keragon")
-
-    # Load state
-    last_syncs = load_last_sync_times()
-    sent_appointments = load_sent_appointments()
-    new_syncs = last_syncs.copy()  # Start with existing sync times
     
-    total_sent = 0
-    total_skipped = 0
-    total_processed = 0
+    print(f"✓ API URL: {API_BASE_URL}")
+    print(f"✓ Developer Key: {DEVELOPER_KEY[:10]}...")
+    print(f"✓ Customer Key: {CUSTOMER_KEY[:10]}...")
+    print(f"✓ Clinics to analyze: {CLINIC_NUMS}")
     
-    # Track if we need to save state (only if something actually changed)
-    state_changed = False
-
+    # Analyze each clinic
     for clinic in CLINIC_NUMS:
-        logger.info(f"--- Processing Clinic {clinic} ---")
-        
-        # Fetch appointments
-        appointments = fetch_appointments(clinic, last_syncs.get(clinic), get_filtered_ops(clinic))
-        
-        # Only update sync time if we actually process appointments
-        if not appointments:
-            logger.info(f"Clinic {clinic}: No appointments to process - sync time unchanged")
-            continue
-            
-        clinic_sent = 0
-        clinic_skipped = 0
-        clinic_processed = 0
-        
-        # Track the latest timestamp we've processed
-        latest_processed_timestamp = last_syncs.get(clinic)
-
-        # Sort appointments by DateTStamp to process in chronological order
-        appointments.sort(key=lambda x: parse_time(x.get('DateTStamp')) or datetime.datetime.min.replace(tzinfo=timezone.utc))
-
-        for appt in appointments:
-            apt_num = str(appt.get('AptNum', ''))
-            clinic_processed += 1
-            
-            # Update latest processed timestamp for ANY appointment we process
-            appt_timestamp = parse_time(appt.get('DateTStamp'))
-            if appt_timestamp:
-                if not latest_processed_timestamp or appt_timestamp > latest_processed_timestamp:
-                    latest_processed_timestamp = appt_timestamp
-                    logger.debug(f"Updated latest processed timestamp to {latest_processed_timestamp}")
-            
-            # Skip if already sent
-            if apt_num in sent_appointments:
-                logger.debug(f"Skipping appointment {apt_num}: already sent")
-                clinic_skipped += 1
-                continue
-
-            # Try to send
-            if send_to_keragon(appt, clinic, dry_run):
-                clinic_sent += 1
-                if not dry_run:
-                    sent_appointments.add(apt_num)
-                    state_changed = True
-            else:
-                logger.warning(f"Failed to send appointment {apt_num}")
-                # Continue processing other appointments instead of stopping
-
-        # Only update sync time if we actually processed appointments
-        if clinic_processed > 0:
-            if latest_processed_timestamp and validate_sync_time_update(clinic, last_syncs.get(clinic), latest_processed_timestamp):
-                new_syncs[clinic] = latest_processed_timestamp
-                state_changed = True
-                logger.info(f"Clinic {clinic}: Processed {clinic_processed} appointments, updated sync time to {latest_processed_timestamp}")
-            else:
-                logger.warning(f"Clinic {clinic}: Processed {clinic_processed} appointments but could not determine valid sync time - keeping previous sync time")
-        
-        logger.info(f"Clinic {clinic}: ✓ Sent {clinic_sent}, Skipped {clinic_skipped}, Total processed {clinic_processed}")
-
-        total_sent += clinic_sent
-        total_skipped += clinic_skipped  
-        total_processed += clinic_processed
-
-    # Only save state if something actually changed
-    if state_changed and not dry_run:
         try:
-            save_state_atomically(new_syncs, sent_appointments)
-            logger.info("Successfully saved state files")
+            analyze_appointment_fields(clinic, limit=5)  # Analyze 5 appointments per clinic
         except Exception as e:
-            logger.error(f"Failed to save state: {e}")
-    elif not state_changed:
-        logger.info("No state changes - state files not updated")
-    else:
-        logger.info("DRY RUN: State files not updated")
+            print(f"Error analyzing clinic {clinic}: {e}")
     
-    logger.info("=== Sync Complete ===")
-    logger.info(f"Total sent: {total_sent}")
-    logger.info(f"Total skipped: {total_skipped}")
-    logger.info(f"Total processed: {total_processed}")
-    logger.info(f"Total tracked appointments: {len(sent_appointments)}")
-
-def cleanup_old_sent_appointments(days_to_keep: int = 30):
-    """Remove old appointment IDs from the sent appointments file"""
-    logger.info(f"Note: Sent appointments file contains {len(load_sent_appointments())} appointment IDs")
-    logger.info("Consider implementing cleanup logic if this file grows too large")
+    print(f"\n{'='*80}")
+    print("DIAGNOSTIC COMPLETE")
+    print(f"{'='*80}")
+    print("\nNext steps:")
+    print("1. Review the field names and values above")
+    print("2. Update your main script with the correct field names")
+    print("3. Update OPERATORY_APPOINTMENT_TYPE_FILTERS with exact values")
+    print("4. Test with --dry-run --verbose")
 
 if __name__ == '__main__':
-    import argparse
-    parser = argparse.ArgumentParser(description='Sync OpenDental → Keragon')
-    parser.add_argument('--reset', action='store_true', help='Clear saved sync timestamps and sent appointments')
-    parser.add_argument('--reset-sent', action='store_true', help='Clear only sent appointments tracking')
-    parser.add_argument('--verbose', action='store_true', help='Enable DEBUG logging')
-    parser.add_argument('--dry-run', action='store_true', help='Show what would be sent without actually sending')
-    args = parser.parse_args()
-
-    if args.verbose:
-        logger.setLevel(logging.DEBUG)
-        logger.debug("Debug logging enabled")
-
-    if args.reset:
-        if os.path.exists(STATE_FILE):
-            os.remove(STATE_FILE)
-            logger.info("Cleared sync state file")
-        if os.path.exists(SENT_APPTS_FILE):
-            os.remove(SENT_APPTS_FILE)
-            logger.info("Cleared sent appointments file")
-        sys.exit(0)
-
-    if args.reset_sent:
-        if os.path.exists(SENT_APPTS_FILE):
-            os.remove(SENT_APPTS_FILE)
-            logger.info("Cleared sent appointments file")
-        sys.exit(0)
-
-    run_sync(dry_run=args.dry_run)
+    main()
