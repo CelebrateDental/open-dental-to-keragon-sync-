@@ -31,14 +31,10 @@ CLINIC_OPERATORY_FILTERS: Dict[int, List[int]] = {
     9035: [11574, 11576, 11577],
 }
 
-# Clinic-specific operatory appointment type filters
-CLINIC_OPERATORY_APPOINTMENT_TYPE_FILTERS: Dict[int, Dict[int, List[str]]] = {
-    9034: {  # Clinic 9034 specific appointment type names
-        11588: ["COMP EX", "COMP EX CHILD"],  # Use actual names from clinic 9034
-    },
-    9035: {  # Clinic 9035 specific appointment type names  
-        11574: ["Cash Consult", "Insurance Consult"]  # Use actual names from clinic 9035
-    }
+# Clinic-specific broken appointment type filters
+CLINIC_BROKEN_APPOINTMENT_TYPE_FILTERS: Dict[int, List[str]] = {
+    9034: ["COMP EX", "COMP EX CHILD"],  # Only these broken appointment types allowed for clinic 9034
+    9035: ["CASH CONSULT", "INSURANCE CONSULT"]  # Only these broken appointment types allowed for clinic 9035
 }
 
 VALID_STATUSES = {'Scheduled', 'Complete', 'Broken'}
@@ -293,22 +289,26 @@ def fetch_appointments(
             logger.debug(f"Skipping apt {apt_num}: invalid status '{status}'")
             continue
             
-        # Check operatory filter
-        if ops and op_num not in ops:
-            logger.debug(f"Skipping apt {apt_num}: operatory {op_num} not in filter {ops}")
+        # Check operatory filter - MUST be from specified operatories
+        if not ops:
+            logger.warning(f"Clinic {clinic}: No operatory filter configured")
+            continue
+            
+        if op_num not in ops:
+            logger.debug(f"Skipping apt {apt_num}: operatory {op_num} not in allowed operatories {ops}")
             continue
         
-        # Check appointment type filter using clinic-specific configuration
-        clinic_filters = CLINIC_OPERATORY_APPOINTMENT_TYPE_FILTERS.get(clinic, {})
-        if op_num in clinic_filters:
-            allowed_types = clinic_filters[op_num]
-            apt_type_name = get_appointment_type_name(a, clinic)
-            
-            if apt_type_name not in allowed_types:
-                logger.debug(f"Skipping apt {apt_num}: appointment type '{apt_type_name}' not in allowed types {allowed_types} for operatory {op_num} in clinic {clinic}")
-                continue
-            else:
-                logger.info(f"✓ Apt {apt_num}: appointment type '{apt_type_name}' matches filter for operatory {op_num} in clinic {clinic}")
+        # NEW: Check broken appointment type filter
+        if status == 'Broken':
+            clinic_broken_filters = CLINIC_BROKEN_APPOINTMENT_TYPE_FILTERS.get(clinic, [])
+            if clinic_broken_filters:  # Only apply filter if configured for this clinic
+                apt_type_name = get_appointment_type_name(a, clinic)
+                
+                if apt_type_name not in clinic_broken_filters:
+                    logger.debug(f"Skipping broken apt {apt_num}: appointment type '{apt_type_name}' not in allowed broken types {clinic_broken_filters} for clinic {clinic}")
+                    continue
+                else:
+                    logger.info(f"✓ Broken apt {apt_num}: appointment type '{apt_type_name}' matches allowed broken types for clinic {clinic}")
         
         valid.append(a)
     
