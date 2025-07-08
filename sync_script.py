@@ -381,7 +381,7 @@ def send_to_keragon(appt: Dict[str, Any], clinic: int, dry_run: bool = False) ->
         'appointmentEndTime': en_payload,
         'appointmentDurationMinutes': duration_minutes,
         'status': appt.get('AptStatus'),
-        'notes': appt.get('Note', '') + ' [fromOD]',
+        'notes': appt.get('Note', ''),
         'patientId': str(appt.get('PatNum')),
         'firstName': first,
         'lastName': last,
