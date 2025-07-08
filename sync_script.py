@@ -114,6 +114,20 @@ def get_appointment_type_name(appointment: Dict[str, Any], clinic_num: int) -> s
     logger.debug(f"No appointment type found for appointment {appointment.get('AptNum')} in clinic {clinic_num}")
     return ''
 
+def get_appointment_type_num(appointment: Dict[str, Any]) -> Optional[int]:
+    """Get the appointment type number for an appointment"""
+    apt_type_num = appointment.get('AppointmentTypeNum')
+    if apt_type_num is not None:
+        return apt_type_num
+    
+    logger.debug(f"No appointment type number found for appointment {appointment.get('AptNum')}")
+    return None
+
+def has_ghl_tag(appointment: Dict[str, Any]) -> bool:
+    """Check if appointment has [fromGHL] tag in the Note field"""
+    note = appointment.get('Note', '') or ''
+    return '[fromGHL]' in note
+
 # === IMPROVED STATE MANAGEMENT ===
 def load_last_sync_times() -> Dict[int, Optional[datetime.datetime]]:
     state: Dict[int, Optional[datetime.datetime]] = {}
@@ -284,6 +298,11 @@ def fetch_appointments(
         status = a.get('AptStatus', '')
         op_num = a.get('Op') or a.get('OperatoryNum')
         
+        # Check for [fromGHL] tag - skip if present
+        if has_ghl_tag(a):
+            logger.debug(f"Skipping apt {apt_num}: contains [fromGHL] tag")
+            continue
+        
         # Check status
         if status not in VALID_STATUSES:
             logger.debug(f"Skipping apt {apt_num}: invalid status '{status}'")
@@ -298,7 +317,7 @@ def fetch_appointments(
             logger.debug(f"Skipping apt {apt_num}: operatory {op_num} not in allowed operatories {ops}")
             continue
         
-        # NEW: Check broken appointment type filter
+        # Check broken appointment type filter
         if status == 'Broken':
             clinic_broken_filters = CLINIC_BROKEN_APPOINTMENT_TYPE_FILTERS.get(clinic, [])
             if clinic_broken_filters:  # Only apply filter if configured for this clinic
@@ -342,6 +361,9 @@ def send_to_keragon(appt: Dict[str, Any], clinic: int, dry_run: bool = False) ->
     name = f"{first} {last}".strip() or 'Unknown'
     provider_name = 'Dr. Gharbi' if clinic == 9034 else 'Dr. Ensley'
 
+    # Get appointment type number
+    apt_type_num = get_appointment_type_num(appt)
+
     # FIXED: Parse time from OpenDental (comes as UTC) and preserve the exact time values
     st_utc = parse_time(appt.get('AptDateTime'))
     if not st_utc:
@@ -373,6 +395,7 @@ def send_to_keragon(appt: Dict[str, Any], clinic: int, dry_run: bool = False) ->
     logger.info(f"  OpenDental UTC: {st_utc}")
     logger.info(f"  GHL time (matching values): {st_ghl}")
     logger.info(f"  Duration: {duration_minutes} minutes")
+    logger.info(f"  Appointment Type Number: {apt_type_num}")
     logger.info(f"  Payload: {st_payload} to {en_payload}")
 
     payload = {
@@ -380,6 +403,7 @@ def send_to_keragon(appt: Dict[str, Any], clinic: int, dry_run: bool = False) ->
         'appointmentTime': st_payload,
         'appointmentEndTime': en_payload,
         'appointmentDurationMinutes': duration_minutes,
+        'appointmentTypeNum': apt_type_num,
         'status': appt.get('AptStatus'),
         'notes': appt.get('Note', ''),
         'patientId': str(appt.get('PatNum')),
@@ -427,6 +451,7 @@ def run_sync(dry_run: bool = False):
 
     logger.info("=== Starting OpenDental → Keragon Sync ===")
     logger.info("Time values will match exactly: 8 AM OpenDental → 8 AM GHL")
+    logger.info("Appointments with [fromGHL] tag will be skipped")
     if dry_run:
         logger.info("DRY RUN MODE: No data will be sent to Keragon")
 
