@@ -7,9 +7,14 @@ import datetime
 import requests
 import tempfile
 import shutil
+import time
+import threading
 from datetime import timezone, timedelta
 from zoneinfo import ZoneInfo
 from typing import List, Dict, Any, Optional, Set
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
 
 # === CONFIGURATION ===
 API_BASE_URL        = os.environ.get('OPEN_DENTAL_API_URL', 'https://api.opendental.com/api/v1')
@@ -20,8 +25,17 @@ KERAGON_WEBHOOK_URL = os.environ.get('KERAGON_WEBHOOK_URL')
 STATE_FILE      = 'last_sync_state.json'
 SENT_APPTS_FILE = 'sent_appointments.json'
 LOG_LEVEL       = os.environ.get('LOG_LEVEL', 'INFO')
-LOOKAHEAD_HOURS = int(os.environ.get('LOOKAHEAD_HOURS', '720'))
-CLINIC_NUMS     = [int(x) for x in os.environ.get('CLINIC_NUMS', '').split(',') if x.strip().isdigit()]
+
+# PERFORMANCE OPTIMIZATIONS
+BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '3'))  # Process 3 clinics at a time
+TIME_WINDOW_HOURS = int(os.environ.get('TIME_WINDOW_HOURS', '24'))  # Process 24 hours at a time instead of 720
+CLINIC_DELAY_SECONDS = float(os.environ.get('CLINIC_DELAY_SECONDS', '2.0'))  # Delay between clinic requests
+MAX_CONCURRENT_CLINICS = int(os.environ.get('MAX_CONCURRENT_CLINICS', '2'))  # Max parallel clinic processing
+REQUEST_TIMEOUT = int(os.environ.get('REQUEST_TIMEOUT', '45'))  # Increased timeout
+RETRY_ATTEMPTS = int(os.environ.get('RETRY_ATTEMPTS', '3'))
+BACKOFF_FACTOR = float(os.environ.get('BACKOFF_FACTOR', '2.0'))
+
+CLINIC_NUMS = [int(x) for x in os.environ.get('CLINIC_NUMS', '').split(',') if x.strip().isdigit()]
 
 # America/Chicago timezone for GHL (GMT-6 CST / GMT-5 CDT)
 GHL_TIMEZONE = ZoneInfo('America/Chicago')
@@ -33,14 +47,18 @@ CLINIC_OPERATORY_FILTERS: Dict[int, List[int]] = {
 
 # Clinic-specific broken appointment type filters
 CLINIC_BROKEN_APPOINTMENT_TYPE_FILTERS: Dict[int, List[str]] = {
-    9034: ["COMP EX", "COMP EX CHILD"],  # Only these broken appointment types allowed for clinic 9034
-    9035: ["CASH CONSULT", "INSURANCE CONSULT"]  # Only these broken appointment types allowed for clinic 9035
+    9034: ["COMP EX", "COMP EX CHILD"],
+    9035: ["CASH CONSULT", "INSURANCE CONSULT"]
 }
 
 VALID_STATUSES = {'Scheduled', 'Complete', 'Broken'}
 
 # Global cache for appointment types per clinic
 _appointment_types_cache: Dict[int, Dict[int, str]] = {}
+
+# Global session with connection pooling and retry strategy
+_session = None
+_session_lock = threading.Lock()
 
 # === LOGGING ===
 logging.basicConfig(
@@ -49,6 +67,60 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger('opendental_sync')
+
+# === OPTIMIZED SESSION MANAGEMENT ===
+def get_optimized_session():
+    """Get a session with connection pooling and retry strategy"""
+    global _session
+    if _session is None:
+        with _session_lock:
+            if _session is None:
+                _session = requests.Session()
+                
+                # Configure retry strategy
+                retry_strategy = Retry(
+                    total=RETRY_ATTEMPTS,
+                    backoff_factor=BACKOFF_FACTOR,
+                    status_forcelist=[429, 500, 502, 503, 504],
+                    allowed_methods=["HEAD", "GET", "POST"]
+                )
+                
+                # Configure connection pooling
+                adapter = HTTPAdapter(
+                    max_retries=retry_strategy,
+                    pool_connections=10,
+                    pool_maxsize=20,
+                    pool_block=True
+                )
+                
+                _session.mount("http://", adapter)
+                _session.mount("https://", adapter)
+                
+                logger.info("Initialized optimized session with connection pooling and retry strategy")
+    
+    return _session
+
+# === RATE LIMITING ===
+class RateLimiter:
+    def __init__(self, delay_seconds: float):
+        self.delay_seconds = delay_seconds
+        self.last_request_time = 0
+        self.lock = threading.Lock()
+    
+    def wait_if_needed(self):
+        with self.lock:
+            current_time = time.time()
+            time_since_last = current_time - self.last_request_time
+            
+            if time_since_last < self.delay_seconds:
+                sleep_time = self.delay_seconds - time_since_last
+                logger.debug(f"Rate limiting: sleeping {sleep_time:.2f}s")
+                time.sleep(sleep_time)
+            
+            self.last_request_time = time.time()
+
+# Global rate limiter
+rate_limiter = RateLimiter(CLINIC_DELAY_SECONDS)
 
 # === APPOINTMENT TYPES CACHE ===
 def get_appointment_types(clinic_num: int) -> Dict[int, str]:
@@ -61,12 +133,16 @@ def get_appointment_types(clinic_num: int) -> Dict[int, str]:
     try:
         logger.info(f"Fetching appointment types for clinic {clinic_num} from OpenDental API...")
         
+        # Rate limit the request
+        rate_limiter.wait_if_needed()
+        
         # Try clinic-specific endpoint first
+        session = get_optimized_session()
         params = {'ClinicNum': clinic_num}
-        r = requests.get(f"{API_BASE_URL}/appointmenttypes", 
-                        headers=make_auth_header(), 
-                        params=params, 
-                        timeout=30)
+        r = session.get(f"{API_BASE_URL}/appointmenttypes", 
+                       headers=make_auth_header(), 
+                       params=params, 
+                       timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
         data = r.json()
         
@@ -253,20 +329,26 @@ def calculate_end_time(start_dt: datetime.datetime, pattern: str) -> datetime.da
         dur = 60
     return start_dt + datetime.timedelta(minutes=dur)
 
-# === APPOINTMENT FETCHING ===
+# === OPTIMIZED APPOINTMENT FETCHING WITH TIME WINDOWING ===
 def get_filtered_ops(clinic: int) -> List[int]:
     return CLINIC_OPERATORY_FILTERS.get(clinic, [])
 
-def fetch_appointments(
+def fetch_appointments_in_window(
     clinic: int,
-    since: Optional[datetime.datetime],
-    ops: List[int]
+    start_time: datetime.datetime,
+    end_time: datetime.datetime,
+    since: Optional[datetime.datetime] = None,
+    ops: List[int] = None
 ) -> List[Dict[str, Any]]:
-    now_utc = datetime.datetime.utcnow().replace(tzinfo=timezone.utc)
+    """Fetch appointments for a specific time window to reduce database load"""
+    
+    if ops is None:
+        ops = get_filtered_ops(clinic)
+    
     params = {
         'ClinicNum': clinic,
-        'dateStart': now_utc.strftime('%Y-%m-%d'),
-        'dateEnd': (now_utc + datetime.timedelta(hours=LOOKAHEAD_HOURS)).strftime('%Y-%m-%d')
+        'dateStart': start_time.strftime('%Y-%m-%d'),
+        'dateEnd': end_time.strftime('%Y-%m-%d')
     }
     
     if since:
@@ -274,26 +356,77 @@ def fetch_appointments(
             since = since.replace(tzinfo=timezone.utc)
         eff_utc = (since + datetime.timedelta(seconds=1)).astimezone(timezone.utc)
         params['DateTStamp'] = eff_utc.strftime('%Y-%m-%d %H:%M:%S')
-        logger.info(f"Clinic {clinic}: fetching appointments modified after UTC {params['DateTStamp']}")
-    else:
-        logger.info(f"Clinic {clinic}: fetching all appointments (first run)")
+        logger.debug(f"Clinic {clinic}: fetching appointments modified after UTC {params['DateTStamp']}")
     
+    logger.debug(f"Clinic {clinic}: fetching appointments for window {start_time.strftime('%Y-%m-%d')} to {end_time.strftime('%Y-%m-%d')}")
     logger.debug(f"→ GET /appointments with params: {params}")
     
     try:
-        r = requests.get(f"{API_BASE_URL}/appointments",
-                         headers=make_auth_header(), params=params, timeout=30)
+        # Rate limit the request
+        rate_limiter.wait_if_needed()
+        
+        session = get_optimized_session()
+        r = session.get(f"{API_BASE_URL}/appointments",
+                       headers=make_auth_header(), 
+                       params=params, 
+                       timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
+        
         data = r.json()
         appts = data if isinstance(data, list) else [data]
-        logger.debug(f"← Raw API response: {len(appts)} appointments")
+        logger.debug(f"← Raw API response: {len(appts)} appointments for clinic {clinic}")
+        
+        return appts
+        
     except Exception as e:
-        logger.error(f"Error fetching appointments for clinic {clinic}: {e}")
+        logger.error(f"Error fetching appointments for clinic {clinic} in window {start_time} to {end_time}: {e}")
         return []
 
+def fetch_appointments_optimized(
+    clinic: int,
+    since: Optional[datetime.datetime],
+    ops: List[int]
+) -> List[Dict[str, Any]]:
+    """Fetch appointments using time windowing to reduce database load"""
+    
+    now_utc = datetime.datetime.utcnow().replace(tzinfo=timezone.utc)
+    
+    # Use smaller time windows instead of the full lookahead period
+    all_appointments = []
+    window_start = now_utc
+    
+    # Calculate how many windows we need
+    total_hours = TIME_WINDOW_HOURS
+    windows_needed = 1  # Start with just the current window
+    
+    logger.info(f"Clinic {clinic}: Using {TIME_WINDOW_HOURS}-hour time windows for optimized fetching")
+    
+    for window_num in range(windows_needed):
+        window_end = window_start + datetime.timedelta(hours=TIME_WINDOW_HOURS)
+        
+        logger.debug(f"Clinic {clinic}: Processing window {window_num + 1}/{windows_needed}")
+        
+        try:
+            window_appointments = fetch_appointments_in_window(
+                clinic, window_start, window_end, since, ops
+            )
+            
+            if window_appointments:
+                all_appointments.extend(window_appointments)
+                logger.debug(f"Clinic {clinic}: Window {window_num + 1} returned {len(window_appointments)} appointments")
+            
+            # Move to next window
+            window_start = window_end
+            
+        except Exception as e:
+            logger.error(f"Error in window {window_num + 1} for clinic {clinic}: {e}")
+            continue
+    
+    logger.info(f"Clinic {clinic}: Total appointments fetched across all windows: {len(all_appointments)}")
+    
     # Filter appointments
     valid = []
-    for a in appts:
+    for a in all_appointments:
         apt_num = str(a.get('AptNum', ''))
         status = a.get('AptStatus', '')
         op_num = a.get('Op') or a.get('OperatoryNum')
@@ -331,7 +464,7 @@ def fetch_appointments(
         
         valid.append(a)
     
-    logger.info(f"Clinic {clinic}: {len(valid)} valid appointment(s) found")
+    logger.info(f"Clinic {clinic}: {len(valid)} valid appointment(s) found after filtering")
     if valid:
         logger.debug(f"Valid appointment IDs: {[a.get('AptNum') for a in valid]}")
     
@@ -343,14 +476,21 @@ def get_patient_details(pat_num: int) -> Dict[str, Any]:
         return {}
     try:
         logger.debug(f"Fetching patient details for PatNum {pat_num}")
-        r = requests.get(f"{API_BASE_URL}/patients/{pat_num}", headers=make_auth_header(), timeout=15)
+        
+        # Rate limit the request
+        rate_limiter.wait_if_needed()
+        
+        session = get_optimized_session()
+        r = session.get(f"{API_BASE_URL}/patients/{pat_num}", 
+                       headers=make_auth_header(), 
+                       timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
         return r.json()
     except Exception as e:
         logger.warning(f"Failed to fetch patient {pat_num}: {e}")
         return {}
 
-# === FIXED SYNC FUNCTION - TIME MATCHING LOGIC ===
+# === KERAGON SENDING ===
 def send_to_keragon(appt: Dict[str, Any], clinic: int, dry_run: bool = False) -> bool:
     apt_num = str(appt.get('AptNum', ''))
     
@@ -364,7 +504,7 @@ def send_to_keragon(appt: Dict[str, Any], clinic: int, dry_run: bool = False) ->
     # Get appointment type number
     apt_type_num = get_appointment_type_num(appt)
 
-    # FIXED: Parse time from OpenDental (comes as UTC) and preserve the exact time values
+    # Parse time from OpenDental (comes as UTC) and preserve the exact time values
     st_utc = parse_time(appt.get('AptDateTime'))
     if not st_utc:
         logger.error(f"Invalid start time for appointment {apt_num}")
@@ -373,8 +513,7 @@ def send_to_keragon(appt: Dict[str, Any], clinic: int, dry_run: bool = False) ->
     logger.debug(f"Appointment {apt_num} - Raw time from OpenDental: {appt.get('AptDateTime')}")
     logger.debug(f"Appointment {apt_num} - Parsed UTC time: {st_utc}")
     
-    # KEY FIX: Extract the time components from UTC and recreate in GHL timezone
-    # This ensures 8 AM UTC from OpenDental becomes 8 AM in GHL timezone
+    # Extract the time components from UTC and recreate in GHL timezone
     st_ghl = st_utc.replace(tzinfo=None)  # Remove UTC timezone
     st_ghl = st_ghl.replace(tzinfo=GHL_TIMEZONE)  # Apply GHL timezone to same time values
     
@@ -428,8 +567,11 @@ def send_to_keragon(appt: Dict[str, Any], clinic: int, dry_run: bool = False) ->
 
     try:
         logger.debug(f"Sending to Keragon: {json.dumps(payload, indent=2)}")
-        r = requests.post(KERAGON_WEBHOOK_URL, json=payload, timeout=30)
+        
+        session = get_optimized_session()
+        r = session.post(KERAGON_WEBHOOK_URL, json=payload, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
+        
         logger.info(f"✓ Successfully sent appointment {apt_num} to Keragon")
         return True
     except Exception as e:
@@ -442,51 +584,33 @@ def send_to_keragon(appt: Dict[str, Any], clinic: int, dry_run: bool = False) ->
                 pass
         return False
 
-# === MAIN SYNC LOGIC ===
-def run_sync(dry_run: bool = False):
-    if not (DEVELOPER_KEY and CUSTOMER_KEY and KERAGON_WEBHOOK_URL and CLINIC_NUMS):
-        logger.critical("Missing configuration – check your environment variables")
-        logger.critical("Required: OPEN_DENTAL_DEVELOPER_KEY, OPEN_DENTAL_CUSTOMER_KEY, KERAGON_WEBHOOK_URL, CLINIC_NUMS")
-        sys.exit(1)
-
-    logger.info("=== Starting OpenDental → Keragon Sync ===")
-    logger.info("Time values will match exactly: 8 AM OpenDental → 8 AM GHL")
-    logger.info("Appointments with [fromGHL] tag will be skipped")
-    if dry_run:
-        logger.info("DRY RUN MODE: No data will be sent to Keragon")
-
-    # Load appointment types cache for each clinic
-    logger.info("Loading appointment types for each clinic...")
-    for clinic in CLINIC_NUMS:
-        types = get_appointment_types(clinic)
-        logger.info(f"Clinic {clinic}: Loaded {len(types)} appointment types")
-
-    # Load state
-    last_syncs = load_last_sync_times()
-    sent_appointments = load_sent_appointments()
-    new_syncs = last_syncs.copy()  # Start with existing sync times
+# === PARALLEL CLINIC PROCESSING ===
+def process_clinic(clinic: int, last_syncs: Dict[int, Optional[datetime.datetime]], 
+                  sent_appointments: Set[str], dry_run: bool = False) -> Dict[str, Any]:
+    """Process a single clinic and return results"""
     
-    total_sent = 0
-    total_skipped = 0
-    total_processed = 0
+    logger.info(f"--- Processing Clinic {clinic} ---")
     
-    # Track if we need to save state (only if something actually changed)
-    state_changed = False
-
-    for clinic in CLINIC_NUMS:
-        logger.info(f"--- Processing Clinic {clinic} ---")
-        
-        # Fetch appointments
-        appointments = fetch_appointments(clinic, last_syncs.get(clinic), get_filtered_ops(clinic))
+    try:
+        # Fetch appointments with optimized windowing
+        appointments = fetch_appointments_optimized(clinic, last_syncs.get(clinic), get_filtered_ops(clinic))
         
         # Only update sync time if we actually process appointments
         if not appointments:
             logger.info(f"Clinic {clinic}: No appointments to process - sync time unchanged")
-            continue
-            
+            return {
+                'clinic': clinic,
+                'sent': 0,
+                'skipped': 0,
+                'processed': 0,
+                'latest_timestamp': last_syncs.get(clinic),
+                'appointments_sent': []
+            }
+        
         clinic_sent = 0
         clinic_skipped = 0
         clinic_processed = 0
+        clinic_appointments_sent = []
         
         # Track the latest timestamp we've processed
         latest_processed_timestamp = last_syncs.get(clinic)
@@ -514,27 +638,118 @@ def run_sync(dry_run: bool = False):
             # Try to send
             if send_to_keragon(appt, clinic, dry_run):
                 clinic_sent += 1
-                if not dry_run:
-                    sent_appointments.add(apt_num)
-                    state_changed = True
+                clinic_appointments_sent.append(apt_num)
             else:
                 logger.warning(f"Failed to send appointment {apt_num}")
                 # Continue processing other appointments instead of stopping
 
-        # Only update sync time if we actually processed appointments
-        if clinic_processed > 0:
-            if latest_processed_timestamp and validate_sync_time_update(clinic, last_syncs.get(clinic), latest_processed_timestamp):
-                new_syncs[clinic] = latest_processed_timestamp
-                state_changed = True
-                logger.info(f"Clinic {clinic}: Processed {clinic_processed} appointments, updated sync time to {latest_processed_timestamp}")
-            else:
-                logger.warning(f"Clinic {clinic}: Processed {clinic_processed} appointments but could not determine valid sync time - keeping previous sync time")
-        
         logger.info(f"Clinic {clinic}: ✓ Sent {clinic_sent}, Skipped {clinic_skipped}, Total processed {clinic_processed}")
+        
+        return {
+            'clinic': clinic,
+            'sent': clinic_sent,
+            'skipped': clinic_skipped,
+            'processed': clinic_processed,
+            'latest_timestamp': latest_processed_timestamp,
+            'appointments_sent': clinic_appointments_sent
+        }
+        
+    except Exception as e:
+        logger.error(f"Error processing clinic {clinic}: {e}")
+        return {
+            'clinic': clinic,
+            'sent': 0,
+            'skipped': 0,
+            'processed': 0,
+            'latest_timestamp': last_syncs.get(clinic),
+            'appointments_sent': [],
+            'error': str(e)
+        }
 
-        total_sent += clinic_sent
-        total_skipped += clinic_skipped  
-        total_processed += clinic_processed
+# === MAIN SYNC LOGIC WITH PARALLEL PROCESSING ===
+def run_sync(dry_run: bool = False):
+    if not (DEVELOPER_KEY and CUSTOMER_KEY and KERAGON_WEBHOOK_URL and CLINIC_NUMS):
+        logger.critical("Missing configuration – check your environment variables")
+        logger.critical("Required: OPEN_DENTAL_DEVELOPER_KEY, OPEN_DENTAL_CUSTOMER_KEY, KERAGON_WEBHOOK_URL, CLINIC_NUMS")
+        sys.exit(1)
+
+    logger.info("=== Starting OPTIMIZED OpenDental → Keragon Sync ===")
+    logger.info(f"Performance optimizations enabled:")
+    logger.info(f"  - Time windows: {TIME_WINDOW_HOURS} hours (instead of full lookahead)")
+    logger.info(f"  - Max concurrent clinics: {MAX_CONCURRENT_CLINICS}")
+    logger.info(f"  - Request timeout: {REQUEST_TIMEOUT}s")
+    logger.info(f"  - Retry attempts: {RETRY_ATTEMPTS}")
+    logger.info(f"  - Rate limiting: {CLINIC_DELAY_SECONDS}s between requests")
+    logger.info("Time values will match exactly: 8 AM OpenDental → 8 AM GHL")
+    logger.info("Appointments with [fromGHL] tag will be skipped")
+    if dry_run:
+        logger.info("DRY RUN MODE: No data will be sent to Keragon")
+
+    # Load appointment types cache for each clinic
+    logger.info("Loading appointment types for each clinic...")
+    for clinic in CLINIC_NUMS:
+        types = get_appointment_types(clinic)
+        logger.info(f"Clinic {clinic}: Loaded {len(types)} appointment types")
+
+    # Load state
+    last_syncs = load_last_sync_times()
+    sent_appointments = load_sent_appointments()
+    new_syncs = last_syncs.copy()  # Start with existing sync times
+    
+    total_sent = 0
+    total_skipped = 0
+    total_processed = 0
+    
+    # Track if we need to save state (only if something actually changed)
+    state_changed = False
+
+    # Process clinics in parallel with controlled concurrency
+    logger.info(f"Processing {len(CLINIC_NUMS)} clinics with max {MAX_CONCURRENT_CLINICS} concurrent")
+    
+    clinic_results = []
+    
+    # Use ThreadPoolExecutor for parallel processing
+    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_CLINICS) as executor:
+        # Submit all clinic processing tasks
+        future_to_clinic = {
+            executor.submit(process_clinic, clinic, last_syncs, sent_appointments, dry_run): clinic
+            for clinic in CLINIC_NUMS
+        }
+        
+        # Process completed tasks as they finish
+        for future in as_completed(future_to_clinic):
+            clinic = future_to_clinic[future]
+            try:
+                result = future.result()
+                clinic_results.append(result)
+                
+                # Update tracking variables
+                total_sent += result['sent']
+                total_skipped += result['skipped']
+                total_processed += result['processed']
+                
+                # Update state if clinic processed appointments
+                if result['processed'] > 0:
+                    if result['latest_timestamp'] and validate_sync_time_update(
+                        clinic, last_syncs.get(clinic), result['latest_timestamp']
+                    ):
+                        new_syncs[clinic] = result['latest_timestamp']
+                        state_changed = True
+                        logger.info(f"Clinic {clinic}: Updated sync time to {result['latest_timestamp']}")
+                    
+                    # Add sent appointments to tracking set
+                    if not dry_run:
+                        for apt_id in result['appointments_sent']:
+                            sent_appointments.add(apt_id)
+                            state_changed = True
+                
+                if 'error' in result:
+                    logger.error(f"Clinic {clinic} completed with error: {result['error']}")
+                else:
+                    logger.info(f"Clinic {clinic} completed successfully")
+                    
+            except Exception as e:
+                logger.error(f"Failed to process clinic {clinic}: {e}")
 
     # Only save state if something actually changed
     if state_changed and not dry_run:
@@ -548,11 +763,18 @@ def run_sync(dry_run: bool = False):
     else:
         logger.info("DRY RUN: State files not updated")
     
+    # Summary report
     logger.info("=== Sync Complete ===")
     logger.info(f"Total sent: {total_sent}")
     logger.info(f"Total skipped: {total_skipped}")
     logger.info(f"Total processed: {total_processed}")
     logger.info(f"Total tracked appointments: {len(sent_appointments)}")
+    
+    # Per-clinic summary
+    logger.info("=== Per-Clinic Summary ===")
+    for result in clinic_results:
+        clinic = result['clinic']
+        logger.info(f"Clinic {clinic}: Sent {result['sent']}, Skipped {result['skipped']}, Processed {result['processed']}")
 
 def cleanup_old_sent_appointments(days_to_keep: int = 30):
     """Remove old appointment IDs from the sent appointments file"""
@@ -561,7 +783,7 @@ def cleanup_old_sent_appointments(days_to_keep: int = 30):
 
 if __name__ == '__main__':
     import argparse
-    parser = argparse.ArgumentParser(description='Sync OpenDental → Keragon')
+    parser = argparse.ArgumentParser(description='Sync OpenDental → Keragon (Optimized)')
     parser.add_argument('--reset', action='store_true', help='Clear saved sync timestamps and sent appointments')
     parser.add_argument('--reset-sent', action='store_true', help='Clear only sent appointments tracking')
     parser.add_argument('--verbose', action='store_true', help='Enable DEBUG logging')
