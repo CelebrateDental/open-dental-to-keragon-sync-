@@ -55,7 +55,7 @@ ENABLE_CACHING = os.environ.get('ENABLE_CACHING', 'true').lower() == 'true'
 CACHE_EXPIRY_MINUTES = int(os.environ.get('CACHE_EXPIRY_MINUTES', '5'))
 USE_SPECIFIC_FIELDS = os.environ.get('USE_SPECIFIC_FIELDS', 'true').lower() == 'true'
 ENABLE_PAGINATION = os.environ.get('ENABLE_PAGINATION', 'true').lower() == 'true'
-PAGE_SIZE = int(os.environ.get('PAGE_SIZE', '50'))  # Smaller page sizes
+PAGE_SIZE = int(os.environ.get('PAGE_SIZE', '50'))  # Used for internal logic, not API
 MAX_RECORDS_PER_REQUEST = int(os.environ.get('MAX_RECORDS_PER_REQUEST', '100'))
 
 CLINIC_NUMS = [int(x) for x in os.environ.get('CLINIC_NUMS', '').split(',') if x.strip().isdigit()]
@@ -70,7 +70,7 @@ CLINIC_BROKEN_APPOINTMENT_TYPE_FILTERS: Dict[int, List[str]] = {
     9035: ["CASH CONSULT", "INSURANCE CONSULT"]
 }
 
-VALID_STATUSES = {'Scheduled', 'Complete', 'Broken'}
+VALID_STATUSES = {'1', '2', '4'}  # Numeric codes: 1=Scheduled, 2=Complete, 4=Broken
 
 REQUIRED_APPOINTMENT_FIELDS = [
     'AptNum', 'AptDateTime', 'AptStatus', 'PatNum', 'Op', 'OperatoryNum',
@@ -125,16 +125,13 @@ def get_next_run_time(now: datetime.datetime) -> datetime.datetime:
     next_run = now_clinic_tz.replace(second=0, microsecond=0)
     
     if is_deep_sync_time(now):
-        return now_clinic_tz  # Run deep sync immediately
+        return now_clinic_tz
     elif is_clinic_open(now):
-        # Align to the next 15-minute interval during clinic hours
         minutes = (now_clinic_tz.minute // INCREMENTAL_INTERVAL_MINUTES + 1) * INCREMENTAL_INTERVAL_MINUTES
         next_run = next_run.replace(minute=0, hour=now_clinic_tz.hour) + timedelta(minutes=minutes)
         if next_run.hour >= CLINIC_CLOSE_HOUR:
-            # Schedule for next day's deep sync
             next_run = next_run.replace(hour=DEEP_SYNC_HOUR, minute=0) + timedelta(days=1)
     else:
-        # Schedule for next deep sync or clinic open time
         if now_clinic_tz.hour >= DEEP_SYNC_HOUR:
             next_run = next_run.replace(hour=DEEP_SYNC_HOUR, minute=0) + timedelta(days=1)
         else:
@@ -262,11 +259,8 @@ def make_optimized_request(
         try:
             session = get_optimized_session()
             url = f"{API_BASE_URL}/{endpoint.lstrip('/')}"
-            if USE_SPECIFIC_FIELDS and 'appointments' in endpoint:
-                params['fields'] = ','.join(REQUIRED_APPOINTMENT_FIELDS)
             if ENABLE_PAGINATION:
-                params['limit'] = PAGE_SIZE
-                params['offset'] = offset
+                params['Offset'] = offset  # Capitalized Offset
             logger.debug(f"Making request to {endpoint} with params: {params}")
             if method == 'GET':
                 response = session.get(url, headers=make_auth_header(), params=params, timeout=REQUEST_TIMEOUT)
@@ -280,6 +274,9 @@ def make_optimized_request(
                 logger.warning(f"Rate limited by API, waiting {wait_time}s...")
                 time.sleep(wait_time)
                 continue
+            if response.status_code >= 400:
+                logger.error(f"Request to {endpoint} failed: {response.status_code} {response.reason}, Response: {response.text}")
+                return None
             response.raise_for_status()
             try:
                 data = response.json()
@@ -447,7 +444,11 @@ def parse_time(s: Optional[str]) -> Optional[datetime.datetime]:
         return None
 
 def make_auth_header() -> Dict[str, str]:
-    return {'Authorization': f'ODFHIR {DEVELOPER_KEY}/{CUSTOMER_KEY}', 'Content-Type': 'application/json'}
+    return {
+        'Authorization': f'Bearer {DEVELOPER_KEY}',
+        'CustomerKey': CUSTOMER_KEY,
+        'Content-Type': 'application/json'
+    }
 
 def calculate_pattern_duration(pattern: str, minutes_per_slot: int = 5) -> int:
     return sum(1 for ch in (pattern or '').upper() if ch in ('X', '/')) * minutes_per_slot
@@ -469,7 +470,7 @@ def generate_sync_windows(
     windows = []
     if last_sync and not force_deep_sync:
         time_since_last = now_utc - last_sync
-        if time_since_last < datetime.timedelta(hours=1):
+        if time_since_last < datetime.timedelta(hours=24):  # Allow 24 hours for incremental
             logger.info(f"Clinic {clinic_num}: Incremental sync (last sync {time_since_last} ago)")
             window_start = last_sync - datetime.timedelta(hours=SAFETY_OVERLAP_HOURS)
             window_end = now_utc + datetime.timedelta(minutes=INCREMENTAL_SYNC_MINUTES)
@@ -487,11 +488,11 @@ def generate_sync_windows(
         if last_sync:
             start_time = max(
                 last_sync - datetime.timedelta(hours=SAFETY_OVERLAP_HOURS), 
-                now_utc - datetime.timedelta(hours=24)  # Look back 24 hours for changes
+                now_utc - datetime.timedelta(hours=24)
             )
         else:
             start_time = now_utc - datetime.timedelta(hours=24)
-        end_time = now_utc + datetime.timedelta(hours=DEEP_SYNC_HOURS)  # 720-hour look-ahead
+        end_time = now_utc + datetime.timedelta(hours=DEEP_SYNC_HOURS)
         current_start = start_time
         while current_start < end_time:
             window_end = min(current_start + datetime.timedelta(hours=TIME_WINDOW_HOURS), end_time)
@@ -546,7 +547,7 @@ def apply_appointment_filters(
     valid = []
     for appt in appointments:
         apt_num = str(appt.get('AptNum', ''))
-        status = appt.get('AptStatus', '')
+        status = str(appt.get('AptStatus', ''))  # Convert to string for comparison
         op_num = appt.get('Op') or appt.get('OperatoryNum')
         if appointment_filter.exclude_ghl_tagged and has_ghl_tag(appt):
             continue
@@ -554,7 +555,7 @@ def apply_appointment_filters(
             continue
         if appointment_filter.operatory_nums and op_num not in appointment_filter.operatory_nums:
             continue
-        if status == 'Broken' and appointment_filter.broken_appointment_types:
+        if status == '4' and appointment_filter.broken_appointment_types:  # Broken
             apt_type_name = get_appointment_type_name(appt, clinic)
             if apt_type_name not in appointment_filter.broken_appointment_types:
                 continue
@@ -860,7 +861,6 @@ def run_sync(dry_run: bool = False, force_deep_sync: bool = False):
     logger.info(f"  • Adaptive rate limiting: {CLINIC_DELAY_SECONDS}s base delay")
     logger.info(f"  • Deep sync window: {DEEP_SYNC_HOURS} hours")
     logger.info(f"  • Request caching: {'enabled' if ENABLE_CACHING else 'disabled'}")
-    logger.info(f"  • Field selection: {'enabled' if USE_SPECIFIC_FIELDS else 'disabled'}")
     logger.info(f"  • Safety overlap: {SAFETY_OVERLAP_HOURS} hours")
     if dry_run:
         logger.info("🔍 DRY RUN MODE")
