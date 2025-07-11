@@ -445,8 +445,7 @@ def parse_time(s: Optional[str]) -> Optional[datetime.datetime]:
 
 def make_auth_header() -> Dict[str, str]:
     return {
-        'Authorization': f'Bearer {DEVELOPER_KEY}',
-        'CustomerKey': CUSTOMER_KEY,
+        'Authorization': f'ODFHIR {DEVELOPER_KEY}/{CUSTOMER_KEY}',
         'Content-Type': 'application/json'
     }
 
