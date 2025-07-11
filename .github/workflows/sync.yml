@@ -61,9 +61,9 @@ jobs:
           MAX_RECORDS_PER_REQUEST: "100"
         run: |
           if [[ "${{ github.event_name }}" == "schedule" && "${{ github.event.schedule }}" == "0 7 * * *" ]]; then
-            python3 sync_opendental_to_keragon.py --force-deep-sync --verbose
+            python3 sync_script.py --force-deep-sync --verbose
           else
-            python3 sync_opendental_to_keragon.py --verbose
+            python3 sync_script.py --verbose
           fi
 
       - name: Commit and push state files
