@@ -1,11 +1,10 @@
-
 name: Open Dental to Keragon Sync
 
 on:
   schedule:
-    # Deep sync at 2 AM Central Time (7 AM UTC, assuming CST)
+    # Deep sync at 2 AM CDT (7 AM UTC, CDT is GMT-5 in July)
     - cron: '0 7 * * *'
-    # Incremental sync every 15 minutes during clinic hours (8 AM–8 PM Central Time, 1 PM–1 AM UTC)
+    # Incremental sync every 15 minutes from 8 AM to 8 PM CDT (1 PM–1 AM UTC)
     - cron: '0,15,30,45 13-0 * * *'
   workflow_dispatch:
 
@@ -14,12 +13,23 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  deep-sync:
+  sync:
     runs-on: ubuntu-latest
-    if: github.event.schedule == '0 7 * * *'  # Only run for deep sync schedule
+    strategy:
+      matrix:
+        sync-type: ['incremental', 'deep']
+        include:
+          - sync-type: deep
+            cron: '0 7 * * *'
+            args: '--force-deep-sync --verbose'
+          - sync-type: incremental
+            cron: '0,15,30,45 13-0 * * *'
+            args: '--verbose'
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == matrix.cron
+
     steps:
       - name: Check out repository code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: true
@@ -31,16 +41,16 @@ jobs:
           stat sync_opendental_to_keragon.py
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          pip install requests python-dateutil
 
-      - name: Run deep sync
+      - name: Run sync
         id: sync
         env:
           OPEN_DENTAL_DEVELOPER_KEY: ${{ secrets.OPEN_DENTAL_DEVELOPER_KEY }}
@@ -48,58 +58,10 @@ jobs:
           KERAGON_WEBHOOK_URL: ${{ secrets.KERAGON_WEBHOOK_URL }}
           CLINIC_NUMS: "${{ secrets.CLINIC_NUM_1 }},${{ secrets.CLINIC_NUM_2 }}"
           LOG_LEVEL: "DEBUG"
-        run: python3 sync_opendental_to_keragon.py --force-deep-sync --verbose
+          CLINIC_DELAY_SECONDS: "5.0"
+        run: python3 sync_opendental_to_keragon.py ${{ matrix.args }}
 
-      - name: Commit and push state file
-        if: steps.sync.outcome == 'success'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          git config --local user.name "GitHub Actions Bot"
-          git config --local user.email "actions@github.com"
-          git add last_sync_state.json sent_appointments.json
-          git diff --cached --quiet || (
-            git commit -m "chore(sync): update sync state [skip ci]" &&
-            git push
-          )
-
-  incremental-sync:
-    runs-on: ubuntu-latest
-    if: github.event.schedule == '0,15,30,45 13-0 * * *'  # Only run for incremental sync schedule
-    steps:
-      - name: Check out repository code
-        uses: actions/checkout@v3
-        with:
-          fetch-depth: 0
-          persist-credentials: true
-
-      - name: Show script version and mtime
-        run: |
-          echo "## Script file information"
-          ls -l sync_opendental_to_keragon.py
-          stat sync_opendental_to_keragon.py
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests
-
-      - name: Run incremental sync
-        id: sync
-        env:
-          OPEN_DENTAL_DEVELOPER_KEY: ${{ secrets.OPEN_DENTAL_DEVELOPER_KEY }}
-          OPEN_DENTAL_CUSTOMER_KEY: ${{ secrets.OPEN_DENTAL_CUSTOMER_KEY }}
-          KERAGON_WEBHOOK_URL: ${{ secrets.KERAGON_WEBHOOK_URL }}
-          CLINIC_NUMS: "${{ secrets.CLINIC_NUM_1 }},${{ secrets.CLINIC_NUM_2 }}"
-          LOG_LEVEL: "DEBUG"
-        run: python3 sync_opendental_to_keragon.py --verbose
-
-      - name: Commit and push state file
+      - name: Commit and push state files
         if: steps.sync.outcome == 'success'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
