@@ -27,8 +27,8 @@ jobs:
       - name: Show script version and mtime
         run: |
           echo "## Script file information"
-          ls -l sync_opendental_to_keragon.py
-          stat sync_opendental_to_keragon.py
+          ls -l sync_script.py
+          stat sync_script.py
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -51,9 +51,9 @@ jobs:
           CLINIC_DELAY_SECONDS: "5.0"
         run: |
           if [[ "${{ github.event.schedule }}" == "0 7 * * *" ]]; then
-            python3 sync_opendental_to_keragon.py --force-deep-sync --verbose
+            python3 sync_script.py --force-deep-sync --verbose
           else
-            python3 sync_opendental_to_keragon.py --verbose
+            python3 sync_script.py --verbose
           fi
 
       - name: Commit and push state files
