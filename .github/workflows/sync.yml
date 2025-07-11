@@ -1,9 +1,12 @@
+
 name: Open Dental to Keragon Sync
 
 on:
   schedule:
-    # Run every 10 minutes
-    - cron: '*/10 * * * *'
+    # Deep sync at 2 AM Central Time (7 AM UTC, assuming CST)
+    - cron: '0 7 * * *'
+    # Incremental sync every 15 minutes during clinic hours (8 AM–8 PM Central Time, 1 PM–1 AM UTC)
+    - cron: '0,15,30,45 13-0 * * *'
   workflow_dispatch:
 
 concurrency:
@@ -11,21 +14,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  sync:
+  deep-sync:
     runs-on: ubuntu-latest
-
+    if: github.event.schedule == '0 7 * * *'  # Only run for deep sync schedule
     steps:
       - name: Check out repository code
         uses: actions/checkout@v3
         with:
-          fetch-depth: 0       # fetch full history for state commits
-          persist-credentials: true  # allow pushing back
+          fetch-depth: 0
+          persist-credentials: true
 
       - name: Show script version and mtime
         run: |
           echo "## Script file information"
-          ls -l sync_script.py
-          stat sync_script.py
+          ls -l sync_opendental_to_keragon.py
+          stat sync_opendental_to_keragon.py
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -37,26 +40,74 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Run sync script
-        id: sync                            # <-- add this line
+      - name: Run deep sync
+        id: sync
         env:
           OPEN_DENTAL_DEVELOPER_KEY: ${{ secrets.OPEN_DENTAL_DEVELOPER_KEY }}
           OPEN_DENTAL_CUSTOMER_KEY: ${{ secrets.OPEN_DENTAL_CUSTOMER_KEY }}
           KERAGON_WEBHOOK_URL: ${{ secrets.KERAGON_WEBHOOK_URL }}
           CLINIC_NUMS: "${{ secrets.CLINIC_NUM_1 }},${{ secrets.CLINIC_NUM_2 }}"
           LOG_LEVEL: "DEBUG"
-        run: python3 sync_script.py --verbose
+        run: python3 sync_opendental_to_keragon.py --force-deep-sync --verbose
 
       - name: Commit and push state file
-        if: steps.sync.outcome == 'success'  # now references the above id
+        if: steps.sync.outcome == 'success'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git config --local user.name "GitHub Actions Bot"
           git config --local user.email "actions@github.com"
-          git add last_sync_state.json
-          # only commit if there were changes
+          git add last_sync_state.json sent_appointments.json
           git diff --cached --quiet || (
-            git commit -m "chore(sync): update last_sync_state [skip ci]" &&
+            git commit -m "chore(sync): update sync state [skip ci]" &&
+            git push
+          )
+
+  incremental-sync:
+    runs-on: ubuntu-latest
+    if: github.event.schedule == '0,15,30,45 13-0 * * *'  # Only run for incremental sync schedule
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Show script version and mtime
+        run: |
+          echo "## Script file information"
+          ls -l sync_opendental_to_keragon.py
+          stat sync_opendental_to_keragon.py
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Run incremental sync
+        id: sync
+        env:
+          OPEN_DENTAL_DEVELOPER_KEY: ${{ secrets.OPEN_DENTAL_DEVELOPER_KEY }}
+          OPEN_DENTAL_CUSTOMER_KEY: ${{ secrets.OPEN_DENTAL_CUSTOMER_KEY }}
+          KERAGON_WEBHOOK_URL: ${{ secrets.KERAGON_WEBHOOK_URL }}
+          CLINIC_NUMS: "${{ secrets.CLINIC_NUM_1 }},${{ secrets.CLINIC_NUM_2 }}"
+          LOG_LEVEL: "DEBUG"
+        run: python3 sync_opendental_to_keragon.py --verbose
+
+      - name: Commit and push state file
+        if: steps.sync.outcome == 'success'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config --local user.name "GitHub Actions Bot"
+          git config --local user.email "actions@github.com"
+          git add last_sync_state.json sent_appointments.json
+          git diff --cached --quiet || (
+            git commit -m "chore(sync): update sync state [skip ci]" &&
             git push
           )
