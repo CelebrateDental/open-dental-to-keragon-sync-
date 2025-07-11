@@ -27,8 +27,8 @@ jobs:
       - name: Show script version and mtime
         run: |
           echo "## Script file information"
-          ls -l sync_script.py
-          stat sync_script.py
+          ls -l sync_opendental_to_keragon.py || true
+          stat sync_opendental_to_keragon.py || true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -49,11 +49,21 @@ jobs:
           CLINIC_NUMS: "${{ secrets.CLINIC_NUM_1 }},${{ secrets.CLINIC_NUM_2 }}"
           LOG_LEVEL: "DEBUG"
           CLINIC_DELAY_SECONDS: "5.0"
+          TIME_WINDOW_HOURS: "4"
+          INCREMENTAL_SYNC_MINUTES: "15"
+          DEEP_SYNC_HOURS: "720"
+          SAFETY_OVERLAP_HOURS: "2"
+          ENABLE_CACHING: "true"
+          CACHE_EXPIRY_MINUTES: "5"
+          USE_SPECIFIC_FIELDS: "false"
+          ENABLE_PAGINATION: "true"
+          PAGE_SIZE: "50"
+          MAX_RECORDS_PER_REQUEST: "100"
         run: |
-          if [[ "${{ github.event.schedule }}" == "0 7 * * *" ]]; then
-            python3 sync_script.py --force-deep-sync --verbose
+          if [[ "${{ github.event_name }}" == "schedule" && "${{ github.event.schedule }}" == "0 7 * * *" ]]; then
+            python3 sync_opendental_to_keragon.py --force-deep-sync --verbose
           else
-            python3 sync_script.py --verbose
+            python3 sync_opendental_to_keragon.py --verbose
           fi
 
       - name: Commit and push state files
@@ -63,7 +73,7 @@ jobs:
         run: |
           git config --local user.name "GitHub Actions Bot"
           git config --local user.email "actions@github.com"
-          git add last_sync_state.json sent_appointments.json
+          git add last_sync_state.json sent_appointments.json appointment_coverage_report.json
           git diff --cached --quiet || (
             git commit -m "chore(sync): update sync state [skip ci]" &&
             git push
