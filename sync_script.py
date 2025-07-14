@@ -39,7 +39,7 @@ RETRY_ATTEMPTS = int(os.environ.get('RETRY_ATTEMPTS', '5'))  # More retries
 BACKOFF_FACTOR = float(os.environ.get('BACKOFF_FACTOR', '3.0'))  # Exponential backoff
 
 # === SMART SYNC OPTIMIZATION ===
-INCREMENTAL_SYNC_MINUTES = int(os.environ.get('INCREMENTAL_SYNC_MINUTES', '60'))  # 15-minute incremental sync
+INCREMENTAL_SYNC_MINUTES = int(os.environ.get('INCREMENTAL_SYNC_MINUTES', '15'))  # 15-minute incremental sync
 DEEP_SYNC_HOURS = int(os.environ.get('DEEP_SYNC_HOURS', '720'))  # 720-hour (30-day) look-ahead
 SAFETY_OVERLAP_HOURS = int(os.environ.get('SAFETY_OVERLAP_HOURS', '2'))  # Safety overlap
 
@@ -52,7 +52,7 @@ INCREMENTAL_INTERVAL_MINUTES = 60  # Incremental sync every 15 minutes during cl
 
 # === CACHING AND OPTIMIZATION ===
 ENABLE_CACHING = os.environ.get('ENABLE_CACHING', 'true').lower() == 'true'
-CACHE_EXPIRY_MINUTES = int(os.environ.get('CACHE_EXPIRY_MINUTES', '5'))
+CACHE_EXPIRY_MINUTES = int(os.environ.get('CACHE_EXPIRY_MINUTES', '30'))
 USE_SPECIFIC_FIELDS = os.environ.get('USE_SPECIFIC_FIELDS', 'true').lower() == 'true'
 ENABLE_PAGINATION = os.environ.get('ENABLE_PAGINATION', 'true').lower() == 'true'
 PAGE_SIZE = int(os.environ.get('PAGE_SIZE', '50'))  # Used for internal logic, not API
