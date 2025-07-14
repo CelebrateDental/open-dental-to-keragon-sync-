@@ -39,7 +39,7 @@ RETRY_ATTEMPTS = int(os.environ.get('RETRY_ATTEMPTS', '5'))  # More retries
 BACKOFF_FACTOR = float(os.environ.get('BACKOFF_FACTOR', '3.0'))  # Exponential backoff
 
 # === SMART SYNC OPTIMIZATION ===
-INCREMENTAL_SYNC_MINUTES = int(os.environ.get('INCREMENTAL_SYNC_MINUTES', '15'))  # 15-minute incremental sync
+INCREMENTAL_SYNC_MINUTES = int(os.environ.get('INCREMENTAL_SYNC_MINUTES', '60'))  # 60-minute incremental sync
 DEEP_SYNC_HOURS = int(os.environ.get('DEEP_SYNC_HOURS', '720'))  # 720-hour (30-day) look-ahead
 SAFETY_OVERLAP_HOURS = int(os.environ.get('SAFETY_OVERLAP_HOURS', '2'))  # Safety overlap
 
@@ -138,6 +138,20 @@ def get_next_run_time(now: datetime.datetime) -> datetime.datetime:
             next_run = next_run.replace(hour=DEEP_SYNC_HOUR, minute=0)
     
     return next_run
+
+# === CONFIG VALIDATION ===
+def validate_configuration() -> bool:
+    """Validate required configuration parameters."""
+    if not DEVELOPER_KEY or not CUSTOMER_KEY:
+        logger.error("Missing Open Dental API credentials")
+        return False
+    if not KERAGON_WEBHOOK_URL:
+        logger.error("Missing Keragon webhook URL")
+        return False
+    if not CLINIC_NUMS:
+        logger.error("No valid clinic numbers provided")
+        return False
+    return True
 
 # === OPTIMIZED SESSION MANAGEMENT ===
 def get_optimized_session():
@@ -276,6 +290,11 @@ def make_optimized_request(
                 continue
             if response.status_code >= 400:
                 logger.error(f"Request to {endpoint} failed: {response.status_code} {response.reason}, Response: {response.text}")
+                if response.status_code == 400:
+                    try:
+                        logger.error(f"Full API response: {response.json()}")
+                    except:
+                        logger.error("Failed to parse JSON response")
                 return None
             response.raise_for_status()
             try:
@@ -519,8 +538,6 @@ def fetch_appointments_for_window(
     }
     if appointment_filter.operatory_nums:
         params['Op'] = ','.join(map(str, appointment_filter.operatory_nums))
-    if appointment_filter.valid_statuses:
-        params['AptStatus'] = ','.join(appointment_filter.valid_statuses)
     if since and window.is_incremental:
         if since.tzinfo is None:
             since = since.replace(tzinfo=timezone.utc)
@@ -528,20 +545,39 @@ def fetch_appointments_for_window(
         params['DateTStamp'] = eff_utc.strftime('%Y-%m-%d %H:%M:%S')
         logger.debug(f"Clinic {clinic}: Incremental sync from {params['DateTStamp']}")
     logger.debug(f"Clinic {clinic}: Fetching {window.start_time} to {window.end_time}")
-    try:
-        appointments = make_optimized_request('appointments', params)
-        if appointments is None and params.get('AptStatus'):
-            logger.warning(f"Clinic {clinic}: AptStatus {params['AptStatus']} failed, retrying without status filter")
-            params.pop('AptStatus', None)  # Remove status filter
+    
+    all_appointments = []
+    # Try individual AptStatus values
+    for status in appointment_filter.valid_statuses:
+        single_params = params.copy()
+        single_params['AptStatus'] = status
+        try:
+            appointments = make_optimized_request('appointments', single_params)
+            if appointments is not None:
+                logger.debug(f"Clinic {clinic}: Status {status} returned {len(appointments)} appointments")
+                all_appointments.extend(appointments)
+            else:
+                logger.warning(f"Clinic {clinic}: Status {status} request failed")
+        except Exception as e:
+            logger.error(f"Clinic {clinic}: Error with AptStatus {status}: {e}")
+        time.sleep(1)  # Small delay between status requests
+    
+    # Fallback: retry without AptStatus
+    if not all_appointments:
+        logger.warning(f"Clinic {clinic}: All AptStatus attempts failed, retrying without status filter")
+        params.pop('AptStatus', None)
+        try:
             appointments = make_optimized_request('appointments', params)
-        if appointments is None:
-            logger.error(f"Clinic {clinic}: Failed to fetch appointments after retry")
-            return []
-        logger.debug(f"Clinic {clinic}: {'Incremental' if window.is_incremental else 'Full'} window returned {len(appointments)} appointments")
-        return appointments
-    except Exception as e:
-        logger.error(f"Error fetching appointments for clinic {clinic}: {e}")
-        return []
+            if appointments is not None:
+                logger.debug(f"Clinic {clinic}: Fallback request returned {len(appointments)} appointments")
+                all_appointments.extend(appointments)
+            else:
+                logger.error(f"Clinic {clinic}: Fallback request failed")
+        except Exception as e:
+            logger.error(f"Clinic {clinic}: Error in fallback request: {e}")
+    
+    logger.debug(f"Clinic {clinic}: {'Incremental' if window.is_incremental else 'Full'} window returned {len(all_appointments)} appointments")
+    return all_appointments
 
 def apply_appointment_filters(
     appointments: List[Dict[str, Any]],
@@ -559,7 +595,7 @@ def apply_appointment_filters(
             continue
         if appointment_filter.operatory_nums and op_num not in appointment_filter.operatory_nums:
             continue
-        if status == 'Broken' and appointment_filter.broken_appointment_types:  # Broken
+        if status == 'Broken' and appointment_filter.broken_appointment_types:
             apt_type_name = get_appointment_type_name(appt, clinic)
             if apt_type_name not in appointment_filter.broken_appointment_types:
                 continue
@@ -946,176 +982,48 @@ def run_appointment_audit(clinic_num: int = None, hours_back: int = 24):
         sys.exit(1)
     clinics_to_audit = [clinic_num] if clinic_num else CLINIC_NUMS
     for clinic in clinics_to_audit:
-        if clinic not in CLINIC_NUMS:
-            logger.error(f"Invalid clinic number {clinic}, skipping")
-            continue
-        logger.info(f"🏥 Auditing Clinic {clinic}...")
-        now_utc = datetime.datetime.utcnow().replace(tzinfo=timezone.utc)
-        audit_start = now_utc - datetime.timedelta(hours=hours_back)
-        audit_window = SyncWindow(
-            start_time=audit_start,
-            end_time=now_utc + datetime.timedelta(hours=DEEP_SYNC_HOURS),
-            is_incremental=False,
-            clinic_num=clinic
-        )
-        audit_filter = AppointmentFilter(
-            clinic_num=clinic,
-            operatory_nums=CLINIC_OPERATORY_FILTERS.get(clinic, []),
-            valid_statuses=VALID_STATUSES,
-            broken_appointment_types=CLINIC_BROKEN_APPOINTMENT_TYPE_FILTERS.get(clinic, []),
-            exclude_ghl_tagged=False
-        )
+        logger.info(f"Auditing clinic {clinic}")
         try:
-            all_appointments = fetch_appointments_for_window(audit_window, audit_filter)
-            logger.info(f"📊 Audit Results - Clinic {clinic}:")
-            logger.info(f"  Total appointments: {len(all_appointments)}")
-            if all_appointments:
-                categories = {
-                    'with_ghl_tag': 0,
-                    'without_ghl_tag': 0,
-                    'in_operatory_filter': 0,
-                    'outside_operatory_filter': 0
-                }
-                operatory_filter = CLINIC_OPERATORY_FILTERS.get(clinic, [])
-                for appt in all_appointments:
-                    if has_ghl_tag(appt):
-                        categories['with_ghl_tag'] += 1
-                    else:
-                        categories['without_ghl_tag'] += 1
-                    op_num = appt.get('Op') or appt.get('OperatoryNum')
-                    if operatory_filter and op_num in operatory_filter:
-                        categories['in_operatory_filter'] += 1
-                    else:
-                        categories['outside_operatory_filter'] += 1
-                logger.info(f"  📋 Breakdown:")
-                logger.info(f"    With [fromGHL]: {categories['with_ghl_tag']}")
-                logger.info(f"    Without [fromGHL]: {categories['without_ghl_tag']}")
-                logger.info(f"    In operatory filter: {categories['in_operatory_filter']}")
-                logger.info(f"    Outside filter: {categories['outside_operatory_filter']}")
-                sent_appointments = load_sent_appointments()
-                already_sent = sum(1 for appt in all_appointments 
-                                 if str(appt.get('AptNum', '')) in sent_appointments)
-                logger.info(f"  ✅ Already sent: {already_sent}")
+            now_utc = datetime.datetime.utcnow().replace(tzinfo=timezone.utc)
+            start_time = now_utc - datetime.timedelta(hours=hours_back)
+            windows = [SyncWindow(
+                start_time=start_time,
+                end_time=now_utc,
+                is_incremental=False,
+                clinic_num=clinic
+            )]
+            appointment_filter = AppointmentFilter(
+                clinic_num=clinic,
+                operatory_nums=CLINIC_OPERATORY_FILTERS.get(clinic, []),
+                valid_statuses=VALID_STATUSES,
+                broken_appointment_types=CLINIC_BROKEN_APPOINTMENT_TYPE_FILTERS.get(clinic, []),
+                exclude_ghl_tagged=True
+            )
+            appointments = []
+            for window in windows:
+                window_appointments = fetch_appointments_for_window(window, appointment_filter)
+                if window_appointments:
+                    filtered_appointments = apply_appointment_filters(window_appointments, appointment_filter)
+                    appointments.extend(filtered_appointments)
+            verification_report = verify_appointment_coverage(clinic, appointments, start_time, now_utc)
+            logger.info(f"Clinic {clinic}: Audit complete, {len(appointments)} appointments found")
         except Exception as e:
-            logger.error(f"❌ Audit failed for clinic {clinic}: {e}")
+            logger.error(f"Failed to audit clinic {clinic}: {e}")
 
-# === UTILITY FUNCTIONS ===
-def validate_configuration():
-    issues = []
-    if not DEVELOPER_KEY:
-        issues.append("OPEN_DENTAL_DEVELOPER_KEY missing")
-    if not CUSTOMER_KEY:
-        issues.append("OPEN_DENTAL_CUSTOMER_KEY missing")
-    if not KERAGON_WEBHOOK_URL:
-        issues.append("KERAGON_WEBHOOK_URL missing")
-    elif not KERAGON_WEBHOOK_URL.startswith(('http://', 'https://')):
-        issues.append("KERAGON_WEBHOOK_URL is not a valid URL")
-    if not CLINIC_NUMS:
-        issues.append("CLINIC_NUMS missing")
-    if TIME_WINDOW_HOURS <= 0 or TIME_WINDOW_HOURS > 24:
-        issues.append(f"TIME_WINDOW_HOURS ({TIME_WINDOW_HOURS}) must be between 1 and 24")
-    if MAX_CONCURRENT_CLINICS > 3:
-        issues.append(f"MAX_CONCURRENT_CLINICS ({MAX_CONCURRENT_CLINICS}) > 3 may overload database")
-    if BATCH_SIZE <= 0:
-        issues.append(f"BATCH_SIZE ({BATCH_SIZE}) must be positive")
-    if INCREMENTAL_SYNC_MINUTES <= 0:
-        issues.append(f"INCREMENTAL_SYNC_MINUTES ({INCREMENTAL_SYNC_MINUTES}) must be positive")
-    if DEEP_SYNC_HOURS <= 0:
-        issues.append(f"DEEP_SYNC_HOURS ({DEEP_SYNC_HOURS}) must be positive")
-    if issues:
-        logger.error("❌ Configuration issues:")
-        for issue in issues:
-            logger.error(f"  • {issue}")
-        return False
-    return True
-
-def show_performance_stats():
-    logger.info("=== 📊 PERFORMANCE STATS ===")
-    logger.info(f"Rate limiter delay: {rate_limiter.current_delay:.2f}s")
-    logger.info(f"Slow requests: {rate_limiter.consecutive_slow_requests}")
-    logger.info(f"Cache entries: {len(_request_cache)}")
-    logger.info(f"Appointment types cached: {len(_appointment_types_cache)}")
-
-# === SCHEDULER ===
-def run_scheduler():
-    if not validate_configuration():
-        sys.exit(1)
-    logger.info(f"Starting scheduler with clinic hours {CLINIC_OPEN_HOUR}:00-{CLINIC_CLOSE_HOUR}:00 {CLINIC_TIMEZONE}")
-    logger.info(f"Deep sync scheduled at {DEEP_SYNC_HOUR}:00 {CLINIC_TIMEZONE}, incremental every {INCREMENTAL_INTERVAL_MINUTES} minutes during clinic hours")
-    while True:
-        now = datetime.datetime.now(tz=timezone.utc)
-        now_clinic_tz = now.astimezone(CLINIC_TIMEZONE)
-        if is_deep_sync_time(now):
-            logger.info(f"Running deep sync at {now_clinic_tz.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-            run_sync(dry_run=False, force_deep_sync=True)
-        elif is_clinic_open(now):
-            logger.info(f"Running incremental sync at {now_clinic_tz.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-            run_sync(dry_run=False, force_deep_sync=False)
-        else:
-            logger.debug(f"Outside clinic hours, no incremental sync needed")
-        next_run = get_next_run_time(now)
-        sleep_seconds = (next_run - now_clinic_tz).total_seconds()
-        logger.info(f"Next run at {next_run.strftime('%Y-%m-%d %H:%M:%S %Z')}, sleeping for {sleep_seconds:.0f}s")
-        time.sleep(sleep_seconds)
-
-if __name__ == '__main__':
+# === MAIN ===
+if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description='Ultra-Optimized OpenDental → Keragon Sync')
-    parser.add_argument('--reset', action='store_true', help='Clear all saved state')
-    parser.add_argument('--reset-sent', action='store_true', help='Clear sent appointments')
-    parser.add_argument('--reset-cache', action='store_true', help='Clear request cache')
-    parser.add_argument('--verbose', action='store_true', help='Enable DEBUG logging')
-    parser.add_argument('--dry-run', action='store_true', help='Show what would be sent')
-    parser.add_argument('--force-deep-sync', action='store_true', help='Force deep sync')
-    parser.add_argument('--show-appt-types', action='store_true', help='Show appointment types')
-    parser.add_argument('--show-stats', action='store_true', help='Show performance stats')
-    parser.add_argument('--validate-config', action='store_true', help='Validate configuration')
-    parser.add_argument('--audit', action='store_true', help='Run appointment audit')
-    parser.add_argument('--audit-clinic', type=int, help='Audit specific clinic')
-    parser.add_argument('--audit-hours', type=int, default=24, help='Hours back to audit')
-    parser.add_argument('--schedule', action='store_true', help='Run in scheduler mode')
+    parser = argparse.ArgumentParser(description="OpenDental to Keragon Sync")
+    parser.add_argument('--dry-run', action='store_true', help="Run without sending to Keragon or saving state")
+    parser.add_argument('--force-deep-sync', action='store_true', help="Force a deep sync")
+    parser.add_argument('--verbose', action='store_true', help="Enable verbose logging")
+    parser.add_argument('--audit', action='store_true', help="Run appointment audit")
+    parser.add_argument('--audit-clinic', type=int, help="Clinic number for audit")
+    parser.add_argument('--audit-hours', type=int, default=24, help="Hours back for audit")
     args = parser.parse_args()
     if args.verbose:
         logger.setLevel(logging.DEBUG)
-    if args.validate_config:
-        sys.exit(0 if validate_configuration() else 1)
-    if args.show_stats:
-        show_performance_stats()
-        sys.exit(0)
-    if args.reset_cache:
-        _request_cache.clear()
-        logger.info("🗑️ Cache cleared")
-        sys.exit(0)
     if args.audit:
         run_appointment_audit(args.audit_clinic, args.audit_hours)
-        sys.exit(0)
-    if args.show_appt_types:
-        if not validate_configuration():
-            sys.exit(1)
-        print("=== 📋 APPOINTMENT TYPES BY CLINIC ===")
-        for clinic in CLINIC_NUMS:
-            appt_types = get_appointment_types(clinic)
-            print(f"\n🏥 Clinic {clinic}:")
-            if appt_types:
-                for type_num, type_name in sorted(appt_types.items()):
-                    print(f"  {type_num}: {type_name}")
-            else:
-                print("  No appointment types found")
-        sys.exit(0)
-    if args.reset:
-        files_to_remove = [STATE_FILE, SENT_APPTS_FILE, CACHE_FILE]
-        for file_path in files_to_remove:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-        _request_cache.clear()
-        logger.info("🗑️ All state cleared")
-        sys.exit(0)
-    if args.reset_sent:
-        if os.path.exists(SENT_APPTS_FILE):
-            os.remove(SENT_APPTS_FILE)
-        logger.info("🗑️ Sent appointments cleared")
-        sys.exit(0)
-    if args.schedule:
-        run_scheduler()
     else:
         run_sync(dry_run=args.dry_run, force_deep_sync=args.force_deep_sync)
