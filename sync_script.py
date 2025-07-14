@@ -39,7 +39,7 @@ RETRY_ATTEMPTS = int(os.environ.get('RETRY_ATTEMPTS', '5'))  # More retries
 BACKOFF_FACTOR = float(os.environ.get('BACKOFF_FACTOR', '3.0'))  # Exponential backoff
 
 # === SMART SYNC OPTIMIZATION ===
-INCREMENTAL_SYNC_MINUTES = int(os.environ.get('INCREMENTAL_SYNC_MINUTES', '60'))  # 60-minute incremental sync
+INCREMENTAL_SYNC_MINUTES = int(os.environ.get('INCREMENTAL_SYNC_MINUTES', '15'))  # 60-minute incremental sync
 DEEP_SYNC_HOURS = int(os.environ.get('DEEP_SYNC_HOURS', '720'))  # 720-hour (30-day) look-ahead
 SAFETY_OVERLAP_HOURS = int(os.environ.get('SAFETY_OVERLAP_HOURS', '2'))  # Safety overlap
 
