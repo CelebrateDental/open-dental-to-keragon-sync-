@@ -48,7 +48,7 @@ CLINIC_TIMEZONE = ZoneInfo('America/Chicago')  # GMT-5 Central Time (CST/CDT)
 CLINIC_OPEN_HOUR = 8  # 8 AM
 CLINIC_CLOSE_HOUR = 20  # 8 PM
 DEEP_SYNC_HOUR = 2  # 2 AM Central Time for deep sync
-INCREMENTAL_INTERVAL_MINUTES = 60  # Incremental sync every 15 minutes during clinic hours
+INCREMENTAL_INTERVAL_MINUTES = 60  # Incremental sync every 60 minutes during clinic hours
 
 # === CACHING AND OPTIMIZATION ===
 ENABLE_CACHING = os.environ.get('ENABLE_CACHING', 'true').lower() == 'true'
@@ -70,7 +70,7 @@ CLINIC_BROKEN_APPOINTMENT_TYPE_FILTERS: Dict[int, List[str]] = {
     9035: ["CASH CONSULT", "INSURANCE CONSULT"]
 }
 
-VALID_STATUSES = {'1', '2', '4'}  # Numeric codes: 1=Scheduled, 2=Complete, 4=Broken
+VALID_STATUSES = {'Scheduled', 'Complete', 'Broken'}  # String names for API compatibility
 
 REQUIRED_APPOINTMENT_FIELDS = [
     'AptNum', 'AptDateTime', 'AptStatus', 'PatNum', 'Op', 'OperatoryNum',
@@ -530,7 +530,12 @@ def fetch_appointments_for_window(
     logger.debug(f"Clinic {clinic}: Fetching {window.start_time} to {window.end_time}")
     try:
         appointments = make_optimized_request('appointments', params)
+        if appointments is None and params.get('AptStatus'):
+            logger.warning(f"Clinic {clinic}: AptStatus {params['AptStatus']} failed, retrying without status filter")
+            params.pop('AptStatus', None)  # Remove status filter
+            appointments = make_optimized_request('appointments', params)
         if appointments is None:
+            logger.error(f"Clinic {clinic}: Failed to fetch appointments after retry")
             return []
         logger.debug(f"Clinic {clinic}: {'Incremental' if window.is_incremental else 'Full'} window returned {len(appointments)} appointments")
         return appointments
@@ -550,11 +555,11 @@ def apply_appointment_filters(
         op_num = appt.get('Op') or appt.get('OperatoryNum')
         if appointment_filter.exclude_ghl_tagged and has_ghl_tag(appt):
             continue
-        if status not in appointment_filter.valid_statuses:
+        if appointment_filter.valid_statuses and status not in appointment_filter.valid_statuses:
             continue
         if appointment_filter.operatory_nums and op_num not in appointment_filter.operatory_nums:
             continue
-        if status == '4' and appointment_filter.broken_appointment_types:  # Broken
+        if status == 'Broken' and appointment_filter.broken_appointment_types:  # Broken
             apt_type_name = get_appointment_type_name(appt, clinic)
             if apt_type_name not in appointment_filter.broken_appointment_types:
                 continue
