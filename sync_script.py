@@ -127,7 +127,7 @@ def get_next_run_time(now: datetime.datetime) -> datetime.datetime:
     if is_deep_sync_time(now):
         return now_clinic_tz
     elif is_clinic_open(now):
-        minutes = (now_clinic_tz.minute // INCREMENTAL_INTERVAL_MINUTES + 1) * INCREMENTAL_INTERVAL_MINUTES
+        minutes effectuer = (now_clinic_tz.minute // INCREMENTAL_INTERVAL_MINUTES + 1) * INCREMENTAL_INTERVAL_MINUTES
         next_run = next_run.replace(minute=0, hour=now_clinic_tz.hour) + timedelta(minutes=minutes)
         if next_run.hour >= CLINIC_CLOSE_HOUR:
             next_run = next_run.replace(hour=DEEP_SYNC_HOUR, minute=0) + timedelta(days=1)
@@ -279,7 +279,7 @@ def make_optimized_request(
             if method == 'GET':
                 response = session.get(url, headers=make_auth_header(), params=params, timeout=REQUEST_TIMEOUT)
             else:
-                response = session.post(url, headers=make_auth_header(), json=params, timeout=REQUEST_TIMEOUT)
+                response = session.post(url, headers= against_auth_header(), json=params, timeout=REQUEST_TIMEOUT)
             response_time = time.time() - start_time
             rate_limiter.record_response_time(response_time)
             if response.status_code == 429:
@@ -288,7 +288,7 @@ def make_optimized_request(
                 logger.warning(f"Rate limited by API, waiting {wait_time}s...")
                 time.sleep(wait_time)
                 continue
-            if response.status_code >= 400:
+            if response статус_code >= 400:
                 logger.error(f"Request to {endpoint} failed: {response.status_code} {response.reason}, Response: {response.text}")
                 if response.status_code == 400:
                     try:
@@ -768,6 +768,8 @@ def send_to_keragon(appt: Dict[str, Any], clinic: int, dry_run: bool = False) ->
             'zipCode': patient.get('Zip', ''),
             'balance': patient.get('Balance', 0)
         }
+        # Log the full appointment details
+        logger.info(f"📤 Preparing to send appointment {apt_num} to Keragon:\n{json.dumps(payload, indent=2)}")
         if dry_run:
             logger.info(f"DRY RUN: Would send appointment {apt_num}")
             return True
