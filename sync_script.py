@@ -1,5 +1,4 @@
-
-   #!/usr/bin/env python3
+#!/usr/bin/env python3
    import os
    import sys
    import json
@@ -1030,4 +1029,3 @@
            run_appointment_audit(args.audit_clinic, args.audit_hours)
        else:
            run_sync(dry_run=args.dry_run, force_deep_sync=args.force_deep_sync)
-   
