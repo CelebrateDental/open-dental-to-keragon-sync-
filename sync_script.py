@@ -127,7 +127,7 @@ def get_next_run_time(now: datetime.datetime) -> datetime.datetime:
     if is_deep_sync_time(now):
         return now_clinic_tz
     elif is_clinic_open(now):
-        minutes effectuer = (now_clinic_tz.minute // INCREMENTAL_INTERVAL_MINUTES + 1) * INCREMENTAL_INTERVAL_MINUTES
+       minutes = (now_clinic_tz.minute // INCREMENTAL_INTERVAL_MINUTES + 1) * INCREMENTAL_INTERVAL_MINUTES
         next_run = next_run.replace(minute=0, hour=now_clinic_tz.hour) + timedelta(minutes=minutes)
         if next_run.hour >= CLINIC_CLOSE_HOUR:
             next_run = next_run.replace(hour=DEEP_SYNC_HOUR, minute=0) + timedelta(days=1)
