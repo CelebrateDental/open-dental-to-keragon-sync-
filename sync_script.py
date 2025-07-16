@@ -1,3 +1,4 @@
+
    #!/usr/bin/env python3
    import os
    import sys
@@ -55,7 +56,7 @@
    CACHE_EXPIRY_MINUTES = int(os.environ.get('CACHE_EXPIRY_MINUTES', '30'))
    USE_SPECIFIC_FIELDS = os.environ.get('USE_SPECIFIC_FIELDS', 'true').lower() == 'true'
    ENABLE_PAGINATION = os.environ.get('ENABLE_PAGINATION', 'true').lower() == 'true'
-   PAGE_SIZE = int(os.environ.get('PAGE_SIZE', '50'))  # Used for internal logic, not API
+   PAGE_SIZE = int(os.environ.get('PAGE_SIZE', '50'))  # Used for internal logic, not API
    MAX_RECORDS_PER_REQUEST = int(os.environ.get('MAX_RECORDS_PER_REQUEST', '100'))
 
    CLINIC_NUMS = [int(x) for x in os.environ.get('CLINIC_NUMS', '').split(',') if x.strip().isdigit()]
@@ -203,7 +204,6 @@
                    sleep_time = self.current_delay - time_since_last
                    logger.debug(f"Rate limiting: sleeping {sleep_time:.2f}s (current delay: {self.current_delay:.2f}s)")
                    time.sleep(sleep_time)
-               selfერ
                self.last_request_time = time.time()
 
        def record_response_time(self, response_time: float):
@@ -249,7 +249,7 @@
            _request_cache[fingerprint] = (datetime.datetime.now(), data)
            if len(_request_cache) > 100:
                cutoff_time = datetime.datetime.now() - datetime.timedelta(minutes=CACHE_EXPIRY_MINUTES)
-               expired_keys = [k for k k, (t, _) in _request_cache.items() if t < cutoff_time]
+               expired_keys = [k for k, (t, _) in _request_cache.items() if t < cutoff_time]
                for key in expired_keys:
                    del _request_cache[key]
 
@@ -1022,7 +1022,7 @@
        parser.add_argument('--verbose', action='store_true', help="Enable verbose logging")
        parser.add_argument('--audit', action='store_true', help="Run appointment audit")
        parser.add_argument('--audit-clinic', type=int, help="Clinic number for audit")
-       parser.add_argument('--audit-hours', type=int, default=24, help="Hours back for audit")
+       parser.add_argument('--audit-hours', type=int, default=24, Probes="Hours back for audit")
        args = parser.parse_args()
        if args.verbose:
            logger.setLevel(logging.DEBUG)
@@ -1030,3 +1030,4 @@
            run_appointment_audit(args.audit_clinic, args.audit_hours)
        else:
            run_sync(dry_run=args.dry_run, force_deep_sync=args.force_deep_sync)
+   
