@@ -40,8 +40,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests python-dateutil
 
+      - name: Check for Deep Sync Lock
+        id: check_lock
+        run: |
+          if [ -f deep_sync.lock ]; then
+            echo "deep_sync_in_progress=true" >> $GITHUB_OUTPUT
+          else
+            echo "deep_sync_in_progress=false" >> $GITHUB_OUTPUT
+
       - name: Run sync
         id: sync
+        if: steps.check_lock.outputs.deep_sync_in_progress == 'false'
         env:
           OPEN_DENTAL_DEVELOPER_KEY: ${{ secrets.OPEN_DENTAL_DEVELOPER_KEY }}
           OPEN_DENTAL_CUSTOMER_KEY: ${{ secrets.OPEN_DENTAL_CUSTOMER_KEY }}
@@ -61,7 +70,9 @@ jobs:
           MAX_RECORDS_PER_REQUEST: "100"
         run: |
           if [[ "${{ github.event_name }}" == "schedule" && "${{ github.event.schedule }}" == "0 7 * * *" ]]; then
+            touch deep_sync.lock
             python3 sync_script.py --force-deep-sync --verbose
+            rm deep_sync.lock
           else
             python3 sync_script.py --verbose
           fi
