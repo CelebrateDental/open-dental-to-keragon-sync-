@@ -47,6 +47,7 @@ jobs:
             echo "deep_sync_in_progress=true" >> $GITHUB_OUTPUT
           else
             echo "deep_sync_in_progress=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Run sync
         id: sync
