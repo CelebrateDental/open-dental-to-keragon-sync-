@@ -85,7 +85,10 @@ jobs:
         run: |
           git config --local user.name "GitHub Actions Bot"
           git config --local user.email "actions@github.com"
-          git add last_sync_state.json sent_appointments.json appointment_coverage_report.json
+          # Only add files if they exist
+          [ -f last_sync_state.json ] && git add last_sync_state.json
+          [ -f sent_appointments.json ] && git add sent_appointments.json
+          [ -f appointment_coverage_report.json ] && git add appointment_coverage_report.json
           git diff --cached --quiet || (
             git commit -m "chore(sync): update sync state [skip ci]" &&
             git push
