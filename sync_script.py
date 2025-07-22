@@ -534,13 +534,26 @@ def fetch_appointments_for_window(
         'dateStart': start_time_utc.strftime('%Y-%m-%d'),
         'dateEnd': end_time_utc.strftime('%Y-%m-%d'),
     }
+    # Log operatory names and numbers for the clinic
+    try:
+        operatory_data = make_optimized_request('operatories', {'ClinicNum': clinic})
+        if operatory_data:
+            operatory_info = [
+                {'OperatoryNum': op.get('OperatoryNum'), 'OperatoryName': op.get('OperatoryName', 'Unknown')}
+                for op in operatory_data if op.get('OperatoryNum') in appointment_filter.operatory_nums
+            ]
+            logger.info(f"Clinic {clinic}: Operatories - {operatory_info}")
+        else:
+            logger.warning(f"Clinic {clinic}: No operatory data retrieved")
+    except Exception as e:
+        logger.error(f"Clinic {clinic}: Failed to fetch operatory data: {e}")
+    
     if window.is_incremental:
         if since is None:
-            # Fallback for incremental sync: fetch appointments modified in last 30 days
             since = datetime.datetime.utcnow().replace(tzinfo=timezone.utc) - datetime.timedelta(days=30)
         if since.tzinfo is None:
             since = since.replace(tzinfo=timezone.utc)
-        eff_utc = (since + datetime.timedelta(seconds=1)).astimezone(timezone.utc)
+        eff_utc = (since + timedelta(seconds=1)).astimezone(timezone.utc)
         params['DateTStamp'] = eff_utc.strftime('%Y-%m-%d %H:%M:%S')
         logger.debug(f"Clinic {clinic}: Applying serverDateTime {params['DateTStamp']} for incremental sync")
     else:
