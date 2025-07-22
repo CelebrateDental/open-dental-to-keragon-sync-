@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 import os
 import sys
@@ -31,7 +32,6 @@ LOG_LEVEL       = os.environ.get('LOG_LEVEL', 'INFO')
 
 # === DATABASE PERFORMANCE OPTIMIZATIONS ===
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '1'))  # Process 1 clinic at a time
-TIME_WINDOW_HOURS = int(os.environ.get('TIME_WINDOW_HOURS', '4'))  # Micro windows: 4 hours
 CLINIC_DELAY_SECONDS = float(os.environ.get('CLINIC_DELAY_SECONDS', '5.0'))  # 5-second delays
 MAX_CONCURRENT_CLINICS = int(os.environ.get('MAX_CONCURRENT_CLINICS', '1'))  # No parallel processing
 REQUEST_TIMEOUT = int(os.environ.get('REQUEST_TIMEOUT', '120'))  # 2-minute timeout
@@ -511,17 +511,13 @@ def generate_sync_windows(
         else:
             start_time = now_utc - datetime.timedelta(hours=24)
         end_time = now_utc + datetime.timedelta(hours=DEEP_SYNC_HOURS)
-        current_start = start_time
-        while current_start < end_time:
-            window_end = min(current_start + datetime.timedelta(hours=TIME_WINDOW_HOURS), end_time)
-            windows.append(SyncWindow(
-                start_time=current_start,
-                end_time=window_end,
-                is_incremental=False,
-                clinic_num=clinic_num
-            ))
-            current_start = window_end
-    logger.info(f"Clinic {clinic_num}: Generated {len(windows)} sync windows")
+        windows.append(SyncWindow(
+            start_time=start_time,
+            end_time=end_time,
+            is_incremental=False,
+            clinic_num=clinic_num
+        ))
+    logger.info(f"Clinic {clinic_num}: Generated {len(windows)} sync window")
     return windows
 
 # === OPTIMIZED APPOINTMENT FETCHING ===
@@ -531,23 +527,25 @@ def fetch_appointments_for_window(
     since: Optional[datetime.datetime] = None
 ) -> List[Dict[str, Any]]:
     clinic = appointment_filter.clinic_num
-    # Convert to America/Chicago for dateStart and dateEnd
-    start_time_local = window.start_time.astimezone(CLINIC_TIMEZONE)
-    end_time_local = window.end_time.astimezone(CLINIC_TIMEZONE)
+    # Convert to UTC for dateStart and dateEnd, ensuring full-day coverage
+    start_time_utc = window.start_time.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    end_time_utc = window.end_time.astimezone(timezone.utc).replace(hour=23, minute=59, second=59, microsecond=999999)
     params = {
         'ClinicNum': clinic,
-        'dateStart': start_time_local.strftime('%Y-%m-%d'),
-        'dateEnd': end_time_local.strftime('%Y-%m-%d'),
+        'dateStart': start_time_utc.strftime('%Y-%m-%d'),
+        'dateEnd': end_time_utc.strftime('%Y-%m-%d'),
     }
+    # Always use serverDateTime to filter updated/created appointments
+    if since is None:
+        # Fallback for deep sync: fetch appointments modified in last 7 days
+        since = datetime.datetime.utcnow().replace(tzinfo=timezone.utc) - datetime.timedelta(days=7)
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=timezone.utc)
+    eff_utc = (since + datetime.timedelta(seconds=1)).astimezone(timezone.utc)
+    params['DateTStamp'] = eff_utc.strftime('%Y-%m-%d %H:%M:%S')
     if appointment_filter.operatory_nums:
         params['Op'] = ','.join(map(str, appointment_filter.operatory_nums))
-    if since and window.is_incremental:
-        if since.tzinfo is None:
-            since = since.replace(tzinfo=timezone.utc)
-        eff_utc = (since + datetime.timedelta(seconds=1)).astimezone(timezone.utc)
-        params['DateTStamp'] = eff_utc.strftime('%Y-%m-%d %H:%M:%S')
-        logger.debug(f"Clinic {clinic}: Incremental sync from {params['DateTStamp']}")
-    logger.debug(f"Clinic {clinic}: Fetching {start_time_local} to {end_time_local} (America/Chicago)")
+    logger.debug(f"Clinic {clinic}: Fetching {start_time_utc} to {end_time_utc} (UTC, effective dates {params['dateStart']} to {params['dateEnd']}, serverDateTime {params['DateTStamp']})")
     
     all_appointments = []
     # Try individual AptStatus values
@@ -579,7 +577,7 @@ def fetch_appointments_for_window(
         except Exception as e:
             logger.error(f"Clinic {clinic}: Error in fallback request: {e}")
     
-    logger.debug(f"Clinic {clinic}: {'Incremental' if window.is_incremental else 'Full'} window returned {len(all_appointments)} appointments")
+    logger.debug(f"Clinic {clinic}: {'Incremental' if window.is_incremental else 'Full'} sync returned {len(all_appointments)} appointments")
     return all_appointments
 
 def apply_appointment_filters(
@@ -620,22 +618,19 @@ def fetch_appointments_optimized(
     )
     windows = generate_sync_windows(clinic, since, force_deep_sync)
     all_appointments = []
-    for i, window in enumerate(windows):
-        window_type = 'incremental' if window.is_incremental else 'full'
-        logger.info(f"Clinic {clinic}: Processing window {i+1}/{len(windows)} ({window_type})")
-        try:
-            window_appointments = fetch_appointments_for_window(window, appointment_filter, since)
-            if window_appointments:
-                filtered_appointments = apply_appointment_filters(window_appointments, appointment_filter)
-                all_appointments.extend(filtered_appointments)
-                logger.info(f"Clinic {clinic}: Window {i+1} - {len(window_appointments)} raw → {len(filtered_appointments)} filtered")
-            else:
-                logger.info(f"Clinic {clinic}: Window {i+1} - No appointments found")
-            if i < len(windows) - 1:
-                time.sleep(2)
-        except Exception as e:
-            logger.error(f"Error processing window {i+1} for clinic {clinic}: {e}")
-            continue
+    window = windows[0]  # Single window
+    window_type = 'incremental' if window.is_incremental else 'full'
+    logger.info(f"Clinic {clinic}: Processing {window_type} sync")
+    try:
+        window_appointments = fetch_appointments_for_window(window, appointment_filter, since)
+        if window_appointments:
+            filtered_appointments = apply_appointment_filters(window_appointments, appointment_filter)
+            all_appointments.extend(filtered_appointments)
+            logger.info(f"Clinic {clinic}: {len(window_appointments)} raw → {len(filtered_appointments)} filtered appointments")
+        else:
+            logger.info(f"Clinic {clinic}: No appointments found")
+    except Exception as e:
+        logger.error(f"Error processing sync for clinic {clinic}: {e}")
     unique_appointments = {}
     for appt in all_appointments:
         apt_num = str(appt.get('AptNum', ''))
@@ -902,7 +897,7 @@ def run_sync(dry_run: bool = False, force_deep_sync: bool = False):
     logger.info("=== ULTRA-OPTIMIZED OpenDental → Keragon Sync ===")
     logger.info("🚀 DATABASE PERFORMANCE OPTIMIZATIONS:")
     logger.info(f"  • Sequential processing (no parallel DB hits)")
-    logger.info(f"  • Micro time windows: {TIME_WINDOW_HOURS} hours")
+    logger.info(f"  • Single date range per sync")
     logger.info(f"  • Adaptive rate limiting: {CLINIC_DELAY_SECONDS}s base delay")
     logger.info(f"  • Deep sync window: {DEEP_SYNC_HOURS} hours")
     logger.info(f"  • Request caching: {'enabled' if ENABLE_CACHING else 'disabled'}")
@@ -965,7 +960,7 @@ def run_sync(dry_run: bool = False, force_deep_sync: bool = False):
     logger.info(f"Total processed: {total_processed}")
     logger.info(f"Tracked appointments: {len(sent_appointments)}")
     logger.info(f"Current delay: {rate_limiter.current_delay:.2f}s")
-    logger.info("=== 🏥 CLINIC SUMMARY ===")
+    logger.info(f"=== 🏥 CLINIC SUMMARY ===")
     for result in clinic_results:
         clinic = result['clinic']
         status = "✅ SUCCESS" if 'error' not in result else "❌ ERROR"
