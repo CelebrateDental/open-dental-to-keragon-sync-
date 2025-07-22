@@ -527,7 +527,6 @@ def fetch_appointments_for_window(
     since: Optional[datetime.datetime] = None
 ) -> List[Dict[str, Any]]:
     clinic = appointment_filter.clinic_num
-    # Convert to UTC for dateStart and dateEnd, ensuring full-day coverage
     start_time_utc = window.start_time.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     end_time_utc = window.end_time.astimezone(timezone.utc).replace(hour=23, minute=59, second=59, microsecond=999999)
     params = {
@@ -535,25 +534,28 @@ def fetch_appointments_for_window(
         'dateStart': start_time_utc.strftime('%Y-%m-%d'),
         'dateEnd': end_time_utc.strftime('%Y-%m-%d'),
     }
-    # Always use serverDateTime to filter updated/created appointments
-    if since is None:
-        # Fallback for deep sync: fetch appointments modified in last 7 days
-        since = datetime.datetime.utcnow().replace(tzinfo=timezone.utc) - datetime.timedelta(days=7)
-    if since.tzinfo is None:
-        since = since.replace(tzinfo=timezone.utc)
-    eff_utc = (since + datetime.timedelta(seconds=1)).astimezone(timezone.utc)
-    params['DateTStamp'] = eff_utc.strftime('%Y-%m-%d %H:%M:%S')
+    if window.is_incremental:
+        if since is None:
+            # Fallback for incremental sync: fetch appointments modified in last 30 days
+            since = datetime.datetime.utcnow().replace(tzinfo=timezone.utc) - datetime.timedelta(days=30)
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=timezone.utc)
+        eff_utc = (since + datetime.timedelta(seconds=1)).astimezone(timezone.utc)
+        params['DateTStamp'] = eff_utc.strftime('%Y-%m-%d %H:%M:%S')
+        logger.debug(f"Clinic {clinic}: Applying serverDateTime {params['DateTStamp']} for incremental sync")
+    else:
+        logger.debug(f"Clinic {clinic}: No serverDateTime filter applied for deep sync")
     if appointment_filter.operatory_nums:
         params['Op'] = ','.join(map(str, appointment_filter.operatory_nums))
-    logger.debug(f"Clinic {clinic}: Fetching {start_time_utc} to {end_time_utc} (UTC, effective dates {params['dateStart']} to {params['dateEnd']}, serverDateTime {params['DateTStamp']})")
+    logger.debug(f"Clinic {clinic}: Fetching {start_time_utc} to {end_time_utc} (UTC, effective dates {params['dateStart']} to {params['dateEnd']})")
     
     all_appointments = []
-    # Try individual AptStatus values
     for status in appointment_filter.valid_statuses:
         single_params = params.copy()
         single_params['AptStatus'] = status
         try:
             appointments = make_optimized_request('appointments', single_params)
+            logger.debug(f"Clinic {clinic}: Raw API response for {status}: {appointments}")
             if appointments is not None:
                 logger.debug(f"Clinic {clinic}: Status {status} returned {len(appointments)} appointments")
                 all_appointments.extend(appointments)
@@ -561,14 +563,14 @@ def fetch_appointments_for_window(
                 logger.warning(f"Clinic {clinic}: Status {status} request failed")
         except Exception as e:
             logger.error(f"Clinic {clinic}: Error with AptStatus {status}: {e}")
-        time.sleep(1)  # Small delay between status requests
+        time.sleep(1)
     
-    # Fallback: retry without AptStatus
     if not all_appointments:
         logger.warning(f"Clinic {clinic}: All AptStatus attempts failed, retrying without status filter")
         params.pop('AptStatus', None)
         try:
             appointments = make_optimized_request('appointments', params)
+            logger.debug(f"Clinic {clinic}: Raw API response for fallback: {appointments}")
             if appointments is not None:
                 logger.debug(f"Clinic {clinic}: Fallback request returned {len(appointments)} appointments")
                 all_appointments.extend(appointments)
@@ -766,7 +768,6 @@ def send_to_keragon(appt: Dict[str, Any], clinic: int, dry_run: bool = False) ->
             'zipCode': patient.get('Zip', ''),
             'balance': patient.get('Balance', 0)
         }
-        # Log the full appointment details
         logger.info(f"📤 Preparing to send appointment {apt_num} to Keragon:\n{json.dumps(payload, indent=2)}")
         if dry_run:
             logger.info(f"DRY RUN: Would send appointment {apt_num}")
