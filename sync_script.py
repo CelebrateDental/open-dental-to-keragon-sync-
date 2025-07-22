@@ -539,7 +539,7 @@ def fetch_appointments_for_window(
         operatory_data = make_optimized_request('operatories', {'ClinicNum': clinic})
         if operatory_data:
             operatory_info = [
-                {'OperatoryNum': op.get('OperatoryNum'), 'OperatoryName': op.get('OperatoryName', 'Unknown')}
+                {'OperatoryNum': op.get('OperatoryNum'), 'OperatoryName': op.get('OpName', 'Unknown')}
                 for op in operatory_data if op.get('OperatoryNum') in appointment_filter.operatory_nums
             ]
             logger.info(f"Clinic {clinic}: Operatories - {operatory_info}")
