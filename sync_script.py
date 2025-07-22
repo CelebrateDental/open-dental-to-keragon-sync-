@@ -531,10 +531,13 @@ def fetch_appointments_for_window(
     since: Optional[datetime.datetime] = None
 ) -> List[Dict[str, Any]]:
     clinic = appointment_filter.clinic_num
+    # Convert to America/Chicago for dateStart and dateEnd
+    start_time_local = window.start_time.astimezone(CLINIC_TIMEZONE)
+    end_time_local = window.end_time.astimezone(CLINIC_TIMEZONE)
     params = {
         'ClinicNum': clinic,
-        'dateStart': window.start_time.strftime('%Y-%m-%d'),
-        'dateEnd': window.end_time.strftime('%Y-%m-%d'),
+        'dateStart': start_time_local.strftime('%Y-%m-%d'),
+        'dateEnd': end_time_local.strftime('%Y-%m-%d'),
     }
     if appointment_filter.operatory_nums:
         params['Op'] = ','.join(map(str, appointment_filter.operatory_nums))
@@ -544,7 +547,7 @@ def fetch_appointments_for_window(
         eff_utc = (since + datetime.timedelta(seconds=1)).astimezone(timezone.utc)
         params['DateTStamp'] = eff_utc.strftime('%Y-%m-%d %H:%M:%S')
         logger.debug(f"Clinic {clinic}: Incremental sync from {params['DateTStamp']}")
-    logger.debug(f"Clinic {clinic}: Fetching {window.start_time} to {window.end_time}")
+    logger.debug(f"Clinic {clinic}: Fetching {start_time_local} to {end_time_local} (America/Chicago)")
     
     all_appointments = []
     # Try individual AptStatus values
