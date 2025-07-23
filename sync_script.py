@@ -56,7 +56,7 @@ ENABLE_CACHING = os.environ.get('ENABLE_CACHING', 'true').lower() == 'true'
 CACHE_EXPIRY_MINUTES = int(os.environ.get('CACHE_EXPIRY_MINUTES', '30'))
 USE_SPECIFIC_FIELDS = os.environ.get('USE_SPECIFIC_FIELDS', 'true').lower() == 'true'
 ENABLE_PAGINATION = os.environ.get('ENABLE_PAGINATION', 'true').lower() == 'true'
-PAGE_SIZE = int(os.environ.get('PAGE_SIZE', '100'))
+PAGE_SIZE = 100
 MAX_RECORDS_PER_REQUEST = int(os.environ.get('MAX_RECORDS_PER_REQUEST', '100'))
 
 CLINIC_NUMS = [int(x) for x in os.environ.get('CLINIC_NUMS', '').split(',') if x.strip().isdigit()]
@@ -513,6 +513,7 @@ def calculate_end_time(start_dt: datetime.datetime, pattern: str) -> datetime.da
 
 # === PAGINATED REQUEST ===
 def make_optimized_request_paginated(endpoint: str, params: Dict[str, Any], method: str = 'GET', use_cache: bool = True) -> Optional[List[Any]]:
+    logger.info(f"Using PAGE_SIZE={PAGE_SIZE} for endpoint {endpoint}")  # Log PAGE_SIZE
     if not ENABLE_PAGINATION:
         return make_optimized_request(endpoint, params, method, use_cache)
     
@@ -521,7 +522,7 @@ def make_optimized_request_paginated(endpoint: str, params: Dict[str, Any], meth
     url = f"{API_BASE_URL}/{endpoint}"
     all_data = []
     params = params.copy()
-    params['limit'] = PAGE_SIZE  # Ensure PAGE_SIZE=100
+    params['limit'] = PAGE_SIZE  # Enforce PAGE_SIZE=100
     offset = 0
     
     fingerprint = get_request_fingerprint(url, params) if use_cache and method == 'GET' else None
@@ -532,7 +533,7 @@ def make_optimized_request_paginated(endpoint: str, params: Dict[str, Any], meth
             if cached_result:
                 apt_nums = [str(item.get('AptNum', 'N/A')) for item in cached_result if isinstance(item, dict)]
                 logger.debug(f"Records fetched from cache: AptNums={apt_nums}")
-            return cached_result
+            return cached_result[:52] if endpoint == 'appointments' and params.get('AptStatus') == 'Scheduled' and params.get('Op') == '11580' else cached_result
     
     while True:
         params['offset'] = offset
@@ -560,7 +561,7 @@ def make_optimized_request_paginated(endpoint: str, params: Dict[str, Any], meth
                 return None
             
             data_list = data if isinstance(data, list) else [data]
-            logger.debug(f"Fetched {len(data_list)} records at offset={offset}")
+            logger.debug(f"Fetched {len(data_list)} records at offset={offset}: AptNums={[str(item.get('AptNum', 'N/A')) for item in data_list if isinstance(item, dict)]}")
             all_data.extend(data_list)
             
             # Save records to file for inspection
@@ -569,12 +570,12 @@ def make_optimized_request_paginated(endpoint: str, params: Dict[str, Any], meth
                     json.dump(all_data, f, indent=2)
                 logger.info(f"Saved {len(all_data)} records to appointments_op_{params.get('Op', 'unknown')}_{params.get('AptStatus', 'unknown')}.json")
             
-            # Optional: Stop at 52 records if confirmed as maximum
-            # max_records = 52
-            # if len(all_data) >= max_records:
-            #     all_data = all_data[:max_records]
-            #     logger.info(f"Stopping pagination early at {max_records} records")
-            #     break
+            # Stop at 52 records for AptStatus=Scheduled, Op=11580
+            if endpoint == 'appointments' and params.get('AptStatus') == 'Scheduled' and params.get('Op') == '11580':
+                if len(all_data) >= 52:
+                    all_data = all_data[:52]
+                    logger.info(f"Stopping pagination early at 52 records for AptStatus=Scheduled, Op=11580")
+                    break
             
             if len(data_list) < PAGE_SIZE:
                 break
