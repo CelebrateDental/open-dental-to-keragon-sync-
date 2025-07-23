@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 import os
 import sys
@@ -20,17 +19,17 @@ from collections import defaultdict
 import hashlib
 
 # === CONFIGURATION ===
-API_BASE_URL        = os.environ.get('OPEN_DENTAL_API_URL', 'https://api.opendental.com/api/v1')
-DEVELOPER_KEY       = os.environ.get('OPEN_DENTAL_DEVELOPER_KEY')
-CUSTOMER_KEY        = os.environ.get('OPEN_DENTAL_CUSTOMER_KEY')
+API_BASE_URL = os.environ.get('OPEN_DENTAL_API_URL', 'https://api.opendental.com/api/v1')
+DEVELOPER_KEY = os.environ.get('OPEN_DENTAL_DEVELOPER_KEY')
+CUSTOMER_KEY = os.environ.get('OPEN_DENTAL_CUSTOMER_KEY')
 KERAGON_WEBHOOK_URL = os.environ.get('KERAGON_WEBHOOK_URL')
 
-STATE_FILE      = 'last_sync_state.json'
+STATE_FILE = 'last_sync_state.json'
 SENT_APPTS_FILE = 'sent_appointments.json'
 APPT_CACHE_FILE = 'appointment_cache.json'
 APPT_TYPES_CACHE_FILE = 'appointment_types_cache.json'
 PATIENT_CACHE_FILE = 'patient_cache.json'
-LOG_LEVEL       = os.environ.get('LOG_LEVEL', 'INFO')
+LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO')
 
 # === DATABASE PERFORMANCE OPTIMIZATIONS ===
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '5'))
@@ -910,32 +909,32 @@ def send_to_keragon(appointment: Dict[str, Any], clinic: int, patient_data: Dict
         start_time_iso = start_time.isoformat()  # e.g., 2025-07-23T10:00:00-05:00
         end_time_iso = end_time.isoformat() if end_time else ''
         
-       payload = {
-        'appointment': {
-            'AptNum': apt_num,
-            'AptStatus': appointment.get('AptStatus', ''),
-            'AptDateTime': start_time_iso,
-            'EndTime': end_time_iso,
-            'Note': appointment.get('Note', ''),
-            'AppointmentTypeNum': appointment.get('AppointmentTypeNum', ''),
-            'ClinicNum': clinic,
-            'PatNum': pat_num,
-            'OperatoryNum': appointment.get('Op') or appointment.get('OperatoryNum', '')
-        },
-        'patient': {
-            'FName': patient.get('FName', ''),
-            'LName': patient.get('LName', ''),
-            'PatNum': patient.get('PatNum', ''),
-            'Email': patient.get('Email', ''),
-            'Address': patient.get('Address', ''),
-            'HmPhone': patient.get('HmPhone', ''),
-            'WkPhone': patient.get('WkPhone', ''),
-            'Birthdate': patient.get('Birthdate', ''),
-            'State': patient.get('State', ''),
-            'Zip': patient.get('Zip', ''),
-            'Gender': patient.get('Gender', '')
+        payload = {
+            'appointment': {
+                'AptNum': apt_num,
+                'AptStatus': appointment.get('AptStatus', ''),
+                'AptDateTime': start_time_iso,
+                'EndTime': end_time_iso,
+                'Note': appointment.get('Note', ''),
+                'AppointmentTypeNum': appointment.get('AppointmentTypeNum', ''),
+                'ClinicNum': clinic,
+                'PatNum': pat_num,
+                'OperatoryNum': appointment.get('Op') or appointment.get('OperatoryNum', '')
+            },
+            'patient': {
+                'FName': patient.get('FName', ''),
+                'LName': patient.get('LName', ''),
+                'PatNum': patient.get('PatNum', ''),
+                'Email': patient.get('Email', ''),
+                'Address': patient.get('Address', ''),
+                'HmPhone': patient.get('HmPhone', ''),
+                'WkPhone': patient.get('WkPhone', ''),
+                'Birthdate': patient.get('Birthdate', ''),
+                'State': patient.get('State', ''),
+                'Zip': patient.get('Zip', ''),
+                'Gender': patient.get('Gender', '')
+            }
         }
-}
         if dry_run:
             logger.info(f"Dry run: Would send appointment {apt_num} to Keragon: {json.dumps(payload, indent=2)}")
             return True
