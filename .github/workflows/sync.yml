@@ -59,7 +59,7 @@ jobs:
           LOG_LEVEL: "DEBUG"
           CLINIC_DELAY_SECONDS: "5.0"
           INCREMENTAL_SYNC_MINUTES: "15"
-          DEEP_SYNC_HOURS: "24"
+          DEEP_SYNC_HOURS: "720"
           SAFETY_OVERLAP_HOURS: "2"
           ENABLE_CACHING: "true"
           CACHE_EXPIRY_MINUTES: "30"
