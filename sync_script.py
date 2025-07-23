@@ -52,7 +52,7 @@ INCREMENTAL_INTERVAL_MINUTES = 60  # Incremental sync every 60 minutes during cl
 
 # === CACHING AND OPTIMIZATION ===
 ENABLE_CACHING = os.environ.get('ENABLE_CACHING', 'true').lower() == 'true'
-CACHE_EXPIRY_MINUTES = int(os.environ.get('CACHE_EXPIRY_MINUTES', '30'))
+CACHE_EXPIRY_MINUTES = int(os.environ.get('CACHE_EXPIRY_MINUTES', '60'))
 USE_SPECIFIC_FIELDS = os.environ.get('USE_SPECIFIC_FIELDS', 'true').lower() == 'true'
 ENABLE_PAGINATION = os.environ.get('ENABLE_PAGINATION', 'true').lower() == 'true'
 PAGE_SIZE = int(os.environ.get('PAGE_SIZE', '50'))  # Used for internal logic, not API
