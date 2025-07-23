@@ -604,7 +604,11 @@ def apply_appointment_filters(
     for appt in appointments:
         apt_num = str(appt.get('AptNum', ''))
         status = str(appt.get('AptStatus', ''))  # Convert to string for comparison
-        op_num = appt.get('Op') or appt.get('OperatoryNum')
+        # Use an explicit None check instead of “or”
+        op_num = appt.get('Op')
+        if op_num is None:
+            op_num = appt.get('OperatoryNum')
+
         if appointment_filter.exclude_ghl_tagged and has_ghl_tag(appt):
             continue
         if appointment_filter.valid_statuses and status not in appointment_filter.valid_statuses:
