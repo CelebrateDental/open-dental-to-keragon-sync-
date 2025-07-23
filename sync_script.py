@@ -521,17 +521,22 @@ def make_optimized_request_paginated(endpoint: str, params: Dict[str, Any], meth
     url = f"{API_BASE_URL}/{endpoint}"
     all_data = []
     params = params.copy()
-    params['limit'] = PAGE_SIZE
+    params['limit'] = PAGE_SIZE  # Ensure PAGE_SIZE=100
     offset = 0
     
     fingerprint = get_request_fingerprint(url, params) if use_cache and method == 'GET' else None
     if use_cache and method == 'GET':
         cached_result = get_cached_response(fingerprint)
         if cached_result is not None:
+            logger.info(f"Cache hit for {endpoint} with params {params}: fetched {len(cached_result)} records")
+            if cached_result:
+                apt_nums = [str(item.get('AptNum', 'N/A')) for item in cached_result if isinstance(item, dict)]
+                logger.debug(f"Records fetched from cache: AptNums={apt_nums}")
             return cached_result
     
     while True:
         params['offset'] = offset
+        logger.debug(f"Fetching {endpoint} with params {params}")
         rate_limiter.wait_if_needed()
         start_time = time.time()
         try:
@@ -555,7 +560,21 @@ def make_optimized_request_paginated(endpoint: str, params: Dict[str, Any], meth
                 return None
             
             data_list = data if isinstance(data, list) else [data]
+            logger.debug(f"Fetched {len(data_list)} records at offset={offset}")
             all_data.extend(data_list)
+            
+            # Save records to file for inspection
+            if endpoint == 'appointments':
+                with open(f'appointments_op_{params.get("Op", "unknown")}_{params.get("AptStatus", "unknown")}.json', 'w') as f:
+                    json.dump(all_data, f, indent=2)
+                logger.info(f"Saved {len(all_data)} records to appointments_op_{params.get('Op', 'unknown')}_{params.get('AptStatus', 'unknown')}.json")
+            
+            # Optional: Stop at 52 records if confirmed as maximum
+            # max_records = 52
+            # if len(all_data) >= max_records:
+            #     all_data = all_data[:max_records]
+            #     logger.info(f"Stopping pagination early at {max_records} records")
+            #     break
             
             if len(data_list) < PAGE_SIZE:
                 break
@@ -563,10 +582,9 @@ def make_optimized_request_paginated(endpoint: str, params: Dict[str, Any], meth
         except requests.exceptions.RequestException as e:
             response_time = time.time() - start_time
             rate_limiter.record_response_time(response_time)
-            logger.error(f"Request to {endpoint} failed: {e}")
+            logger.error(f"Request to {endpoint} failed at offset={offset}: {e}")
             return None
     
-    # Log all records before returning
     logger.info(f"Completed pagination for {endpoint} with params {params}: fetched {len(all_data)} records")
     if all_data:
         apt_nums = [str(item.get('AptNum', 'N/A')) for item in all_data if isinstance(item, dict)]
@@ -747,11 +765,12 @@ def fetch_appointments_for_window(
     clinic = appointment_filter.clinic_num
     start_time_utc = window.start_time.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     end_time_utc = window.end_time.astimezone(timezone.utc).replace(hour=23, minute=59, second=59, microsecond=999999)
+    logger.info(f"Using PAGE_SIZE={PAGE_SIZE} for clinic {clinic}")  # Log PAGE_SIZE
     params = {
         'ClinicNum': clinic,
         'dateStart': start_time_utc.strftime('%Y-%m-%d'),
         'dateEnd': end_time_utc.strftime('%Y-%m-%d'),
-        'limit': PAGE_SIZE
+        'limit': PAGE_SIZE  # Ensure PAGE_SIZE is used
     }
     try:
         operatory_data = make_optimized_request_paginated('operatories', {'ClinicNum': clinic, 'limit': PAGE_SIZE})
@@ -785,9 +804,11 @@ def fetch_appointments_for_window(
             single_params = params.copy()
             single_params['AptStatus'] = status
             single_params['Op'] = str(op_num)
+            single_params['limit'] = PAGE_SIZE  # Explicitly set limit
+            logger.debug(f"Clinic {clinic}: Requesting with params {single_params}")
             try:
                 appointments = make_optimized_request_paginated('appointments', single_params)
-                logger.debug(f"Clinic {clinic}: Raw API response for AptStatus={status}, Op={op_num}: {appointments}")
+                logger.debug(f"Clinic {clinic}: Raw API response for AptStatus={status}, Op={op_num}: {len(appointments or [])} records")
                 if appointments is not None:
                     logger.debug(f"Clinic {clinic}: AptStatus={status}, Op={op_num} returned {len(appointments)} appointments")
                     all_appointments.extend(appointments)
@@ -801,9 +822,10 @@ def fetch_appointments_for_window(
         logger.warning(f"Clinic {clinic}: All AptStatus/Op attempts failed, retrying without status or operatory filter")
         params.pop('AptStatus', None)
         params.pop('Op', None)
+        params['limit'] = PAGE_SIZE  # Ensure limit
         try:
             appointments = make_optimized_request_paginated('appointments', params)
-            logger.debug(f"Clinic {clinic}: Raw API response for fallback: {appointments}")
+            logger.debug(f"Clinic {clinic}: Raw API response for fallback: {len(appointments or [])} records")
             if appointments is not None:
                 logger.debug(f"Clinic {clinic}: Fallback request returned {len(appointments)} appointments")
                 all_appointments.extend(appointments)
@@ -814,7 +836,6 @@ def fetch_appointments_for_window(
     
     logger.debug(f"Clinic {clinic}: {'Incremental' if window.is_incremental else 'Full'} sync returned {len(all_appointments)} appointments")
     return all_appointments
-
 def apply_appointment_filters(
     appointments: List[Dict[str, Any]],
     appointment_filter: AppointmentFilter
