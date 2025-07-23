@@ -57,7 +57,7 @@ CACHE_EXPIRY_MINUTES = int(os.environ.get('CACHE_EXPIRY_MINUTES', '30'))
 USE_SPECIFIC_FIELDS = os.environ.get('USE_SPECIFIC_FIELDS', 'true').lower() == 'true'
 ENABLE_PAGINATION = os.environ.get('ENABLE_PAGINATION', 'true').lower() == 'true'
 PAGE_SIZE = int(os.environ.get('PAGE_SIZE', '100'))
-MAX_RECORDS_PER_REQUEST = int(os.environ.get('MAX_RECORDS_PER_REQUEST', '500'))
+MAX_RECORDS_PER_REQUEST = int(os.environ.get('MAX_RECORDS_PER_REQUEST', '100'))
 
 CLINIC_NUMS = [int(x) for x in os.environ.get('CLINIC_NUMS', '').split(',') if x.strip().isdigit()]
 
@@ -557,14 +557,7 @@ def make_optimized_request_paginated(endpoint: str, params: Dict[str, Any], meth
             data_list = data if isinstance(data, list) else [data]
             all_data.extend(data_list)
             
-            # Check total count from X-Total-Count header
-            total = int(response.headers.get("X-Total-Count", 0))
-            if total > 0 and offset >= total:
-                logger.debug(f"Reached total count ({total}) at offset {offset}, stopping pagination")
-                break
-                
             if len(data_list) < PAGE_SIZE:
-                logger.debug(f"Received {len(data_list)} items, less than PAGE_SIZE ({PAGE_SIZE}), stopping pagination")
                 break
             offset += PAGE_SIZE
         except requests.exceptions.RequestException as e:
@@ -584,6 +577,7 @@ def make_optimized_request_paginated(endpoint: str, params: Dict[str, Any], meth
     
     logger.debug(f"Paged request completed in {response_time:.2f}s, total records: {len(all_data)}")
     return all_data
+
 def make_optimized_request(endpoint: str, params: Dict[str, Any], method: str = 'GET', use_cache: bool = True) -> Optional[List[Any]]:
     session = get_optimized_session()
     headers = make_auth_header()
