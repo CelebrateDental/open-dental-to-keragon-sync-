@@ -59,23 +59,24 @@ jobs:
           CLINIC_NUMS: "${{ secrets.CLINIC_NUM_1 }},${{ secrets.CLINIC_NUM_2 }}"
           LOG_LEVEL: "DEBUG"
           CLINIC_DELAY_SECONDS: "5.0"
-          TIME_WINDOW_HOURS: "4"
           INCREMENTAL_SYNC_MINUTES: "15"
-          DEEP_SYNC_HOURS: "720"
+          DEEP_SYNC_HOURS: "24"
           SAFETY_OVERLAP_HOURS: "2"
           ENABLE_CACHING: "true"
-          CACHE_EXPIRY_MINUTES: "5"
+          CACHE_EXPIRY_MINUTES: "30"
           USE_SPECIFIC_FIELDS: "false"
           ENABLE_PAGINATION: "true"
-          PAGE_SIZE: "50"
+          PAGE_SIZE: "100"
           MAX_RECORDS_PER_REQUEST: "100"
         run: |
           if [[ "${{ github.event_name }}" == "schedule" && "${{ github.event.schedule }}" == "0 7 * * *" ]]; then
+            echo "Running deep sync at 2 AM CDT"
             touch deep_sync.lock
-            python3 sync_script.py --force-deep-sync --verbose
+            python3 sync_script.py --force-deep-sync --verbose --once
             rm deep_sync.lock
           else
-            python3 sync_script.py --verbose
+            echo "Running sync (deep if first run, else incremental)"
+            python3 sync_script.py --verbose --once
           fi
 
       - name: Commit and push state files
@@ -88,8 +89,10 @@ jobs:
           # Only add files if they exist
           [ -f last_sync_state.json ] && git add last_sync_state.json
           [ -f sent_appointments.json ] && git add sent_appointments.json
-          [ -f appointment_coverage_report.json ] && git add appointment_coverage_report.json
+          [ -f patient_cache.json ] && git add patient_cache.json
+          [ -f appointment_types_cache.json ] && git add appointment_types_cache.json
+          [ -f appointment_cache.json ] && git add appointment_cache.json
           git diff --cached --quiet || (
-            git commit -m "chore(sync): update sync state [skip ci]" &&
+            git commit -m "chore(sync): update sync state and caches [skip ci]" &&
             git push
           )
