@@ -912,29 +912,29 @@ def send_to_keragon(appointment: Dict[str, Any], clinic: int, patient_data: Dict
         
        payload = {
         'appointment': {
-        'AptNum': apt_num,
-        'AptStatus': appointment.get('AptStatus', ''),
-        'AptDateTime': start_time_iso,
-        'EndTime': end_time_iso,
-        'Note': appointment.get('Note', ''),
-        'AppointmentTypeNum': appointment.get('AppointmentTypeNum', ''),
-        'ClinicNum': clinic,
-        'PatNum': pat_num,
-        'OperatoryNum': appointment.get('Op') or appointment.get('OperatoryNum', '')
-    },
-    'patient': {
-        'FName': patient.get('FName', ''),
-        'LName': patient.get('LName', ''),
-        'PatNum': patient.get('PatNum', ''),
-        'Email': patient.get('Email', ''),
-        'Address': patient.get('Address', ''),
-        'HmPhone': patient.get('HmPhone', ''),
-        'WkPhone': patient.get('WkPhone', ''),
-        'Birthdate': patient.get('Birthdate', ''),
-        'State': patient.get('State', ''),
-        'Zip': patient.get('Zip', ''),
-        'Gender': patient.get('Gender', '')
-    }
+            'AptNum': apt_num,
+            'AptStatus': appointment.get('AptStatus', ''),
+            'AptDateTime': start_time_iso,
+            'EndTime': end_time_iso,
+            'Note': appointment.get('Note', ''),
+            'AppointmentTypeNum': appointment.get('AppointmentTypeNum', ''),
+            'ClinicNum': clinic,
+            'PatNum': pat_num,
+            'OperatoryNum': appointment.get('Op') or appointment.get('OperatoryNum', '')
+        },
+        'patient': {
+            'FName': patient.get('FName', ''),
+            'LName': patient.get('LName', ''),
+            'PatNum': patient.get('PatNum', ''),
+            'Email': patient.get('Email', ''),
+            'Address': patient.get('Address', ''),
+            'HmPhone': patient.get('HmPhone', ''),
+            'WkPhone': patient.get('WkPhone', ''),
+            'Birthdate': patient.get('Birthdate', ''),
+            'State': patient.get('State', ''),
+            'Zip': patient.get('Zip', ''),
+            'Gender': patient.get('Gender', '')
+        }
 }
         if dry_run:
             logger.info(f"Dry run: Would send appointment {apt_num} to Keragon: {json.dumps(payload, indent=2)}")
