@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 import os
 import sys
@@ -558,29 +557,31 @@ def fetch_appointments_for_window(
         logger.debug(f"Clinic {clinic}: Applying serverDateTime {params['DateTStamp']} for incremental sync")
     else:
         logger.debug(f"Clinic {clinic}: No serverDateTime filter applied for deep sync")
-    if appointment_filter.operatory_nums:
-        params['Op'] = ','.join(map(str, appointment_filter.operatory_nums))
+    
     logger.debug(f"Clinic {clinic}: Fetching {start_time_utc} to {end_time_utc} (UTC, effective dates {params['dateStart']} to {params['dateEnd']})")
     
     all_appointments = []
     for status in appointment_filter.valid_statuses:
-        single_params = params.copy()
-        single_params['AptStatus'] = status
-        try:
-            appointments = make_optimized_request('appointments', single_params)
-            logger.debug(f"Clinic {clinic}: Raw API response for {status}: {appointments}")
-            if appointments is not None:
-                logger.debug(f"Clinic {clinic}: Status {status} returned {len(appointments)} appointments")
-                all_appointments.extend(appointments)
-            else:
-                logger.warning(f"Clinic {clinic}: Status {status} request failed")
-        except Exception as e:
-            logger.error(f"Clinic {clinic}: Error with AptStatus {status}: {e}")
-        time.sleep(1)
+        for op_num in appointment_filter.operatory_nums:
+            single_params = params.copy()
+            single_params['AptStatus'] = status
+            single_params['Op'] = str(op_num)  # Individual operatory number
+            try:
+                appointments = make_optimized_request('appointments', single_params)
+                logger.debug(f"Clinic {clinic}: Raw API response for AptStatus={status}, Op={op_num}: {appointments}")
+                if appointments is not None:
+                    logger.debug(f"Clinic {clinic}: AptStatus={status}, Op={op_num} returned {len(appointments)} appointments")
+                    all_appointments.extend(appointments)
+                else:
+                    logger.warning(f"Clinic {clinic}: AptStatus={status}, Op={op_num} request failed")
+            except Exception as e:
+                logger.error(f"Clinic {clinic}: Error with AptStatus={status}, Op={op_num}: {e}")
+            time.sleep(1)  # Small delay between individual requests
     
     if not all_appointments:
-        logger.warning(f"Clinic {clinic}: All AptStatus attempts failed, retrying without status filter")
+        logger.warning(f"Clinic {clinic}: All AptStatus/Op attempts failed, retrying without status or operatory filter")
         params.pop('AptStatus', None)
+        params.pop('Op', None)
         try:
             appointments = make_optimized_request('appointments', params)
             logger.debug(f"Clinic {clinic}: Raw API response for fallback: {appointments}")
