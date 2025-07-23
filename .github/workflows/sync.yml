@@ -63,7 +63,7 @@ jobs:
           INCREMENTAL_SYNC_MINUTES: "15"
           DEEP_SYNC_HOURS: "720"
           SAFETY_OVERLAP_HOURS: "2"
-          ENABLE_CACHING: "false"
+          ENABLE_CACHING: "true"
           CACHE_EXPIRY_MINUTES: "5"
           USE_SPECIFIC_FIELDS: "false"
           ENABLE_PAGINATION: "true"
