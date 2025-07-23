@@ -84,6 +84,7 @@ _session = None
 _session_lock = threading.Lock()
 _request_cache: Dict[str, Tuple[datetime.datetime, Any]] = {}
 _cache_lock = threading.Lock()
+SHARED_CLINIC_NUM = None  # Store the clinic used for shared fetching
 
 # === LOGGING ===
 logging.basicConfig(
@@ -248,26 +249,30 @@ def cache_response(fingerprint: str, data: Any):
                 del _request_cache[key]
 
 # === APPOINTMENT TYPES CACHE ===
-def load_appointment_types_cache() -> Dict[int, Dict[int, str]]:
+def load_appointment_types_cache() -> Dict[str, Dict[int, str]]:
     if not os.path.exists(APPT_TYPES_CACHE_FILE):
         logger.info("No appointment types cache file found")
         return {}
     try:
         with open(APPT_TYPES_CACHE_FILE) as f:
             data = json.load(f)
-            logger.info(f"Loaded appointment types cache from {APPT_TYPES_CACHE_FILE} with {len(data.get('appointment_types', {}))} clinics")
-            return {int(k): v for k, v in data['appointment_types'].items()}
+            logger.info(f"Loaded appointment types cache from {APPT_TYPES_CACHE_FILE} with {len(data.get('appointment_types', {}))} entries")
+            # Support both shared and clinic-specific cache for backward compatibility
+            appointment_types = data.get('appointment_types', {})
+            if 'shared' in appointment_types:
+                return {'shared': {int(k): v for k, v in appointment_types['shared'].items()}}
+            return {int(k): {int(k2): v2 for k2, v2 in v.items()} for k, v in appointment_types.items()}
     except Exception as e:
         logger.error(f"Failed to load appointment types cache: {e}")
         return {}
 
-def save_appointment_types_cache(appointment_types: Dict[int, Dict[int, str]]):
+def save_appointment_types_cache(appointment_types: Dict[str, Dict[int, str]]):
     temp_file = None
     try:
         with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.tmp', dir=os.path.dirname(APPT_TYPES_CACHE_FILE) or '.') as f:
             cache_data = {
                 'cache_date': datetime.datetime.now(CLINIC_TIMEZONE).isoformat(),
-                'appointment_types': {str(k): v for k, v in appointment_types.items()}
+                'appointment_types': {'shared': {str(k): v for k, v in appointment_types.get('shared', {}).items()}}
             }
             json.dump(cache_data, f, indent=2)
             temp_file = f.name
@@ -282,42 +287,61 @@ def save_appointment_types_cache(appointment_types: Dict[int, Dict[int, str]]):
                 pass
 
 def get_appointment_types(clinic_num: int, force_refresh: bool = False) -> Dict[int, str]:
-    global _appointment_types_cache
-    if not force_refresh and clinic_num in _appointment_types_cache:
-        logger.debug(f"Using in-memory appointment types cache for clinic {clinic_num}")
-        return _appointment_types_cache[clinic_num]
+    global _appointment_types_cache, SHARED_CLINIC_NUM
+    # Use shared cache for all clinics
+    if not force_refresh and _appointment_types_cache.get('shared'):
+        logger.debug(f"Using shared in-memory appointment types cache for clinic {clinic_num}")
+        return _appointment_types_cache['shared']
     
+    # Load from file if not forcing refresh
     if not force_refresh:
         _appointment_types_cache = load_appointment_types_cache()
+        if _appointment_types_cache.get('shared'):
+            logger.debug(f"Using file-based shared appointment types cache for clinic {clinic_num}")
+            return _appointment_types_cache['shared']
+        # Fallback to clinic-specific cache for backward compatibility
         if clinic_num in _appointment_types_cache:
-            logger.debug(f"Using file-based appointment types cache for clinic {clinic_num}")
-            return _appointment_types_cache[clinic_num]
+            logger.debug(f"Using file-based clinic-specific cache for clinic {clinic_num}")
+            _appointment_types_cache['shared'] = _appointment_types_cache[clinic_num]
+            save_appointment_types_cache(_appointment_types_cache)
+            return _appointment_types_cache['shared']
+    
+    # Fetch only for the first clinic or a designated clinic
+    fetch_clinic = SHARED_CLINIC_NUM if SHARED_CLINIC_NUM else clinic_num
+    if not SHARED_CLINIC_NUM:
+        SHARED_CLINIC_NUM = clinic_num  # Set the first clinic as the shared source
     
     try:
-        logger.info(f"Fetching appointment types for clinic {clinic_num}")
-        params = {'ClinicNum': clinic_num, 'limit': PAGE_SIZE}
-        data = make_optimized_request_paginated('appointmenttypes', params)
-        if data is None:
-            logger.error(f"Failed to fetch appointment types for clinic {clinic_num}")
-            _appointment_types_cache[clinic_num] = {}
-            save_appointment_types_cache(_appointment_types_cache)
-            return _appointment_types_cache[clinic_num]
-        appt_types = data
-        clinic_cache = {}
-        for apt_type in appt_types:
-            type_num = apt_type.get('AppointmentTypeNum')
-            type_name = apt_type.get('AppointmentTypeName', '')
-            if type_num is not None:
-                clinic_cache[type_num] = type_name
-        _appointment_types_cache[clinic_num] = clinic_cache
-        logger.info(f"Loaded {len(clinic_cache)} appointment types for clinic {clinic_num}")
+        logger.info(f"Fetching appointment types for clinic {fetch_clinic} (shared for all clinics)")
+        params = {'ClinicNum': fetch_clinic, 'limit': PAGE_SIZE, 'IsHidden': 'false'}
+        MAX_APPT_TYPES = 500
+        appt_types = []
+        offset = 0
+        while len(appt_types) < MAX_APPT_TYPES:
+            params['offset'] = offset
+            data_list = make_optimized_request_paginated('appointmenttypes', params)
+            if data_list is None:
+                logger.error(f"Failed to fetch appointment types for clinic {fetch_clinic}")
+                break
+            appt_types.extend(data_list)
+            logger.debug(f"Fetched {len(data_list)} appointment types at offset {offset}: {[apt['AppointmentTypeNum'] for apt in data_list]}")
+            if len(data_list) < PAGE_SIZE or len(appt_types) >= MAX_APPT_TYPES:
+                break
+            offset += PAGE_SIZE
+        if len(appt_types) >= MAX_APPT_TYPES:
+            logger.warning(f"Reached max appointment types ({MAX_APPT_TYPES}) for clinic {fetch_clinic}")
+        
+        clinic_cache = {apt_type['AppointmentTypeNum']: apt_type['AppointmentTypeName'] 
+                        for apt_type in appt_types if 'AppointmentTypeNum' in apt_type}
+        _appointment_types_cache['shared'] = clinic_cache
+        logger.info(f"Loaded {len(clinic_cache)} appointment types for clinic {fetch_clinic} (shared)")
         save_appointment_types_cache(_appointment_types_cache)
         return clinic_cache
     except Exception as e:
-        logger.error(f"Failed to fetch appointment types for clinic {clinic_num}: {e}")
-        _appointment_types_cache[clinic_num] = {}
+        logger.error(f"Failed to fetch appointment types for clinic {fetch_clinic}: {e}")
+        _appointment_types_cache['shared'] = {}
         save_appointment_types_cache(_appointment_types_cache)
-        return _appointment_types_cache[clinic_num]
+        return _appointment_types_cache['shared']
 
 def get_appointment_type_name(appointment: Dict[str, Any], clinic_num: int) -> str:
     apt_type_num = appointment.get('AppointmentTypeNum')
