@@ -720,8 +720,8 @@ def generate_sync_windows(
             force_deep_sync = True
     if not last_sync or force_deep_sync:
         logger.info(f"Clinic {clinic_num}: Deep sync with {DEEP_SYNC_HOURS}-hour window")
-        start_time = now_utc - timedelta(days=1)  # Simplified to 24 hours for deep sync
-        end_time = now_utc + timedelta(days=1)    # Look ahead one day
+        start_time = now_utc - timedelta(hours=SAFETY_OVERLAP_HOURS)  # Small overlap
+        end_time = now_utc + timedelta(hours=DEEP_SYNC_HOURS)         # Look ahead 720 hours
         windows.append(SyncWindow(
             start_time=start_time,
             end_time=end_time,
@@ -730,7 +730,6 @@ def generate_sync_windows(
         ))
     logger.info(f"Clinic {clinic_num}: Generated {len(windows)} sync window(s)")
     return windows
-
 # === OPTIMIZED APPOINTMENT FETCHING ===
 def fetch_appointments_for_window(
     window: SyncWindow,
