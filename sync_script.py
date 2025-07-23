@@ -26,8 +26,9 @@ KERAGON_WEBHOOK_URL = os.environ.get('KERAGON_WEBHOOK_URL')
 
 STATE_FILE      = 'last_sync_state.json'
 SENT_APPTS_FILE = 'sent_appointments.json'
-CACHE_FILE      = 'appointment_cache.json'
-APPT_TYPES_CACHE_FILE = 'appointment_types_cache.json'  # Persistent cache file
+APPT_CACHE_FILE = 'appointment_cache.json'
+APPT_TYPES_CACHE_FILE = 'appointment_types_cache.json'
+PATIENT_CACHE_FILE = 'patient_cache.json'
 LOG_LEVEL       = os.environ.get('LOG_LEVEL', 'INFO')
 
 # === DATABASE PERFORMANCE OPTIMIZATIONS ===
@@ -78,6 +79,7 @@ REQUIRED_APPOINTMENT_FIELDS = [
 ]
 
 _appointment_types_cache: Dict[int, Dict[int, str]] = {}
+_patient_cache: Dict[int, Dict[str, Any]] = {}
 _session = None
 _session_lock = threading.Lock()
 _request_cache: Dict[str, Tuple[datetime.datetime, Any]] = {}
@@ -293,14 +295,14 @@ def get_appointment_types(clinic_num: int, force_refresh: bool = False) -> Dict[
     
     try:
         logger.info(f"Fetching appointment types for clinic {clinic_num}")
-        params = {'ClinicNum': clinic_num}
-        data = make_optimized_request('appointmenttypes', params)
+        params = {'ClinicNum': clinic_num, 'limit': PAGE_SIZE}
+        data = make_optimized_request_paginated('appointmenttypes', params)
         if data is None:
             logger.error(f"Failed to fetch appointment types for clinic {clinic_num}")
             _appointment_types_cache[clinic_num] = {}
             save_appointment_types_cache(_appointment_types_cache)
             return _appointment_types_cache[clinic_num]
-        appt_types = data if isinstance(data, list) else [data]
+        appt_types = data
         clinic_cache = {}
         for apt_type in appt_types:
             type_num = apt_type.get('AppointmentTypeNum')
@@ -336,6 +338,40 @@ def get_appointment_type_num(appointment: Dict[str, Any]) -> Optional[int]:
 
 def has_ghl_tag(appointment: Dict[str, Any]) -> bool:
     return '[fromGHL]' in (appointment.get('Note', '') or '')
+
+# === PATIENT CACHE ===
+def load_patient_cache() -> Dict[int, Dict[str, Any]]:
+    if not os.path.exists(PATIENT_CACHE_FILE):
+        logger.info("No patient cache file found")
+        return {}
+    try:
+        with open(PATIENT_CACHE_FILE) as f:
+            data = json.load(f)
+            logger.info(f"Loaded patient cache from {PATIENT_CACHE_FILE} with {len(data.get('patients', {}))} patients")
+            return {int(k): v for k, v in data.get('patients', {}).items()}
+    except Exception as e:
+        logger.error(f"Failed to load patient cache: {e}")
+        return {}
+
+def save_patient_cache(patient_cache: Dict[int, Dict[str, Any]]):
+    temp_file = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.tmp', dir=os.path.dirname(PATIENT_CACHE_FILE) or '.') as f:
+            cache_data = {
+                'cache_date': datetime.datetime.now(CLINIC_TIMEZONE).isoformat(),
+                'patients': {str(k): v for k, v in patient_cache.items()}
+            }
+            json.dump(cache_data, f, indent=2)
+            temp_file = f.name
+        shutil.move(temp_file, PATIENT_CACHE_FILE)
+        logger.info(f"Saved patient cache to {PATIENT_CACHE_FILE}")
+    except Exception as e:
+        logger.error(f"Failed to save patient cache: {e}")
+        if temp_file and os.path.exists(temp_file):
+            try:
+                os.unlink(temp_file)
+            except:
+                pass
 
 # === STATE MANAGEMENT ===
 def load_last_sync_times() -> Dict[int, Optional[datetime.datetime]]:
@@ -424,10 +460,15 @@ def parse_time(s: Optional[str]) -> Optional[datetime.datetime]:
     if not s:
         return None
     try:
+        # Try parsing with timezone information
         dt = datetime.datetime.fromisoformat(s.replace('Z', '+00:00'))
         if dt.tzinfo is None:
-            logger.warning(f"Naive datetime received: {s}, assuming UTC")
-            dt = dt.replace(tzinfo=timezone.utc)
+            # If naive, assume CLINIC_TIMEZONE (America/Chicago, GMT-5)
+            logger.debug(f"Naive datetime received: {s}, assuming {CLINIC_TIMEZONE}")
+            dt = dt.replace(tzinfo=CLINIC_TIMEZONE)
+        else:
+            # Convert to CLINIC_TIMEZONE if it has a different timezone
+            dt = dt.astimezone(CLINIC_TIMEZONE)
         return dt
     except ValueError:
         logger.warning(f"Unrecognized time format: {s}")
@@ -448,6 +489,113 @@ def calculate_end_time(start_dt: datetime.datetime, pattern: str) -> datetime.da
         logger.warning(f"No slots in pattern '{pattern}', defaulting to 60 minutes")
         dur = 60
     return start_dt + datetime.timedelta(minutes=dur)
+
+# === PAGINATED REQUEST ===
+def make_optimized_request_paginated(endpoint: str, params: Dict[str, Any], method: str = 'GET', use_cache: bool = True) -> Optional[List[Any]]:
+    if not ENABLE_PAGINATION:
+        return make_optimized_request(endpoint, params, method, use_cache)
+    
+    session = get_optimized_session()
+    headers = make_auth_header()
+    url = f"{API_BASE_URL}/{endpoint}"
+    all_data = []
+    params = params.copy()
+    params['limit'] = PAGE_SIZE
+    offset = 0
+    
+    fingerprint = get_request_fingerprint(url, params) if use_cache and method == 'GET' else None
+    if use_cache and method == 'GET':
+        cached_result = get_cached_response(fingerprint)
+        if cached_result is not None:
+            return cached_result
+    
+    while True:
+        params['offset'] = offset
+        rate_limiter.wait_if_needed()
+        start_time = time.time()
+        try:
+            if method == 'GET':
+                response = session.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
+            else:
+                response = session.post(url, headers=headers, json=params, timeout=REQUEST_TIMEOUT)
+            
+            response.raise_for_status()
+            response_time = time.time() - start_time
+            rate_limiter.record_response_time(response_time)
+            
+            try:
+                data = response.json()
+            except ValueError:
+                logger.error(f"Invalid JSON response from {endpoint}: {response.text}")
+                return None
+            
+            if isinstance(data, dict) and data.get('error'):
+                logger.error(f"API error for {endpoint}: {data.get('error')}")
+                return None
+            
+            data_list = data if isinstance(data, list) else [data]
+            all_data.extend(data_list)
+            
+            if len(data_list) < PAGE_SIZE:
+                break
+            offset += PAGE_SIZE
+        except requests.exceptions.RequestException as e:
+            response_time = time.time() - start_time
+            rate_limiter.record_response_time(response_time)
+            logger.error(f"Request to {endpoint} failed: {e}")
+            return None
+    
+    if method == 'GET' and use_cache and all_data:
+        cache_response(fingerprint, all_data)
+    
+    logger.debug(f"Paged request completed in {response_time:.2f}s, total records: {len(all_data)}")
+    return all_data
+
+def make_optimized_request(endpoint: str, params: Dict[str, Any], method: str = 'GET', use_cache: bool = True) -> Optional[List[Any]]:
+    session = get_optimized_session()
+    headers = make_auth_header()
+    url = f"{API_BASE_URL}/{endpoint}"
+    fingerprint = get_request_fingerprint(url, params) if use_cache and method == 'GET' else None
+    
+    if use_cache and method == 'GET':
+        cached_result = get_cached_response(fingerprint)
+        if cached_result is not None:
+            return cached_result
+    
+    rate_limiter.wait_if_needed()
+    start_time = time.time()
+    try:
+        if method == 'GET':
+            response = session.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
+        else:
+            response = session.post(url, headers=headers, json=params, timeout=REQUEST_TIMEOUT)
+        
+        response.raise_for_status()
+        response_time = time.time() - start_time
+        rate_limiter.record_response_time(response_time)
+        
+        try:
+            data = response.json()
+        except ValueError:
+            logger.error(f"Invalid JSON response from {endpoint}: {response.text}")
+            return None
+        
+        if isinstance(data, dict) and data.get('error'):
+            logger.error(f"API error for {endpoint}: {data.get('error')}")
+            return None
+        
+        all_data = data if isinstance(data, list) else [data]
+        
+        if method == 'GET' and use_cache and all_data:
+            cache_response(fingerprint, all_data)
+        
+        logger.debug(f"Request completed in {response_time:.2f}s, total records: {len(all_data)}")
+        return all_data
+    except requests.exceptions.RequestException as e:
+        response_time = time.time() - start_time
+        rate_limiter.record_response_time(response_time)
+        logger.error(f"Request to {endpoint} failed: {e}")
+        return None
 
 # === SMART SYNC WINDOW GENERATION ===
 def generate_sync_windows(
@@ -491,6 +639,78 @@ def generate_sync_windows(
     logger.info(f"Clinic {clinic_num}: Generated {len(windows)} sync window")
     return windows
 
+# === PATIENT DATA ===
+def get_patient_details(pat_num: int) -> Dict[str, Any]:
+    global _patient_cache
+    if not pat_num:
+        return {}
+    
+    if pat_num in _patient_cache:
+        logger.debug(f"Patient {pat_num}: Using in-memory cache")
+        return _patient_cache[pat_num]
+    
+    if not _patient_cache:
+        _patient_cache = load_patient_cache()
+    
+    if pat_num in _patient_cache:
+        logger.debug(f"Patient {pat_num}: Using persistent cache")
+        return _patient_cache[pat_num]
+    
+    try:
+        data = make_optimized_request(f'patients/{pat_num}', {})
+        if data is None:
+            logger.warning(f"Failed to fetch patient {pat_num}: No data returned")
+            return {}
+        if isinstance(data, list) and len(data) == 1:
+            patient_data = data[0]
+        elif isinstance(data, dict):
+            patient_data = data
+        else:
+            logger.warning(f"Unexpected response format for patient {pat_num}: {type(data)}")
+            return {}
+        
+        _patient_cache[pat_num] = patient_data
+        save_patient_cache(_patient_cache)
+        logger.info(f"Patient {pat_num}: Fetched and cached")
+        return patient_data
+    except Exception as e:
+        logger.warning(f"Failed to fetch patient {pat_num}: {e}")
+        return {}
+
+def fetch_patients_paginated(pat_nums: List[int]) -> Dict[int, Dict[str, Any]]:
+    global _patient_cache
+    if not _patient_cache:
+        _patient_cache = load_patient_cache()
+    
+    missing_pat_nums = [pn for pn in pat_nums if pn not in _patient_cache]
+    patient_data = {pn: _patient_cache.get(pn, {}) for pn in pat_nums}
+    
+    if not missing_pat_nums:
+        logger.info("All patient details found in cache")
+        return patient_data
+    
+    batch_size = PAGE_SIZE
+    for i in range(0, len(missing_pat_nums), batch_size):
+        batch = missing_pat_nums[i:i + batch_size]
+        params = {'PatNums': ','.join(str(pn) for pn in batch)}
+        try:
+            data = make_optimized_request_paginated('patients', params)
+            if data is None:
+                logger.warning(f"Failed to fetch patient batch: {batch}")
+                continue
+            for patient in data:
+                pat_num = patient.get('PatNum')
+                if pat_num:
+                    _patient_cache[pat_num] = patient
+                    patient_data[pat_num] = patient
+            logger.info(f"Fetched {len(data)} patients for batch {batch}")
+        except Exception as e:
+            logger.error(f"Error fetching patient batch {batch}: {e}")
+        time.sleep(0.5)
+    
+    save_patient_cache(_patient_cache)
+    return patient_data
+
 # === OPTIMIZED APPOINTMENT FETCHING ===
 def fetch_appointments_for_window(
     window: SyncWindow,
@@ -504,9 +724,10 @@ def fetch_appointments_for_window(
         'ClinicNum': clinic,
         'dateStart': start_time_utc.strftime('%Y-%m-%d'),
         'dateEnd': end_time_utc.strftime('%Y-%m-%d'),
+        'limit': PAGE_SIZE
     }
     try:
-        operatory_data = make_optimized_request('operatories', {'ClinicNum': clinic})
+        operatory_data = make_optimized_request_paginated('operatories', {'ClinicNum': clinic, 'limit': PAGE_SIZE})
         if operatory_data:
             operatory_info = [
                 {'OperatoryNum': op.get('OperatoryNum'), 'OperatoryName': op.get('OpName', 'Unknown')}
@@ -538,7 +759,7 @@ def fetch_appointments_for_window(
             single_params['AptStatus'] = status
             single_params['Op'] = str(op_num)
             try:
-                appointments = make_optimized_request('appointments', single_params)
+                appointments = make_optimized_request_paginated('appointments', single_params)
                 logger.debug(f"Clinic {clinic}: Raw API response for AptStatus={status}, Op={op_num}: {appointments}")
                 if appointments is not None:
                     logger.debug(f"Clinic {clinic}: AptStatus={status}, Op={op_num} returned {len(appointments)} appointments")
@@ -554,7 +775,7 @@ def fetch_appointments_for_window(
         params.pop('AptStatus', None)
         params.pop('Op', None)
         try:
-            appointments = make_optimized_request('appointments', params)
+            appointments = make_optimized_request_paginated('appointments', params)
             logger.debug(f"Clinic {clinic}: Raw API response for fallback: {appointments}")
             if appointments is not None:
                 logger.debug(f"Clinic {clinic}: Fallback request returned {len(appointments)} appointments")
@@ -630,45 +851,37 @@ def fetch_appointments_optimized(
     logger.info(f"Clinic {clinic}: After deduplication, {len(unique_appointments)} appointments")
     return unique_appointments
 
-# === PATIENT DATA ===
-def get_patient_details(pat_num: int) -> Dict[str, Any]:
-    if not pat_num:
-        return {}
-    try:
-        data = make_optimized_request(f'patients/{pat_num}', {})
-        if data is None:
-            logger.warning(f"Failed to fetch patient {pat_num}: No data returned")
-            return {}
-        if isinstance(data, list) and len(data) == 1:
-            return data[0]
-        elif isinstance(data, dict):
-            return data
-        else:
-            logger.warning(f"Unexpected response format for patient {pat_num}: {type(data)}")
-            return {}
-    except Exception as e:
-        logger.warning(f"Failed to fetch patient {pat_num}: {e}")
-        return {}
-
 # === KERAGON INTEGRATION ===
-def send_to_keragon(appointment: Dict[str, Any], clinic: int, dry_run: bool = False) -> bool:
+def send_to_keragon(appointment: Dict[str, Any], clinic: int, patient_data: Dict[int, Dict[str, Any]], dry_run: bool = False) -> bool:
     try:
-        patient = get_patient_details(appointment.get('PatNum'))
         apt_num = str(appointment.get('AptNum', ''))
+        pat_num = appointment.get('PatNum')
+        patient = patient_data.get(pat_num, {})
         start_time_str = appointment.get('AptDateTime', '')
         start_time = parse_time(start_time_str)
+        if start_time is None:
+            logger.error(f"Invalid AptDateTime for appointment {apt_num}: {start_time_str}")
+            return False
+        
+        # Ensure start_time is in CLINIC_TIMEZONE (GMT-5)
+        start_time = start_time.astimezone(CLINIC_TIMEZONE)
         pattern = appointment.get('Pattern', '')
         end_time = calculate_end_time(start_time, pattern) if start_time and pattern else None
+        
+        # Format times as ISO 8601 in CLINIC_TIMEZONE
+        start_time_iso = start_time.isoformat()  # e.g., 2025-07-23T10:00:00-05:00
+        end_time_iso = end_time.isoformat() if end_time else ''
+        
         payload = {
             'appointment': {
                 'AptNum': apt_num,
                 'AptStatus': appointment.get('AptStatus', ''),
-                'AptDateTime': start_time_str,
-                'EndTime': end_time.isoformat() if end_time else '',
+                'AptDateTime': start_time_iso,
+                'EndTime': end_time_iso,
                 'Note': appointment.get('Note', ''),
                 'AppointmentType': get_appointment_type_name(appointment, clinic),
                 'ClinicNum': clinic,
-                'PatNum': appointment.get('PatNum', ''),
+                'PatNum': pat_num,
                 'OperatoryNum': appointment.get('Op') or appointment.get('OperatoryNum', '')
             },
             'patient': {
@@ -693,14 +906,14 @@ def send_to_keragon(appointment: Dict[str, Any], clinic: int, dry_run: bool = Fa
         logger.error(f"Failed to send appointment {apt_num} to Keragon: {e}")
         return False
 
-def send_batch_to_keragon(appointments: List[Dict[str, Any]], clinic: int, dry_run: bool = False) -> Tuple[int, List[str]]:
+def send_batch_to_keragon(appointments: List[Dict[str, Any]], clinic: int, patient_data: Dict[int, Dict[str, Any]], dry_run: bool = False) -> Tuple[int, List[str]]:
     batch_size = BATCH_SIZE
     successful_sends = 0
     sent_appointment_ids = []
     for i in range(0, len(appointments), batch_size):
         batch = appointments[i:i + batch_size]
         for appt in batch:
-            if send_to_keragon(appt, clinic, dry_run):
+            if send_to_keragon(appt, clinic, patient_data, dry_run):
                 successful_sends += 1
                 sent_appointment_ids.append(str(appt.get('AptNum', '')))
             time.sleep(0.5)
@@ -721,61 +934,22 @@ def process_clinic_optimized(
     appointment_types = get_appointment_types(clinic, force_refresh=force_deep_sync)
     appointments = fetch_appointments_optimized(clinic, since, force_deep_sync)
     new_appointments = []
+    pat_nums = set()
     for appt in appointments:
         apt_num = str(appt.get('AptNum', ''))
         if apt_num in sent_appointments:
             continue
         new_appointments.append(appt)
-    logger.info(f"Clinic {clinic}: Found {len(new_appointments)} new or updated appointments")
-    sent_count, sent_ids = send_batch_to_keragon(new_appointments, clinic, dry_run)
+        pat_num = appt.get('PatNum')
+        if pat_num:
+            pat_nums.add(pat_num)
+    logger.info(f"Clinic {clinic}: Found {len(new_appointments)} new or updated appointments for {len(pat_nums)} patients")
+    
+    patient_data = fetch_patients_paginated(list(pat_nums))
+    
+    sent_count, sent_ids = send_batch_to_keragon(new_appointments, clinic, patient_data, dry_run)
     logger.info(f"Clinic {clinic}: Successfully sent {sent_count} appointments")
     return sent_count, sent_ids
-
-def make_optimized_request(endpoint: str, params: Dict[str, Any], method: str = 'GET', use_cache: bool = True) -> Optional[List[Any]]:
-    session = get_optimized_session()
-    headers = make_auth_header()
-    url = f"{API_BASE_URL}/{endpoint}"
-    fingerprint = get_request_fingerprint(url, params)
-    
-    if use_cache and method == 'GET':
-        cached_result = get_cached_response(fingerprint)
-        if cached_result is not None:
-            return cached_result
-    
-    rate_limiter.wait_if_needed()
-    start_time = time.time()
-    try:
-        if method == 'GET':
-            response = session.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
-        else:
-            response = session.post(url, headers=headers, json=params, timeout=REQUEST_TIMEOUT)
-        
-        response.raise_for_status()
-        response_time = time.time() - start_time
-        rate_limiter.record_response_time(response_time)
-        
-        try:
-            data = response.json()
-        except ValueError:
-            logger.error(f"Invalid JSON response from {endpoint}: {response.text}")
-            return None
-        
-        if isinstance(data, dict) and data.get('error'):
-            logger.error(f"API error for {endpoint}: {data.get('error')}")
-            return None
-        
-        all_data = data if isinstance(data, list) else [data]
-        
-        if method == 'GET' and use_cache and all_data:
-            cache_response(fingerprint, all_data)
-        
-        logger.debug(f"Request completed in {response_time:.2f}s, total records: {len(all_data)}")
-        return all_data
-    except requests.exceptions.RequestException as e:
-        response_time = time.time() - start_time
-        rate_limiter.record_response_time(response_time)
-        logger.error(f"Request to {endpoint} failed: {e}")
-        return None
 
 def main_loop(dry_run: bool = False, force_deep_sync: bool = False, once: bool = False):
     if not validate_configuration():
