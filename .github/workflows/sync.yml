@@ -40,18 +40,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests python-dateutil
 
-      - name: Check for Deep Sync Lock
-        id: check_lock
+      - name: Check for last_sync_state.json
+        id: check_state
         run: |
-          if [ -f deep_sync.lock ]; then
-            echo "deep_sync_in_progress=true" >> $GITHUB_OUTPUT
+          if [ -f last_sync_state.json ]; then
+            echo "state_file_exists=true" >> $GITHUB_OUTPUT
           else
-            echo "deep_sync_in_progress=false" >> $GITHUB_OUTPUT
+            echo "state_file_exists=false" >> $GITHUB_OUTPUT
           fi
 
       - name: Run sync
         id: sync
-        if: steps.check_lock.outputs.deep_sync_in_progress == 'false'
         env:
           OPEN_DENTAL_DEVELOPER_KEY: ${{ secrets.OPEN_DENTAL_DEVELOPER_KEY }}
           OPEN_DENTAL_CUSTOMER_KEY: ${{ secrets.OPEN_DENTAL_CUSTOMER_KEY }}
@@ -69,13 +68,14 @@ jobs:
           PAGE_SIZE: "100"
           MAX_RECORDS_PER_REQUEST: "100"
         run: |
-          if [[ "${{ github.event_name }}" == "schedule" && "${{ github.event.schedule }}" == "0 7 * * *" ]]; then
-            echo "Running deep sync at 2 AM CDT"
-            touch deep_sync.lock
+          if [ "${{ steps.check_state.outputs.state_file_exists }}" == "false" ]; then
+            echo "No last_sync_state.json found, running deep sync"
             python3 sync_script.py --force-deep-sync --verbose --once
-            rm deep_sync.lock
+          elif [[ "${{ github.event_name }}" == "schedule" && "${{ github.event.schedule }}" == "0 7 * * *" ]]; then
+            echo "Running deep sync at 2 AM CDT"
+            python3 sync_script.py --force-deep-sync --verbose --once
           else
-            echo "Running sync (deep if first run, else incremental)"
+            echo "Running incremental sync"
             python3 sync_script.py --verbose --once
           fi
 
