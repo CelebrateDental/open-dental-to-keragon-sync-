@@ -57,7 +57,7 @@ CACHE_EXPIRY_MINUTES = int(os.environ.get('CACHE_EXPIRY_MINUTES', '30'))
 USE_SPECIFIC_FIELDS = os.environ.get('USE_SPECIFIC_FIELDS', 'true').lower() == 'true'
 ENABLE_PAGINATION = os.environ.get('ENABLE_PAGINATION', 'true').lower() == 'true'
 PAGE_SIZE = int(os.environ.get('PAGE_SIZE', '50'))
-MAX_RECORDS_PER_REQUEST = int(os.environ.get('MAX_RECORDS_PER_REQUEST', '100'))
+MAX_RECORDS_PER_REQUEST = int(os.environ.get('MAX_RECORDS_PER_REQUEST', '500'))
 
 CLINIC_NUMS = [int(x) for x in os.environ.get('CLINIC_NUMS', '').split(',') if x.strip().isdigit()]
 
@@ -565,6 +565,12 @@ def make_optimized_request_paginated(endpoint: str, params: Dict[str, Any], meth
             rate_limiter.record_response_time(response_time)
             logger.error(f"Request to {endpoint} failed: {e}")
             return None
+    
+    # Log all records before returning
+    logger.info(f"Completed pagination for {endpoint} with params {params}: fetched {len(all_data)} records")
+    if all_data:
+        apt_nums = [str(item.get('AptNum', 'N/A')) for item in all_data if isinstance(item, dict)]
+        logger.debug(f"Records fetched: AptNums={apt_nums}")
     
     if method == 'GET' and use_cache and all_data:
         cache_response(fingerprint, all_data)
