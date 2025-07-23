@@ -318,7 +318,12 @@ def get_appointment_types(clinic_num: int, force_refresh: bool = False) -> Dict[
     
     try:
         logger.info(f"Fetching appointment types for clinic {fetch_clinic} (shared for all clinics)")
-        params = {'ClinicNum': fetch_clinic, 'limit': 500, 'IsHidden': 'false'}
+        params = {
+            'ClinicNum': fetch_clinic,
+            'limit': 500,
+            'IsHidden': 'false',
+            'fields': 'AppointmentTypeNum,AppointmentTypeName'
+        }
         appt_types = make_optimized_request_paginated('appointmenttypes', params)
         if appt_types is None:
             logger.error(f"Failed to fetch appointment types for clinic {fetch_clinic}")
@@ -327,7 +332,7 @@ def get_appointment_types(clinic_num: int, force_refresh: bool = False) -> Dict[
             return _appointment_types_cache['shared']
         
         clinic_cache = {apt_type['AppointmentTypeNum']: apt_type['AppointmentTypeName'] 
-                        for apt_type in appt_types if 'AppointmentTypeNum' in apt_type}
+                        for apt_type in appt_types if 'AppointmentTypeNum' in apt_type and 'AppointmentTypeName' in apt_type}
         _appointment_types_cache['shared'] = clinic_cache
         logger.info(f"Loaded {len(clinic_cache)} appointment types for clinic {fetch_clinic} (shared)")
         save_appointment_types_cache(_appointment_types_cache)
@@ -632,6 +637,11 @@ def generate_sync_windows(
 ) -> List[SyncWindow]:
     now_utc = datetime.datetime.utcnow().replace(tzinfo=timezone.utc)
     windows = []
+    # Force deep sync if state file doesn't exist
+    if not os.path.exists(STATE_FILE):
+        logger.info(f"Clinic {clinic_num}: No state file found, forcing deep sync")
+        force_deep_sync = True
+    
     if last_sync and not force_deep_sync:
         time_since_last = now_utc - last_sync
         if time_since_last < timedelta(hours=24):
@@ -930,18 +940,16 @@ def send_to_keragon(appointment: Dict[str, Any], clinic: int, patient_data: Dict
             logger.info(f"Dry run: Would send appointment {apt_num} to Keragon: {json.dumps(payload, indent=2)}")
             return True
         
+        logger.info(f"Sending payload for appointment {apt_num} to Keragon: {json.dumps(payload, indent=2)}")
         session = get_optimized_session()
         headers = {'Content-Type': 'application/json'}
         for attempt in range(RETRY_ATTEMPTS):
             try:
                 response = session.post(KERAGON_WEBHOOK_URL, json=payload, headers=headers, timeout=30)
-                logger.debug(f"Keragon request for {apt_num}: {response.request.url}, Payload: {json.dumps(payload, indent=2)}")
-                if response.status_code in (200, 201, 202):
-                    logger.info(f"✓ Successfully sent appointment {apt_num}")
+                logger.debug(f"Keragon request for {apt_num}: {response.request.url}")
+                if response.status_code in (200, 201, 202, 204):
+                    logger.info(f"✓ Successfully sent appointment {apt_num} (HTTP {response.status_code})")
                     return True
-                elif response.status_code == 204:
-                    logger.warning(f"Keragon returned 204 for appointment {apt_num}: No content received")
-                    return False
                 else:
                     logger.error(f"Failed to send appointment {apt_num}: HTTP {response.status_code} - {response.text}")
             except requests.exceptions.RequestException as e:
