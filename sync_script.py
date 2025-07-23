@@ -348,7 +348,7 @@ def get_appointment_type_name(appointment: Dict[str, Any], clinic_num: int) -> s
         if apt_type_name:
             return apt_type_name
         else:
-            logger.warning(f"No AppointmentTypeName for AppointmentTypeNum {apt_type_num} in clinic {clinic_num}")
+            logger.warning.toolong(f"No AppointmentTypeName for AppointmentTypeNum {apt_type_num} in clinic {clinic_num}")
     apt_type_direct = appointment.get('AptType', '') or appointment.get('AppointmentType', '')
     if not apt_type_direct:
         logger.debug(f"No AppointmentTypeNum or AptType for appointment {appointment.get('AptNum')}")
@@ -728,30 +728,24 @@ def fetch_patients_paginated(pat_nums: List[int]) -> Dict[int, Dict[str, Any]]:
     if not _patient_cache:
         _patient_cache = load_patient_cache()
     
-    missing_pat_nums = [pn for pn in pat_nums if pn not in _patient_cache]
     patient_data = {pn: _patient_cache.get(pn, {}) for pn in pat_nums}
+    
+    missing_pat_nums = [pn for pn in pat_nums if not patient_data[pn]]
     
     if not missing_pat_nums:
         logger.info("All patient details found in cache")
         return patient_data
     
-    batch_size = PAGE_SIZE
-    for i in range(0, len(missing_pat_nums), batch_size):
-        batch = missing_pat_nums[i:i + batch_size]
-        params = {'PatNums': ','.join(str(pn) for pn in batch)}
+    for pn in missing_pat_nums:
         try:
-            data = make_optimized_request_paginated('patients', params)
-            if data is None:
-                logger.warning(f"Failed to fetch patient batch: {batch}")
-                continue
-            for patient in data:
-                pat_num = patient.get('PatNum')
-                if pat_num:
-                    _patient_cache[pat_num] = patient
-                    patient_data[pat_num] = patient
-            logger.info(f"Fetched {len(data)} patients for batch {batch}")
+            patient = get_patient_details(pn)
+            if patient:
+                patient_data[pn] = patient
+                logger.info(f"Fetched patient {pn}")
+            else:
+                logger.warning(f"No data returned for patient {pn}")
         except Exception as e:
-            logger.error(f"Error fetching patient batch {batch}: {e}")
+            logger.error(f"Error fetching patient {pn}: {e}")
         time.sleep(0.5)
     
     save_patient_cache(_patient_cache)
@@ -764,8 +758,10 @@ def fetch_appointments_for_window(
     since: Optional[datetime.datetime] = None
 ) -> List[Dict[str, Any]]:
     clinic = appointment_filter.clinic_num
-    start_time_utc = window.start_time.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    end_time_utc = window.end_time.astimezone(timezone.utc).replace(hour=23, minute=59, second=59, microsecond=999999)
+    start_time_utc = (window.start_time.astimezone(timezone.utc)
+                     .replace(hour=0, minute=0, second=0, microsecond=0))
+    end_time_utc = (window.end_time.astimezone(timezone.utc)
+                   .replace(hour=23, minute=59, second=59, microsecond=999999))
     logger.info(f"Using PAGE_SIZE={PAGE_SIZE} for clinic {clinic}")  # Log PAGE_SIZE
     params = {
         'ClinicNum': clinic,
@@ -837,6 +833,7 @@ def fetch_appointments_for_window(
     
     logger.debug(f"Clinic {clinic}: {'Incremental' if window.is_incremental else 'Full'} sync returned {len(all_appointments)} appointments")
     return all_appointments
+
 def apply_appointment_filters(
     appointments: List[Dict[str, Any]],
     appointment_filter: AppointmentFilter
