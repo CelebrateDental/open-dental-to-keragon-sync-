@@ -120,32 +120,42 @@ def is_deep_sync_time(now: datetime.datetime) -> bool:
     now_clinic_tz = now.astimezone(CLINIC_TIMEZONE)
     return now_clinic_tz.hour == DEEP_SYNC_HOUR and now_clinic_tz.minute == 0
 
-def get_next_run_time(now: datetime.datetime) -> datetime.datetime:
+def get_next_run_time(now: datetime.datetime, force_deep_sync: bool = False) -> datetime.datetime:
     now_clinic_tz = now.astimezone(CLINIC_TIMEZONE)
     next_run = now_clinic_tz.replace(second=0, microsecond=0)
     
-    if is_deep_sync_time(now):
+    if force_deep_sync or is_deep_sync_time(now):
+        logger.info("Scheduling deep sync")
         return now_clinic_tz
     elif is_clinic_open(now):
         minutes = (now_clinic_tz.minute // INCREMENTAL_INTERVAL_MINUTES + 1) * INCREMENTAL_INTERVAL_MINUTES
         next_run = next_run.replace(minute=0, hour=now_clinic_tz.hour) + timedelta(minutes=minutes)
         if next_run.hour >= CLINIC_CLOSE_HOUR:
             next_run = next_run.replace(hour=DEEP_SYNC_HOUR, minute=0) + timedelta(days=1)
-        else:
-            next_run = next_run.replace(hour=DEEP_SYNC_HOUR, minute=0)
+    else:
+        next_run = next_run.replace(hour=DEEP_SYNC_HOUR, minute=0) + timedelta(days=1)
     
     return next_run
 
 # === CONFIG VALIDATION ===
 def validate_configuration() -> bool:
+    errors = []
     if not DEVELOPER_KEY or not CUSTOMER_KEY:
-        logger.error("Missing Open Dental API credentials")
-        return False
+        errors.append("Missing Open Dental API credentials")
     if not KERAGON_WEBHOOK_URL:
-        logger.error("Missing Keragon webhook URL")
-        return False
+        errors.append("Missing Keragon webhook URL")
     if not CLINIC_NUMS:
-        logger.error("No valid clinic numbers provided")
+        errors.append("No valid clinic numbers provided")
+    for clinic in CLINIC_NUMS:
+        if clinic not in CLINIC_OPERATORY_FILTERS:
+            errors.append(f"No operatory filters defined for clinic {clinic}")
+        if clinic not in CLINIC_BROKEN_APPOINTMENT_TYPE_FILTERS:
+            errors.append(f"No broken appointment type filters defined for clinic {clinic}")
+    
+    if errors:
+        logger.error("Configuration validation failed:")
+        for error in errors:
+            logger.error(f"- {error}")
         return False
     return True
 
@@ -172,12 +182,12 @@ def get_optimized_session():
                 _session.mount("http://", adapter)
                 _session.mount("https://", adapter)
                 _session.headers.update({
-                    'User-Agent': 'OpenDental-Sync-DB-Optimized/3.0',
+                    'User-Agent': 'OpenDental-Sync-Optimized/3.1',
                     'Accept': 'application/json',
                     'Accept-Encoding': 'gzip, deflate',
                     'Connection': 'keep-alive'
                 })
-                logger.info("Initialized database-optimized session")
+                logger.info("Initialized optimized session")
     return _session
 
 # === ADAPTIVE RATE LIMITING ===
@@ -210,7 +220,7 @@ class AdaptiveRateLimiter:
                 self.consecutive_slow_requests += 1
                 if self.consecutive_slow_requests >= 2:
                     self.current_delay = min(self.current_delay * 1.5, self.max_delay)
-                    logger.warning(f"Database slow response ({response_time:.2f}s), increasing delay to {self.current_delay:.2f}s")
+                    logger.warning(f"Slow response ({response_time:.2f}s), increasing delay to {self.current_delay:.2f}s")
             else:
                 self.consecutive_slow_requests = 0
                 if response_time < 3 and self.current_delay > self.base_delay:
@@ -243,7 +253,7 @@ def cache_response(fingerprint: str, data: Any):
     with _cache_lock:
         _request_cache[fingerprint] = (datetime.datetime.now(), data)
         if len(_request_cache) > 100:
-            cutoff_time = datetime.datetime.now() - datetime.timedelta(minutes=CACHE_EXPIRY_MINUTES)
+            cutoff_time = datetime.datetime.now() - timedelta(minutes=CACHE_EXPIRY_MINUTES)
             expired_keys = [k for k, (t, _) in _request_cache.items() if t < cutoff_time]
             for key in expired_keys:
                 del _request_cache[key]
@@ -257,7 +267,6 @@ def load_appointment_types_cache() -> Dict[str, Dict[int, str]]:
         with open(APPT_TYPES_CACHE_FILE) as f:
             data = json.load(f)
             logger.info(f"Loaded appointment types cache from {APPT_TYPES_CACHE_FILE} with {len(data.get('appointment_types', {}))} entries")
-            # Support both shared and clinic-specific cache for backward compatibility
             appointment_types = data.get('appointment_types', {})
             if 'shared' in appointment_types:
                 return {'shared': {int(k): v for k, v in appointment_types['shared'].items()}}
@@ -288,45 +297,34 @@ def save_appointment_types_cache(appointment_types: Dict[str, Dict[int, str]]):
 
 def get_appointment_types(clinic_num: int, force_refresh: bool = False) -> Dict[int, str]:
     global _appointment_types_cache, SHARED_CLINIC_NUM
-    # Use shared cache for all clinics
     if not force_refresh and _appointment_types_cache.get('shared'):
         logger.debug(f"Using shared in-memory appointment types cache for clinic {clinic_num}")
         return _appointment_types_cache['shared']
     
-    # Load from file if not forcing refresh
     if not force_refresh:
         _appointment_types_cache = load_appointment_types_cache()
         if _appointment_types_cache.get('shared'):
             logger.debug(f"Using file-based shared appointment types cache for clinic {clinic_num}")
             return _appointment_types_cache['shared']
-        # Fallback to clinic-specific cache for backward compatibility
         if clinic_num in _appointment_types_cache:
             logger.debug(f"Using file-based clinic-specific cache for clinic {clinic_num}")
             _appointment_types_cache['shared'] = _appointment_types_cache[clinic_num]
             save_appointment_types_cache(_appointment_types_cache)
             return _appointment_types_cache['shared']
     
-    # Fetch only for the first clinic or a designated clinic
     fetch_clinic = SHARED_CLINIC_NUM if SHARED_CLINIC_NUM else clinic_num
     if not SHARED_CLINIC_NUM:
-        SHARED_CLINIC_NUM = clinic_num  # Set the first clinic as the shared source
+        SHARED_CLINIC_NUM = clinic_num
     
     try:
         logger.info(f"Fetching appointment types for clinic {fetch_clinic} (shared for all clinics)")
-        MAX_APPT_TYPES = 500
-        params = {'ClinicNum': fetch_clinic, 'limit': MAX_APPT_TYPES, 'IsHidden': 'false'}
-        appt_types = []
-        data_list = make_optimized_request('appointmenttypes', params)
-        if data_list is None:
+        params = {'ClinicNum': fetch_clinic, 'limit': 500, 'IsHidden': 'false'}
+        appt_types = make_optimized_request_paginated('appointmenttypes', params)
+        if appt_types is None:
             logger.error(f"Failed to fetch appointment types for clinic {fetch_clinic}")
             _appointment_types_cache['shared'] = {}
             save_appointment_types_cache(_appointment_types_cache)
             return _appointment_types_cache['shared']
-        appt_types.extend(data_list)
-        logger.debug(f"Fetched {len(data_list)} appointment types: {[apt['AppointmentTypeNum'] for apt in data_list]}")
-        appt_types = appt_types[:MAX_APPT_TYPES]  # Trim to exactly MAX_APPT_TYPES
-        if len(appt_types) >= MAX_APPT_TYPES:
-            logger.warning(f"Reached max appointment types ({MAX_APPT_TYPES}) for clinic {fetch_clinic}")
         
         clinic_cache = {apt_type['AppointmentTypeNum']: apt_type['AppointmentTypeName'] 
                         for apt_type in appt_types if 'AppointmentTypeNum' in apt_type}
@@ -344,7 +342,7 @@ def get_appointment_type_name(appointment: Dict[str, Any], clinic_num: int) -> s
     apt_type_num = appointment.get('AppointmentTypeNum')
     if apt_type_num is not None:
         appointment_types = get_appointment_types(clinic_num)
-        apt_type_name = appointment_types.get(apt_type_num, '')
+        apt_type_name = appointment_types.get(int(apt_type_num), '')
         if apt_type_name:
             return apt_type_name
         else:
@@ -353,9 +351,6 @@ def get_appointment_type_name(appointment: Dict[str, Any], clinic_num: int) -> s
     if not apt_type_direct:
         logger.debug(f"No AppointmentTypeNum or AptType for appointment {appointment.get('AptNum')}")
     return apt_type_direct
-
-def get_appointment_type_num(appointment: Dict[str, Any]) -> Optional[int]:
-    return appointment.get('AppointmentTypeNum')
 
 def has_ghl_tag(appointment: Dict[str, Any]) -> bool:
     return '[fromGHL]' in (appointment.get('Note', '') or '')
@@ -426,9 +421,9 @@ def validate_sync_time_update(clinic: int, old_time: Optional[datetime.datetime]
         logger.warning(f"Clinic {clinic}: Attempted to set null sync time")
         return False
     if old_time.tzinfo is None:
-        old_time = old_time.replace(tzinfo=timezone.utc)
+        old_time = old_time.replace(tzinfo=CLINIC_TIMEZONE)
     if new_time.tzinfo is None:
-        new_time = new_time.replace(tzinfo=timezone.utc)
+        new_time = new_time.replace(tzinfo=CLINIC_TIMEZONE)
     if new_time < old_time:
         logger.warning(f"Clinic {clinic}: Attempted to move sync time backwards")
         return False
@@ -450,7 +445,7 @@ def save_state_atomically(sync_times: Dict[int, Optional[datetime.datetime]],
             temp_sent_file = f.name
         shutil.move(temp_sync_file, STATE_FILE)
         shutil.move(temp_sent_file, SENT_APPTS_FILE)
-        logger.debug(f"Saved state files with {len(sent_ids)} sent appointment IDs")
+        logger.info(f"Saved state files with {len(sent_ids)} sent appointment IDs")
     except Exception as e:
         logger.error(f"Error in atomic save: {e}")
         for temp_file in [temp_sync_file, temp_sent_file]:
@@ -481,14 +476,11 @@ def parse_time(s: Optional[str]) -> Optional[datetime.datetime]:
     if not s:
         return None
     try:
-        # Try parsing with timezone information
         dt = datetime.datetime.fromisoformat(s.replace('Z', '+00:00'))
         if dt.tzinfo is None:
-            # If naive, assume CLINIC_TIMEZONE (America/Chicago, GMT-5)
             logger.debug(f"Naive datetime received: {s}, assuming {CLINIC_TIMEZONE}")
             dt = dt.replace(tzinfo=CLINIC_TIMEZONE)
         else:
-            # Convert to CLINIC_TIMEZONE if it has a different timezone
             dt = dt.astimezone(CLINIC_TIMEZONE)
         return dt
     except ValueError:
@@ -513,7 +505,7 @@ def calculate_end_time(start_dt: datetime.datetime, pattern: str) -> datetime.da
 
 # === PAGINATED REQUEST ===
 def make_optimized_request_paginated(endpoint: str, params: Dict[str, Any], method: str = 'GET', use_cache: bool = True) -> Optional[List[Any]]:
-    logger.info(f"Using PAGE_SIZE={PAGE_SIZE} for endpoint {endpoint}")  # Log PAGE_SIZE
+    logger.info(f"Using PAGE_SIZE={PAGE_SIZE} for endpoint {endpoint}")
     if not ENABLE_PAGINATION:
         return make_optimized_request(endpoint, params, method, use_cache)
     
@@ -522,7 +514,7 @@ def make_optimized_request_paginated(endpoint: str, params: Dict[str, Any], meth
     url = f"{API_BASE_URL}/{endpoint}"
     all_data = []
     params = params.copy()
-    params['limit'] = PAGE_SIZE  # Enforce PAGE_SIZE=100
+    params['limit'] = PAGE_SIZE
     offset = 0
     
     fingerprint = get_request_fingerprint(url, params) if use_cache and method == 'GET' else None
@@ -530,10 +522,7 @@ def make_optimized_request_paginated(endpoint: str, params: Dict[str, Any], meth
         cached_result = get_cached_response(fingerprint)
         if cached_result is not None:
             logger.info(f"Cache hit for {endpoint} with params {params}: fetched {len(cached_result)} records")
-            if cached_result:
-                apt_nums = [str(item.get('AptNum', 'N/A')) for item in cached_result if isinstance(item, dict)]
-                logger.debug(f"Records fetched from cache: AptNums={apt_nums}")
-            return cached_result  # Return full cached result without restriction
+            return cached_result
     
     while True:
         params['offset'] = offset
@@ -546,12 +535,14 @@ def make_optimized_request_paginated(endpoint: str, params: Dict[str, Any], meth
             else:
                 response = session.post(url, headers=headers, json=params, timeout=REQUEST_TIMEOUT)
             
+            logger.debug(f"API request: {response.request.url}")
             response.raise_for_status()
             response_time = time.time() - start_time
             rate_limiter.record_response_time(response_time)
             
             try:
                 data = response.json()
+                logger.debug(f"Raw API response: {json.dumps(data, indent=2)}")
             except ValueError:
                 logger.error(f"Invalid JSON response from {endpoint}: {response.text}")
                 return None
@@ -564,11 +555,11 @@ def make_optimized_request_paginated(endpoint: str, params: Dict[str, Any], meth
             logger.debug(f"Fetched {len(data_list)} records at offset={offset}: AptNums={[str(item.get('AptNum', 'N/A')) for item in data_list if isinstance(item, dict)]}")
             all_data.extend(data_list)
             
-            # Save records to file for inspection
             if endpoint == 'appointments':
-                with open(f'appointments_op_{params.get("Op", "unknown")}_{params.get("AptStatus", "unknown")}.json', 'w') as f:
+                filename = f'appointments_op_{params.get("Op", "unknown")}_{params.get("AptStatus", "unknown")}.json'
+                with open(filename, 'w') as f:
                     json.dump(all_data, f, indent=2)
-                logger.info(f"Saved {len(all_data)} records to appointments_op_{params.get('Op', 'unknown')}_{params.get('AptStatus', 'unknown')}.json")
+                logger.info(f"Saved {len(all_data)} records to {filename}")
             
             if len(data_list) < PAGE_SIZE:
                 break
@@ -580,14 +571,9 @@ def make_optimized_request_paginated(endpoint: str, params: Dict[str, Any], meth
             return None
     
     logger.info(f"Completed pagination for {endpoint} with params {params}: fetched {len(all_data)} records")
-    if all_data:
-        apt_nums = [str(item.get('AptNum', 'N/A')) for item in all_data if isinstance(item, dict)]
-        logger.debug(f"Records fetched: AptNums={apt_nums}")
-    
     if method == 'GET' and use_cache and all_data:
         cache_response(fingerprint, all_data)
     
-    logger.debug(f"Paged request completed in {response_time:.2f}s, total records: {len(all_data)}")
     return all_data
 
 def make_optimized_request(endpoint: str, params: Dict[str, Any], method: str = 'GET', use_cache: bool = True) -> Optional[List[Any]]:
@@ -609,12 +595,14 @@ def make_optimized_request(endpoint: str, params: Dict[str, Any], method: str = 
         else:
             response = session.post(url, headers=headers, json=params, timeout=REQUEST_TIMEOUT)
         
+        logger.debug(f"API request: {response.request.url}")
         response.raise_for_status()
         response_time = time.time() - start_time
         rate_limiter.record_response_time(response_time)
         
         try:
             data = response.json()
+            logger.debug(f"Raw API response: {json.dumps(data, indent=2)}")
         except ValueError:
             logger.error(f"Invalid JSON response from {endpoint}: {response.text}")
             return None
@@ -646,10 +634,10 @@ def generate_sync_windows(
     windows = []
     if last_sync and not force_deep_sync:
         time_since_last = now_utc - last_sync
-        if time_since_last < datetime.timedelta(hours=24):
+        if time_since_last < timedelta(hours=24):
             logger.info(f"Clinic {clinic_num}: Incremental sync (last sync {time_since_last} ago)")
-            window_start = last_sync - datetime.timedelta(hours=SAFETY_OVERLAP_HOURS)
-            window_end = now_utc + datetime.timedelta(minutes=INCREMENTAL_SYNC_MINUTES)
+            window_start = last_sync - timedelta(hours=SAFETY_OVERLAP_HOURS)
+            window_end = now_utc + timedelta(minutes=INCREMENTAL_SYNC_MINUTES)
             windows.append(SyncWindow(
                 start_time=window_start,
                 end_time=window_end,
@@ -661,21 +649,15 @@ def generate_sync_windows(
             force_deep_sync = True
     if not last_sync or force_deep_sync:
         logger.info(f"Clinic {clinic_num}: Deep sync with {DEEP_SYNC_HOURS}-hour window")
-        if last_sync:
-            start_time = max(
-                last_sync - datetime.timedelta(hours=SAFETY_OVERLAP_HOURS), 
-                now_utc - datetime.timedelta(hours=24)
-            )
-        else:
-            start_time = now_utc - datetime.timedelta(hours=24)
-        end_time = now_utc + datetime.timedelta(hours=DEEP_SYNC_HOURS)
+        start_time = now_utc - timedelta(days=1)  # Simplified to 24 hours for deep sync
+        end_time = now_utc + timedelta(days=1)    # Look ahead one day
         windows.append(SyncWindow(
             start_time=start_time,
             end_time=end_time,
             is_incremental=False,
             clinic_num=clinic_num
         ))
-    logger.info(f"Clinic {clinic_num}: Generated {len(windows)} sync window")
+    logger.info(f"Clinic {clinic_num}: Generated {len(windows)} sync window(s)")
     return windows
 
 # === PATIENT DATA ===
@@ -722,7 +704,6 @@ def fetch_patients_paginated(pat_nums: List[int]) -> Dict[int, Dict[str, Any]]:
         _patient_cache = load_patient_cache()
     
     patient_data = {pn: _patient_cache.get(pn, {}) for pn in pat_nums}
-    
     missing_pat_nums = [pn for pn in pat_nums if not patient_data[pn]]
     
     if not missing_pat_nums:
@@ -737,9 +718,9 @@ def fetch_patients_paginated(pat_nums: List[int]) -> Dict[int, Dict[str, Any]]:
                 logger.info(f"Fetched patient {pn}")
             else:
                 logger.warning(f"No data returned for patient {pn}")
+            time.sleep(0.5)
         except Exception as e:
             logger.error(f"Error fetching patient {pn}: {e}")
-        time.sleep(0.5)
     
     save_patient_cache(_patient_cache)
     return patient_data
@@ -747,19 +728,18 @@ def fetch_patients_paginated(pat_nums: List[int]) -> Dict[int, Dict[str, Any]]:
 # === OPTIMIZED APPOINTMENT FETCHING ===
 def fetch_appointments_for_window(
     window: SyncWindow,
-    appointment_filter: AppointmentFilter,
-    since: Optional[datetime.datetime] = None
+    appointment_filter: AppointmentFilter
 ) -> List[Dict[str, Any]]:
     clinic = appointment_filter.clinic_num
     start_time_utc = window.start_time.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     end_time_utc = window.end_time.astimezone(timezone.utc).replace(hour=23, minute=59, second=59, microsecond=999999)
-    logger.info(f"Using PAGE_SIZE={PAGE_SIZE} for clinic {clinic}")  # Log PAGE_SIZE
     params = {
         'ClinicNum': clinic,
         'dateStart': start_time_utc.strftime('%Y-%m-%d'),
         'dateEnd': end_time_utc.strftime('%Y-%m-%d'),
-        'limit': PAGE_SIZE  # Ensure PAGE_SIZE is used
+        'limit': PAGE_SIZE
     }
+    
     try:
         operatory_data = make_optimized_request_paginated('operatories', {'ClinicNum': clinic, 'limit': PAGE_SIZE})
         if operatory_data:
@@ -773,35 +753,20 @@ def fetch_appointments_for_window(
     except Exception as e:
         logger.error(f"Clinic {clinic}: Failed to fetch operatory data: {e}")
     
-    if window.is_incremental:
-        if since is None:
-            since = datetime.datetime.utcnow().replace(tzinfo=timezone.utc) - datetime.timedelta(days=30)
-        if since.tzinfo is None:
-            since = since.replace(tzinfo=timezone.utc)
-        eff_utc = (since + timedelta(seconds=1)).astimezone(timezone.utc)
-        params['DateTStamp'] = eff_utc.strftime('%Y-%m-%d %H:%M:%S')
-        logger.debug(f"Clinic {clinic}: Applying serverDateTime {params['DateTStamp']} for incremental sync")
-    else:
-        logger.debug(f"Clinic {clinic}: No serverDateTime filter applied for deep sync")
-    
-    logger.debug(f"Clinic {clinic}: Fetching {start_time_utc} to {end_time_utc} (UTC, effective dates {params['dateStart']} to {params['dateEnd']})")
-    
     all_appointments = []
     for status in appointment_filter.valid_statuses:
         for op_num in appointment_filter.operatory_nums:
             single_params = params.copy()
             single_params['AptStatus'] = status
             single_params['Op'] = str(op_num)
-            single_params['limit'] = PAGE_SIZE  # Explicitly set limit
-            logger.debug(f"Clinic {clinic}: Requesting with params {single_params}")
             try:
                 appointments = make_optimized_request_paginated('appointments', single_params)
                 logger.debug(f"Clinic {clinic}: Raw API response for AptStatus={status}, Op={op_num}: {len(appointments or [])} records")
-                if appointments is not None:
+                if appointments:
                     logger.debug(f"Clinic {clinic}: AptStatus={status}, Op={op_num} returned {len(appointments)} appointments")
                     all_appointments.extend(appointments)
                 else:
-                    logger.warning(f"Clinic {clinic}: AptStatus={status}, Op={op_num} request failed")
+                    logger.debug(f"Clinic {clinic}: AptStatus={status}, Op={op_num} returned no appointments")
             except Exception as e:
                 logger.error(f"Clinic {clinic}: Error with AptStatus={status}, Op={op_num}: {e}")
             time.sleep(1)
@@ -810,15 +775,14 @@ def fetch_appointments_for_window(
         logger.warning(f"Clinic {clinic}: All AptStatus/Op attempts failed, retrying without status or operatory filter")
         params.pop('AptStatus', None)
         params.pop('Op', None)
-        params['limit'] = PAGE_SIZE  # Ensure limit
         try:
             appointments = make_optimized_request_paginated('appointments', params)
             logger.debug(f"Clinic {clinic}: Raw API response for fallback: {len(appointments or [])} records")
-            if appointments is not None:
+            if appointments:
                 logger.debug(f"Clinic {clinic}: Fallback request returned {len(appointments)} appointments")
                 all_appointments.extend(appointments)
             else:
-                logger.error(f"Clinic {clinic}: Fallback request failed")
+                logger.debug(f"Clinic {clinic}: Fallback request returned no appointments")
         except Exception as e:
             logger.error(f"Clinic {clinic}: Error in fallback request: {e}")
     
@@ -834,21 +798,36 @@ def apply_appointment_filters(
     for appt in appointments:
         apt_num = str(appt.get('AptNum', ''))
         status = str(appt.get('AptStatus', ''))
-        op_num = appt.get('Op')
-        if op_num is None:
-            op_num = appt.get('OperatoryNum')
+        op_num = appt.get('Op') or appt.get('OperatoryNum')
         if appointment_filter.exclude_ghl_tagged and has_ghl_tag(appt):
+            logger.debug(f"Excluding appointment {apt_num} due to GHL tag")
             continue
         if appointment_filter.valid_statuses and status not in appointment_filter.valid_statuses:
+            logger.debug(f"Excluding appointment {apt_num} due to invalid status: {status}")
             continue
         if appointment_filter.operatory_nums and op_num not in appointment_filter.operatory_nums:
+            logger.debug(f"Excluding appointment {apt_num} due to invalid operatory: {op_num}")
             continue
         if status == 'Broken' and appointment_filter.broken_appointment_types:
             apt_type_name = get_appointment_type_name(appt, clinic)
             if apt_type_name not in appointment_filter.broken_appointment_types:
+                logger.debug(f"Excluding broken appointment {apt_num} due to invalid type: {apt_type_name}")
                 continue
         valid.append(appt)
+    logger.info(f"Clinic {clinic}: Filtered {len(appointments)} → {len(valid)} appointments")
     return valid
+
+def deduplicate_appointments(appointments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    unique_appointments = {}
+    for appt in appointments:
+        apt_num = str(appt.get('AptNum', ''))
+        pat_num = str(appt.get('PatNum', ''))
+        apt_date_time = appt.get('AptDateTime', '')
+        key = (apt_num, pat_num, apt_date_time)
+        unique_appointments[key] = appt
+    deduplicated = list(unique_appointments.values())
+    logger.info(f"Deduplicated {len(appointments)} → {len(deduplicated)} appointments")
+    return deduplicated
 
 def fetch_appointments_optimized(
     clinic: int,
@@ -869,30 +848,41 @@ def fetch_appointments_optimized(
     window_type = 'incremental' if window.is_incremental else 'full'
     logger.info(f"Clinic {clinic}: Processing {window_type} sync")
     try:
-        window_appointments = fetch_appointments_for_window(window, appointment_filter, since)
+        window_appointments = fetch_appointments_for_window(window, appointment_filter)
         if window_appointments:
             filtered_appointments = apply_appointment_filters(window_appointments, appointment_filter)
-            all_appointments.extend(filtered_appointments)
-            logger.info(f"Clinic {clinic}: {len(window_appointments)} raw → {len(filtered_appointments)} filtered appointments")
+            deduplicated_appointments = deduplicate_appointments(filtered_appointments)
+            all_appointments.extend(deduplicated_appointments)
+            logger.info(f"Clinic {clinic}: {len(window_appointments)} raw → {len(filtered_appointments)} filtered → {len(deduplicated_appointments)} deduplicated appointments")
         else:
             logger.info(f"Clinic {clinic}: No appointments found")
     except Exception as e:
         logger.error(f"Error processing sync for clinic {clinic}: {e}")
-    unique_appointments = []
-    seen_apt_nums = set()
-    for appt in all_appointments:
-        apt_num = str(appt.get('AptNum', ''))
-        if apt_num and apt_num not in seen_apt_nums:
-            seen_apt_nums.add(apt_num)
-            unique_appointments.append(appt)
-    logger.info(f"Clinic {clinic}: After deduplication, {len(unique_appointments)} appointments")
-    return unique_appointments
+    return all_appointments
 
 # === KERAGON INTEGRATION ===
+def validate_keragon_payload(payload: Dict[str, Any]) -> bool:
+    appt = payload.get('appointment', {})
+    patient = payload.get('patient', {})
+    required_appt_fields = ['AptNum', 'AptStatus', 'AptDateTime', 'ClinicNum', 'PatNum']
+    required_patient_fields = ['FName', 'LName', 'PatNum']
+    
+    missing_appt = [f for f in required_appt_fields if not appt.get(f)]
+    missing_patient = [f for f in required_patient_fields if not patient.get(f)]
+    
+    if missing_appt or missing_patient:
+        logger.error(f"Invalid Keragon payload: Missing appointment fields {missing_appt}, patient fields {missing_patient}")
+        return False
+    return True
+
 def send_to_keragon(appointment: Dict[str, Any], clinic: int, patient_data: Dict[int, Dict[str, Any]], dry_run: bool = False) -> bool:
     try:
         apt_num = str(appointment.get('AptNum', ''))
         pat_num = appointment.get('PatNum')
+        if not pat_num:
+            logger.error(f"Appointment {apt_num}: Missing PatNum")
+            return False
+        
         patient = patient_data.get(pat_num, {})
         start_time_str = appointment.get('AptDateTime', '')
         start_time = parse_time(start_time_str)
@@ -900,31 +890,27 @@ def send_to_keragon(appointment: Dict[str, Any], clinic: int, patient_data: Dict
             logger.error(f"Invalid AptDateTime for appointment {apt_num}: {start_time_str}")
             return False
         
-        # Ensure start_time is in CLINIC_TIMEZONE (GMT-5)
         start_time = start_time.astimezone(CLINIC_TIMEZONE)
         pattern = appointment.get('Pattern', '')
-        end_time = calculate_end_time(start_time, pattern) if start_time and pattern else None
-        
-        # Format times as ISO 8601 in CLINIC_TIMEZONE
-        start_time_iso = start_time.isoformat()  # e.g., 2025-07-23T10:00:00-05:00
-        end_time_iso = end_time.isoformat() if end_time else ''
+        end_time = calculate_end_time(start_time, pattern) if start_time and pattern else start_time + timedelta(minutes=60)
         
         payload = {
             'appointment': {
                 'AptNum': apt_num,
                 'AptStatus': appointment.get('AptStatus', ''),
-                'AptDateTime': start_time_iso,
-                'EndTime': end_time_iso,
+                'AptDateTime': start_time.isoformat(),
+                'EndTime': end_time.isoformat(),
                 'Note': appointment.get('Note', ''),
                 'AppointmentTypeNum': appointment.get('AppointmentTypeNum', ''),
-                'ClinicNum': clinic,
-                'PatNum': pat_num,
-                'OperatoryNum': appointment.get('Op') or appointment.get('OperatoryNum', '')
+                'AppointmentTypeName': get_appointment_type_name(appointment, clinic),
+                'ClinicNum': str(clinic),
+                'PatNum': str(pat_num),
+                'OperatoryNum': str(appointment.get('Op') or appointment.get('OperatoryNum', ''))
             },
             'patient': {
                 'FName': patient.get('FName', ''),
                 'LName': patient.get('LName', ''),
-                'PatNum': patient.get('PatNum', ''),
+                'PatNum': str(pat_num),
                 'Email': patient.get('Email', ''),
                 'Address': patient.get('Address', ''),
                 'HmPhone': patient.get('HmPhone', ''),
@@ -935,23 +921,43 @@ def send_to_keragon(appointment: Dict[str, Any], clinic: int, patient_data: Dict
                 'Gender': patient.get('Gender', '')
             }
         }
+        
+        if not validate_keragon_payload(payload):
+            logger.error(f"Skipping appointment {apt_num} due to invalid payload")
+            return False
+        
         if dry_run:
             logger.info(f"Dry run: Would send appointment {apt_num} to Keragon: {json.dumps(payload, indent=2)}")
             return True
+        
         session = get_optimized_session()
         headers = {'Content-Type': 'application/json'}
-        response = session.post(KERAGON_WEBHOOK_URL, json=payload, headers=headers, timeout=30)
-        if response.status_code in (200, 201, 202):
-            logger.info(f"✓ Successfully sent appointment {apt_num}")
-            return True
-        else:
-            logger.error(f"Failed to send appointment {apt_num}: HTTP {response.status_code} - {response.text}")
-            return False
+        for attempt in range(RETRY_ATTEMPTS):
+            try:
+                response = session.post(KERAGON_WEBHOOK_URL, json=payload, headers=headers, timeout=30)
+                logger.debug(f"Keragon request for {apt_num}: {response.request.url}, Payload: {json.dumps(payload, indent=2)}")
+                if response.status_code in (200, 201, 202):
+                    logger.info(f"✓ Successfully sent appointment {apt_num}")
+                    return True
+                elif response.status_code == 204:
+                    logger.warning(f"Keragon returned 204 for appointment {apt_num}: No content received")
+                    return False
+                else:
+                    logger.error(f"Failed to send appointment {apt_num}: HTTP {response.status_code} - {response.text}")
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Attempt {attempt + 1} failed for appointment {apt_num}: {e}")
+            time.sleep(BACKOFF_FACTOR * (2 ** attempt))
+        logger.error(f"Failed to send appointment {apt_num} after {RETRY_ATTEMPTS} attempts")
+        return False
     except Exception as e:
         logger.error(f"Failed to send appointment {apt_num} to Keragon: {e}")
         return False
 
 def send_batch_to_keragon(appointments: List[Dict[str, Any]], clinic: int, patient_data: Dict[int, Dict[str, Any]], dry_run: bool = False) -> Tuple[int, List[str]]:
+    if not appointments:
+        logger.info("No appointments to send to Keragon")
+        return 0, []
+    
     batch_size = BATCH_SIZE
     successful_sends = 0
     sent_appointment_ids = []
@@ -973,28 +979,33 @@ def process_clinic_optimized(
     sent_appointments: Set[str],
     dry_run: bool = False,
     force_deep_sync: bool = False
-) -> Tuple[int, List[str]]:
+) -> Tuple[int, List[str], datetime.datetime]:
     logger.info(f"Processing clinic {clinic}")
     since = last_syncs.get(clinic)
     appointment_types = get_appointment_types(clinic, force_refresh=force_deep_sync)
     appointments = fetch_appointments_optimized(clinic, since, force_deep_sync)
+    
     new_appointments = []
     pat_nums = set()
     for appt in appointments:
         apt_num = str(appt.get('AptNum', ''))
         if apt_num in sent_appointments:
+            logger.debug(f"Skipping already sent appointment {apt_num}")
             continue
         new_appointments.append(appt)
         pat_num = appt.get('PatNum')
         if pat_num:
             pat_nums.add(pat_num)
+    
     logger.info(f"Clinic {clinic}: Found {len(new_appointments)} new or updated appointments for {len(pat_nums)} patients")
     
     patient_data = fetch_patients_paginated(list(pat_nums))
     
     sent_count, sent_ids = send_batch_to_keragon(new_appointments, clinic, patient_data, dry_run)
     logger.info(f"Clinic {clinic}: Successfully sent {sent_count} appointments")
-    return sent_count, sent_ids
+    
+    sync_time = datetime.datetime.utcnow().replace(tzinfo=timezone.utc)
+    return sent_count, sent_ids, sync_time
 
 def main_loop(dry_run: bool = False, force_deep_sync: bool = False, once: bool = False):
     if not validate_configuration():
@@ -1006,32 +1017,37 @@ def main_loop(dry_run: bool = False, force_deep_sync: bool = False, once: bool =
     
     while True:
         now = datetime.datetime.now(tz=timezone.utc)
-        next_run = get_next_run_time(now)
+        next_run = get_next_run_time(now, force_deep_sync)
         time_to_next = (next_run.astimezone(timezone.utc) - now).total_seconds()
         
         if time_to_next > 0 and not once:
             logger.info(f"Next run at {next_run.astimezone(CLINIC_TIMEZONE)} ({time_to_next/60:.1f} minutes from now)")
-            time.sleep(min(time_to_next, 3600))
+            time.sleep(time_to_next)
             continue
         
         total_sent = 0
         new_sent_ids = []
-        force_deep = force_deep_sync or is_deep_sync_time(now)
-        sync_type = 'deep' if force_deep else 'incremental'
+        sync_type = 'deep' if force_deep_sync or is_deep_sync_time(now) else 'incremental'
         logger.info(f"Starting {sync_type} sync for {len(CLINIC_NUMS)} clinics")
         
         for i, clinic in enumerate(CLINIC_NUMS):
             if i > 0:
                 time.sleep(CLINIC_DELAY_SECONDS)
-            sent_count, sent_ids = process_clinic_optimized(clinic, last_syncs, sent_appointments, dry_run, force_deep)
+            sent_count, sent_ids, sync_time = process_clinic_optimized(
+                clinic, last_syncs, sent_appointments, dry_run, force_deep_sync or is_deep_sync_time(now)
+            )
             total_sent += sent_count
             new_sent_ids.extend(sent_ids)
-            last_syncs[clinic] = datetime.datetime.utcnow().replace(tzinfo=timezone.utc)
+            if validate_sync_time_update(clinic, last_syncs.get(clinic), sync_time):
+                last_syncs[clinic] = sync_time
+            else:
+                logger.warning(f"Clinic {clinic}: Skipping sync time update due to invalid timestamp")
         
         if new_sent_ids:
             sent_appointments.update(new_sent_ids)
             try:
                 save_state_atomically(last_syncs, sent_appointments)
+                logger.info("Committed state and sent appointments")
             except Exception as e:
                 logger.error(f"Failed to save state: {e}")
         
