@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 import os
 import sys
@@ -348,7 +349,7 @@ def get_appointment_type_name(appointment: Dict[str, Any], clinic_num: int) -> s
         if apt_type_name:
             return apt_type_name
         else:
-            logger.warning.toolong(f"No AppointmentTypeName for AppointmentTypeNum {apt_type_num} in clinic {clinic_num}")
+            logger.warning(f"No AppointmentTypeName for AppointmentTypeNum {apt_type_num} in clinic {clinic_num}")
     apt_type_direct = appointment.get('AptType', '') or appointment.get('AppointmentType', '')
     if not apt_type_direct:
         logger.debug(f"No AppointmentTypeNum or AptType for appointment {appointment.get('AptNum')}")
@@ -533,7 +534,7 @@ def make_optimized_request_paginated(endpoint: str, params: Dict[str, Any], meth
             if cached_result:
                 apt_nums = [str(item.get('AptNum', 'N/A')) for item in cached_result if isinstance(item, dict)]
                 logger.debug(f"Records fetched from cache: AptNums={apt_nums}")
-            return cached_result[:52] if endpoint == 'appointments' and params.get('AptStatus') == 'Scheduled' and params.get('Op') == '11580' else cached_result
+            return cached_result  # Return full cached result without restriction
     
     while True:
         params['offset'] = offset
@@ -569,13 +570,6 @@ def make_optimized_request_paginated(endpoint: str, params: Dict[str, Any], meth
                 with open(f'appointments_op_{params.get("Op", "unknown")}_{params.get("AptStatus", "unknown")}.json', 'w') as f:
                     json.dump(all_data, f, indent=2)
                 logger.info(f"Saved {len(all_data)} records to appointments_op_{params.get('Op', 'unknown')}_{params.get('AptStatus', 'unknown')}.json")
-            
-            # Stop at 52 records for AptStatus=Scheduled, Op=11580
-            if endpoint == 'appointments' and params.get('AptStatus') == 'Scheduled' and params.get('Op') == '11580':
-                if len(all_data) >= 52:
-                    all_data = all_data[:52]
-                    logger.info(f"Stopping pagination early at 52 records for AptStatus=Scheduled, Op=11580")
-                    break
             
             if len(data_list) < PAGE_SIZE:
                 break
@@ -758,10 +752,8 @@ def fetch_appointments_for_window(
     since: Optional[datetime.datetime] = None
 ) -> List[Dict[str, Any]]:
     clinic = appointment_filter.clinic_num
-    start_time_utc = (window.start_time.astimezone(timezone.utc)
-                     .replace(hour=0, minute=0, second=0, microsecond=0))
-    end_time_utc = (window.end_time.astimezone(timezone.utc)
-                   .replace(hour=23, minute=59, second=59, microsecond=999999))
+    start_time_utc = window.start_time.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    end_time_utc = window.end_time.astimezone(timezone.utc).replace(hour=23, minute=59, second=59, microsecond=999999)
     logger.info(f"Using PAGE_SIZE={PAGE_SIZE} for clinic {clinic}")  # Log PAGE_SIZE
     params = {
         'ClinicNum': clinic,
