@@ -320,7 +320,7 @@ def get_appointment_types(clinic_num: int, force_refresh: bool = False) -> Dict[
         logger.info(f"Fetching appointment types for clinic {fetch_clinic} (shared for all clinics)")
         params = {
             'ClinicNum': fetch_clinic,
-            'limit': 500,
+            'limit': 400,
             'IsHidden': 'false',
             'fields': 'AppointmentTypeNum,AppointmentTypeName'
         }
@@ -1031,7 +1031,6 @@ def main_loop(dry_run: bool = False, force_deep_sync: bool = False, once: bool =
         if time_to_next > 0 and not once:
             logger.info(f"Next run at {next_run.astimezone(CLINIC_TIMEZONE)} ({time_to_next/60:.1f} minutes from now)")
             time.sleep(time_to_next)
-            continue
         
         total_sent = 0
         new_sent_ids = []
@@ -1063,6 +1062,13 @@ def main_loop(dry_run: bool = False, force_deep_sync: bool = False, once: bool =
         
         if once:
             break
+        # Ensure the sync is fully complete before calculating the next run time
+        now = datetime.datetime.now(tz=timezone.utc)
+        next_run = get_next_run_time(now, force_deep_sync)
+        time_to_next = (next_run.astimezone(timezone.utc) - now).total_seconds()
+        if time_to_next > 0:
+            logger.info(f"Sync completed, waiting for next run at {next_run.astimezone(CLINIC_TIMEZONE)}")
+            time.sleep(time_to_next)
 
 if __name__ == "__main__":
     import argparse
