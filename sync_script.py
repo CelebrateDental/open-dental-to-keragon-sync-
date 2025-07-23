@@ -499,7 +499,7 @@ def calculate_end_time(start_dt: datetime.datetime, pattern: str) -> datetime.da
         dur = 60
     return start_dt + datetime.timedelta(minutes=dur)
 
-# === PAGINATED REQUEST ===
+# === REQUEST HANDLING ===
 def make_optimized_request_paginated(endpoint: str, params: Dict[str, Any], method: str = 'GET', use_cache: bool = True) -> Optional[List[Any]]:
     logger.info(f"Using PAGE_SIZE={PAGE_SIZE} for endpoint {endpoint}")
     if not ENABLE_PAGINATION:
@@ -620,6 +620,76 @@ def make_optimized_request(endpoint: str, params: Dict[str, Any], method: str = 
         logger.error(f"Request to {endpoint} failed: {e}")
         return None
 
+# === PATIENT DATA ===
+def get_patient_details(pat_num: int) -> Dict[str, Any]:
+    global _patient_cache
+    if not pat_num:
+        return {}
+    
+    if pat_num in _patient_cache:
+        logger.debug(f"Patient {pat_num}: Using in-memory cache")
+        return _patient_cache[pat_num]
+    
+    if not _patient_cache:
+        _patient_cache = load_patient_cache()
+    
+    if pat_num in _patient_cache:
+        logger.debug(f"Patient {pat_num}: Using persistent cache")
+        return _patient_cache[pat_num]
+    
+    try:
+        data = make_optimized_request(f'patients/{pat_num}', {})
+        if data is None:
+            logger.warning(f"Failed to fetch patient {pat_num}: No data returned")
+            return {}
+        if isinstance(data, list) and len(data) == 1:
+            patient_data = data[0]
+        elif isinstance(data, dict):
+            patient_data = data
+        else:
+            logger.warning(f"Unexpected response format for patient {pat_num}: {type(data)}")
+            return {}
+        
+        _patient_cache[pat_num] = patient_data
+        save_patient_cache(_patient_cache)
+        logger.info(f"Patient {pat_num}: Fetched and cached")
+        return patient_data
+    except Exception as e:
+        logger.warning(f"Failed to fetch patient {pat_num}: {e}")
+        return {}
+
+def fetch_patients_paginated(pat_nums: List[int]) -> Dict[int, Dict[str, Any]]:
+    global _patient_cache
+    if not pat_nums:
+        logger.info("No patients to fetch")
+        return {}
+    
+    if not _patient_cache:
+        _patient_cache = load_patient_cache()
+    
+    patient_data = {pn: _patient_cache.get(pn, {}) for pn in pat_nums}
+    missing_pat_nums = [pn for pn in pat_nums if not patient_data[pn]]
+    
+    if not missing_pat_nums:
+        logger.info(f"All {len(pat_nums)} patient details found in cache")
+        return patient_data
+    
+    logger.info(f"Fetching details for {len(missing_pat_nums)} patients: {missing_pat_nums}")
+    for pn in missing_pat_nums:
+        try:
+            patient = get_patient_details(pn)
+            if patient:
+                patient_data[pn] = patient
+                logger.info(f"Fetched patient {pn}")
+            else:
+                logger.warning(f"No data returned for patient {pn}")
+            time.sleep(0.5)
+        except Exception as e:
+            logger.error(f"Error fetching patient {pn}: {e}")
+    
+    save_patient_cache(_patient_cache)
+    return patient_data
+
 # === SMART SYNC WINDOW GENERATION ===
 def generate_sync_windows(
     clinic_num: int,
@@ -661,71 +731,6 @@ def generate_sync_windows(
     logger.info(f"Clinic {clinic_num}: Generated {len(windows)} sync window(s)")
     return windows
 
-# === PATIENT DATA ===
-def get_patient_details(pat_num: int) -> Dict[str, Any]:
-    global _patient_cache
-    if not pat_num:
-        return {}
-    
-    if pat_num in _patient_cache:
-        logger.debug(f"Patient {pat_num}: Using in-memory cache")
-        return _patient_cache[pat_num]
-    
-    if not _patient_cache:
-        _patient_cache = load_patient_cache()
-    
-    if pat_num in _patient_cache:
-        logger.debug(f"Patient {pat_num}: Using persistent cache")
-        return _patient_cache[pat_num]
-    
-    try:
-        data = make_optimized_request(f'patients/{pat_num}', {})
-        if data is None:
-            logger.warning(f"Failed to fetch patient {pat_num}: No data returned")
-            return {}
-        if isinstance(data, list) and len(data) == 1:
-            patient_data = data[0]
-        elif isinstance(data, dict):
-            patient_data = data
-        else:
-            logger.warning(f"Unexpected response format for patient {pat_num}: {type(data)}")
-            return {}
-        
-        _patient_cache[pat_num] = patient_data
-        save_patient_cache(_patient_cache)
-        logger.info(f"Patient {pat_num}: Fetched and cached")
-        return patient_data
-    except Exception as e:
-        logger.warning(f"Failed to fetch patient {pat_num}: {e}")
-        return {}
-
-def fetch_patients_paginated(pat_nums: List[int]) -> Dict[int, Dict[str, Any]]:
-    global _patient_cache
-    if not _patient_cache:
-        _patient_cache = load_patient_cache()
-    
-    patient_data = {pn: _patient_cache.get(pn, {}) for pn in pat_nums}
-    missing_pat_nums = [pn for pn in pat_nums if not patient_data[pn]]
-    
-    if not missing_pat_nums:
-        logger.info("All patient details found in cache")
-        return patient_data
-    
-    for pn in missing_pat_nums:
-        try:
-            patient = get_patient_details(pn)
-            if patient:
-                patient_data[pn] = patient
-                logger.info(f"Fetched patient {pn}")
-            else:
-                logger.warning(f"No data returned for patient {pn}")
-            time.sleep(0.5)
-        except Exception as e:
-            logger.error(f"Error fetching patient {pn}: {e}")
-    
-    save_patient_cache(_patient_cache)
-    return patient_data
-
 # === OPTIMIZED APPOINTMENT FETCHING ===
 def fetch_appointments_for_window(
     window: SyncWindow,
@@ -738,7 +743,8 @@ def fetch_appointments_for_window(
         'ClinicNum': clinic,
         'dateStart': start_time_utc.strftime('%Y-%m-%d'),
         'dateEnd': end_time_utc.strftime('%Y-%m-%d'),
-        'limit': PAGE_SIZE
+        'limit': PAGE_SIZE,
+        'fields': ','.join(REQUIRED_APPOINTMENT_FIELDS)
     }
     
     try:
@@ -751,8 +757,10 @@ def fetch_appointments_for_window(
             logger.info(f"Clinic {clinic}: Operatories - {operatory_info}")
         else:
             logger.warning(f"Clinic {clinic}: No operatory data retrieved")
+            return []
     except Exception as e:
         logger.error(f"Clinic {clinic}: Failed to fetch operatory data: {e}")
+        return []
     
     all_appointments = []
     for status in appointment_filter.valid_statuses:
@@ -773,19 +781,7 @@ def fetch_appointments_for_window(
             time.sleep(1)
     
     if not all_appointments:
-        logger.warning(f"Clinic {clinic}: All AptStatus/Op attempts failed, retrying without status or operatory filter")
-        params.pop('AptStatus', None)
-        params.pop('Op', None)
-        try:
-            appointments = make_optimized_request_paginated('appointments', params)
-            logger.debug(f"Clinic {clinic}: Raw API response for fallback: {len(appointments or [])} records")
-            if appointments:
-                logger.debug(f"Clinic {clinic}: Fallback request returned {len(appointments)} appointments")
-                all_appointments.extend(appointments)
-            else:
-                logger.debug(f"Clinic {clinic}: Fallback request returned no appointments")
-        except Exception as e:
-            logger.error(f"Clinic {clinic}: Error in fallback request: {e}")
+        logger.warning(f"Clinic {clinic}: No appointments found for specified operatories and statuses")
     
     logger.debug(f"Clinic {clinic}: {'Incremental' if window.is_incremental else 'Full'} sync returned {len(all_appointments)} appointments")
     return all_appointments
@@ -800,6 +796,10 @@ def apply_appointment_filters(
         apt_num = str(appt.get('AptNum', ''))
         status = str(appt.get('AptStatus', ''))
         op_num = appt.get('Op') or appt.get('OperatoryNum')
+        pat_num = appt.get('PatNum')
+        if not pat_num:
+            logger.debug(f"Excluding appointment {apt_num} due to missing PatNum")
+            continue
         if appointment_filter.exclude_ghl_tagged and has_ghl_tag(appt):
             logger.debug(f"Excluding appointment {apt_num} due to GHL tag")
             continue
@@ -991,10 +991,12 @@ def process_clinic_optimized(
         if apt_num in sent_appointments:
             logger.debug(f"Skipping already sent appointment {apt_num}")
             continue
-        new_appointments.append(appt)
         pat_num = appt.get('PatNum')
         if pat_num:
             pat_nums.add(pat_num)
+            new_appointments.append(appt)
+        else:
+            logger.warning(f"Skipping appointment {apt_num} with missing PatNum")
     
     logger.info(f"Clinic {clinic}: Found {len(new_appointments)} new or updated appointments for {len(pat_nums)} patients")
     
