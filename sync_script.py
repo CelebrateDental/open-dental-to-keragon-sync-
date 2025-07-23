@@ -313,21 +313,17 @@ def get_appointment_types(clinic_num: int, force_refresh: bool = False) -> Dict[
     
     try:
         logger.info(f"Fetching appointment types for clinic {fetch_clinic} (shared for all clinics)")
-        params = {'ClinicNum': fetch_clinic, 'limit': PAGE_SIZE, 'IsHidden': 'false'}
         MAX_APPT_TYPES = 500
+        params = {'ClinicNum': fetch_clinic, 'limit': MAX_APPT_TYPES, 'IsHidden': 'false'}
         appt_types = []
-        offset = 0
-        while len(appt_types) < MAX_APPT_TYPES:
-            params['offset'] = offset
-            data_list = make_optimized_request_paginated('appointmenttypes', params)
-            if data_list is None:
-                logger.error(f"Failed to fetch appointment types for clinic {fetch_clinic}")
-                break
-            appt_types.extend(data_list)
-            logger.debug(f"Fetched {len(data_list)} appointment types at offset {offset}: {[apt['AppointmentTypeNum'] for apt in data_list]}")
-            if len(data_list) < PAGE_SIZE:
-                break
-            offset += PAGE_SIZE
+        data_list = make_optimized_request('appointmenttypes', params)
+        if data_list is None:
+            logger.error(f"Failed to fetch appointment types for clinic {fetch_clinic}")
+            _appointment_types_cache['shared'] = {}
+            save_appointment_types_cache(_appointment_types_cache)
+            return _appointment_types_cache['shared']
+        appt_types.extend(data_list)
+        logger.debug(f"Fetched {len(data_list)} appointment types: {[apt['AppointmentTypeNum'] for apt in data_list]}")
         appt_types = appt_types[:MAX_APPT_TYPES]  # Trim to exactly MAX_APPT_TYPES
         if len(appt_types) >= MAX_APPT_TYPES:
             logger.warning(f"Reached max appointment types ({MAX_APPT_TYPES}) for clinic {fetch_clinic}")
