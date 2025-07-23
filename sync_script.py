@@ -317,7 +317,7 @@ def get_appointment_types(clinic_num: int, force_refresh: bool = False) -> Dict[
         MAX_APPT_TYPES = 500
         appt_types = []
         offset = 0
-        while True:
+        while len(appt_types) < MAX_APPT_TYPES:
             params['offset'] = offset
             data_list = make_optimized_request_paginated('appointmenttypes', params)
             if data_list is None:
@@ -325,9 +325,10 @@ def get_appointment_types(clinic_num: int, force_refresh: bool = False) -> Dict[
                 break
             appt_types.extend(data_list)
             logger.debug(f"Fetched {len(data_list)} appointment types at offset {offset}: {[apt['AppointmentTypeNum'] for apt in data_list]}")
-            if len(appt_types) >= MAX_APPT_TYPES or len(data_list) < PAGE_SIZE:
+            if len(data_list) < PAGE_SIZE:
                 break
             offset += PAGE_SIZE
+        appt_types = appt_types[:MAX_APPT_TYPES]  # Trim to exactly MAX_APPT_TYPES
         if len(appt_types) >= MAX_APPT_TYPES:
             logger.warning(f"Reached max appointment types ({MAX_APPT_TYPES}) for clinic {fetch_clinic}")
         
