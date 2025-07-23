@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 import os
 import sys
@@ -609,7 +610,6 @@ def apply_appointment_filters(
         op_num = appt.get('Op')
         if op_num is None:
             op_num = appt.get('OperatoryNum')
-
         if appointment_filter.exclude_ghl_tagged and has_ghl_tag(appt):
             continue
         if appointment_filter.valid_statuses and status not in appointment_filter.valid_statuses:
@@ -738,7 +738,16 @@ def get_patient_details(pat_num: int) -> Dict[str, Any]:
         return {}
     try:
         data = make_optimized_request(f'patients/{pat_num}', {})
-        return data if data else {}
+        if data is None:
+            logger.warning(f"Failed to fetch patient {pat_num}: No data returned")
+            return {}
+        if isinstance(data, list) and len(data) == 1:
+            return data[0]  # Extract single patient dictionary
+        elif isinstance(data, dict):
+            return data  # Handle case where API returns dictionary directly
+        else:
+            logger.warning(f"Unexpected response format for patient {pat_num}: {type(data)}")
+            return {}
     except Exception as e:
         logger.warning(f"Failed to fetch patient {pat_num}: {e}")
         return {}
