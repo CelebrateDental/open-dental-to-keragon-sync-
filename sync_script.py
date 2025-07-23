@@ -56,7 +56,7 @@ ENABLE_CACHING = os.environ.get('ENABLE_CACHING', 'true').lower() == 'true'
 CACHE_EXPIRY_MINUTES = int(os.environ.get('CACHE_EXPIRY_MINUTES', '30'))
 USE_SPECIFIC_FIELDS = os.environ.get('USE_SPECIFIC_FIELDS', 'true').lower() == 'true'
 ENABLE_PAGINATION = os.environ.get('ENABLE_PAGINATION', 'true').lower() == 'true'
-PAGE_SIZE = int(os.environ.get('PAGE_SIZE', '50'))
+PAGE_SIZE = int(os.environ.get('PAGE_SIZE', '100'))
 MAX_RECORDS_PER_REQUEST = int(os.environ.get('MAX_RECORDS_PER_REQUEST', '500'))
 
 CLINIC_NUMS = [int(x) for x in os.environ.get('CLINIC_NUMS', '').split(',') if x.strip().isdigit()]
