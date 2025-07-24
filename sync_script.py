@@ -730,6 +730,7 @@ def generate_sync_windows(
         ))
     logger.info(f"Clinic {clinic_num}: Generated {len(windows)} sync window(s)")
     return windows
+
 # === OPTIMIZED APPOINTMENT FETCHING ===
 def fetch_appointments_for_window(
     window: SyncWindow,
@@ -842,14 +843,15 @@ def fetch_appointments_optimized(
         broken_appointment_types=CLINIC_BROKEN_APPOINTMENT_TYPE_FILTERS.get(clinic, []),
         exclude_ghl_tagged=True
     )
-    start, end = generate_sync_windows(clinic, since, force_deep_sync)
-    window_type = 'incremental' if not (force_deep_sync or since is None) else 'full'
-    logger.info(f"Clinic {clinic}: Processing {window_type} sync from {start} to {end}")
+    windows = generate_sync_windows(clinic, since, force_deep_sync)
+    window = windows[0]  # Use the first (and only) window
+    window_type = 'incremental' if window.is_incremental else 'full'
+    logger.info(f"Clinic {clinic}: Processing {window_type} sync from {window.start_time} to {window.end_time}")
     
     params = {
         'ClinicNum': str(clinic),
-        'dateStart': start.strftime('%Y-%m-%d'),  # Date-only format
-        'dateEnd': end.strftime('%Y-%m-%d'),     # Date-only format
+        'dateStart': window.start_time.strftime('%Y-%m-%d'),  # Date-only format
+        'dateEnd': window.end_time.strftime('%Y-%m-%d'),     # Date-only format
         'AptStatus': ','.join(str(s) for s in appointment_filter.valid_statuses)
     }
     if appointment_filter.operatory_nums:
@@ -860,7 +862,7 @@ def fetch_appointments_optimized(
         # Apply DateTStamp filter first
         time_filtered_appointments = [
             appt for appt in window_appointments
-            if start <= parse_time(appt.get('DateTStamp', '')) <= end
+            if window.start_time <= parse_time(appt.get('DateTStamp', '')) <= window.end_time
         ]
         # Apply additional filters
         filtered_appointments = apply_appointment_filters(time_filtered_appointments, appointment_filter)
