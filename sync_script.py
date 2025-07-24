@@ -848,36 +848,65 @@ def fetch_appointments_optimized(
     window_type = 'incremental' if window.is_incremental else 'full'
     logger.info(f"Clinic {clinic}: Processing {window_type} sync from {window.start_time} to {window.end_time}")
     
+    all_appointments = []
     params = {
         'ClinicNum': str(clinic),
-        'dateStart': window.start_time.strftime('%Y-%m-%d'),  # Date-only format
-        'dateEnd': window.end_time.strftime('%Y-%m-%d'),     # Date-only format
-        'AptStatus': ','.join(str(s) for s in appointment_filter.valid_statuses)
+        'dateStart': window.start_time.strftime('%Y-%m-%d'),
+        'dateEnd': window.end_time.strftime('%Y-%m-%d'),
+        'limit': PAGE_SIZE,
+        'fields': ','.join(REQUIRED_APPOINTMENT_FIELDS)
     }
-    if appointment_filter.operatory_nums:
-        params['Op'] = ','.join(str(op) for op in appointment_filter.operatory_nums)
     
     try:
-        window_appointments = make_optimized_request_paginated('appointments', params)
-        # Apply DateTStamp filter first
-        time_filtered_appointments = [
-            appt for appt in window_appointments
-            if window.start_time <= parse_time(appt.get('DateTStamp', '')) <= window.end_time
-        ]
-        # Apply additional filters
-        filtered_appointments = apply_appointment_filters(time_filtered_appointments, appointment_filter)
-        # Deduplicate
-        deduplicated_appointments = deduplicate_appointments(filtered_appointments)
-        logger.info(
-            f"Clinic {clinic}: {len(window_appointments)} raw → "
-            f"{len(time_filtered_appointments)} time-filtered → "
-            f"{len(filtered_appointments)} filtered → "
-            f"{len(deduplicated_appointments)} deduplicated appointments"
-        )
-        return deduplicated_appointments
+        operatory_data = make_optimized_request_paginated('operatories', {'ClinicNum': clinic, 'limit': PAGE_SIZE})
+        if operatory_data:
+            operatory_info = [
+                {'OperatoryNum': op.get('OperatoryNum'), 'OperatoryName': op.get('OpName', 'Unknown')}
+                for op in operatory_data if op.get('OperatoryNum') in appointment_filter.operatory_nums
+            ]
+            logger.info(f"Clinic {clinic}: Operatories - {operatory_info}")
+        else:
+            logger.warning(f"Clinic {clinic}: No operatory data retrieved")
+            return []
     except Exception as e:
-        logger.error(f"Error processing sync for clinic {clinic}: {e}")
+        logger.error(f"Clinic {clinic}: Failed to fetch operatory data: {e}")
         return []
+    
+    for status in appointment_filter.valid_statuses:
+        for op_num in appointment_filter.operatory_nums:
+            single_params = params.copy()
+            single_params['AptStatus'] = status
+            single_params['Op'] = str(op_num)
+            try:
+                appointments = make_optimized_request_paginated('appointments', single_params)
+                if appointments is None:
+                    logger.error(f"Clinic {clinic}: No appointments returned for AptStatus={status}, Op={op_num}")
+                    continue
+                logger.debug(f"Clinic {clinic}: AptStatus={status}, Op={op_num} returned {len(appointments)} appointments")
+                all_appointments.extend(appointments)
+            except Exception as e:
+                logger.error(f"Clinic {clinic}: Error fetching appointments for AptStatus={status}, Op={op_num}: {e}")
+            time.sleep(1)
+    
+    if not all_appointments:
+        logger.warning(f"Clinic {clinic}: No appointments found for specified operatories and statuses")
+    
+    # Apply DateTStamp filter
+    time_filtered_appointments = [
+        appt for appt in all_appointments
+        if window.start_time <= parse_time(appt.get('DateTStamp', '')) <= window.end_time
+    ]
+    # Apply additional filters
+    filtered_appointments = apply_appointment_filters(time_filtered_appointments, appointment_filter)
+    # Deduplicate
+    deduplicated_appointments = deduplicate_appointments(filtered_appointments)
+    logger.info(
+        f"Clinic {clinic}: {len(all_appointments)} raw → "
+        f"{len(time_filtered_appointments)} time-filtered → "
+        f"{len(filtered_appointments)} filtered → "
+        f"{len(deduplicated_appointments)} deduplicated appointments"
+    )
+    return deduplicated_appointments
 
 # === KERAGON INTEGRATION ===
 def validate_keragon_payload(payload: Dict[str, Any]) -> bool:
@@ -935,7 +964,7 @@ def send_to_keragon(appointment: Dict[str, Any], clinic: int, patient_data: Dict
                 'HmPhone': patient.get('HmPhone', ''),
                 'WkPhone': patient.get('WkPhone', ''),
                 'Birthdate': patient.get('Birthdate', ''),
-                'State': patient.get('State', ''),
+                'State': player.get('State', ''),
                 'Zip': patient.get('Zip', ''),
                 'WirelessPh': patient.get('WirelessPhone', ''),
                 'Gender': patient.get('Gender', '')
