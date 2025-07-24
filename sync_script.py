@@ -964,7 +964,7 @@ def send_to_keragon(appointment: Dict[str, Any], clinic: int, patient_data: Dict
                 'HmPhone': patient.get('HmPhone', ''),
                 'WkPhone': patient.get('WkPhone', ''),
                 'Birthdate': patient.get('Birthdate', ''),
-                'State': player.get('State', ''),
+                'State': patient.get('State', ''),
                 'Zip': patient.get('Zip', ''),
                 'WirelessPh': patient.get('WirelessPhone', ''),
                 'Gender': patient.get('Gender', '')
