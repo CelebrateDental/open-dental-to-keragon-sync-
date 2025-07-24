@@ -68,7 +68,7 @@ CLINIC_OPERATORY_FILTERS: Dict[int, List[int]] = {
 
 CLINIC_BROKEN_APPOINTMENT_TYPE_FILTERS: Dict[int, List[str]] = {
     9034: ["COMP EX", "COMP EX CHILD"],
-    9035: ["CASH CONSULT", "INSURANCE CONSULT"]
+    9035: ["CASH CONSULT", "INSURANCE CONSULT", "INS CONSULT"]
 }
 
 VALID_STATUSES = {'Scheduled', 'Complete', 'Broken'}
