@@ -2,12 +2,9 @@ name: Open Dental to Keragon Sync
 
 on:
   schedule:
-    # Deep sync at 2 AM CDT (7 AM UTC, CDT is GMT-5 in July)
-    - cron: '0 7 * * *'
-    # Incremental sync every 15 minutes from 8 AM to 8 PM CDT (1 PM–11:59 PM UTC)
-    - cron: '0,15,30,45 13-23 * * *'
-    # Incremental sync every 15 minutes from 8 PM CDT (12 AM–1 AM UTC next day)
-    - cron: '0,15,30,45 0-1 * * *'
+    - cron: '0 7 * * *'  # Deep sync at 2 AM CDT (7 AM UTC)
+    - cron: '0,15,30,45 13-23 * * *'  # Incremental sync 8 AM–8 PM CDT
+    - cron: '0,15,30,45 0-1 * * *'  # Incremental sync 8 PM CDT
   workflow_dispatch:
 
 concurrency:
@@ -45,7 +42,7 @@ jobs:
         with:
           name: patient-cache
           path: .
-        continue-on-error: true  # Don't fail if artifact doesn't exist (e.g., first run)
+        continue-on-error: true
 
       - name: Check for last_sync_state.json
         id: check_state
@@ -53,7 +50,7 @@ jobs:
           if [ -f last_sync_state.json ]; then
             echo "state_file_exists=true" >> $GITHUB_OUTPUT
           else
-            echo "state_file_exists=true" >> $GITHUB_OUTPUT  # Force deep sync if no state
+            echo "state_file_exists=false" >> $GITHUB_OUTPUT
           fi
 
       - name: Debug workspace files before sync
@@ -107,17 +104,19 @@ jobs:
             cat patient_cache.json
           else
             echo "patient_cache.json not found"
+            echo "Creating empty patient_cache.json to ensure upload"
+            echo '{"cache_date": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'", "patients": {}}' > patient_cache.json
           fi
 
       - name: Upload patient cache
-        if: always()  # Upload even if sync fails to preserve cache
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: patient-cache
           path: patient_cache.json
-          retention-days: 30
-          if-no-files-found: warn  # Warn instead of error if file is missing
-          compression-level: 6  # Default compression
+          retention-days: 120
+          if-no-files-found: warn
+          compression-level: 6
 
       - name: Upload appointment types cache
         if: always()
