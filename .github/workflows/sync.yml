@@ -89,7 +89,6 @@ jobs:
           # Only add files if they exist
           [ -f last_sync_state.json ] && git add last_sync_state.json
           [ -f sent_appointments.json ] && git add sent_appointments.json
-          [ -f patient_cache.json ] && git add patient_cache.json
           [ -f appointment_types_cache.json ] && git add appointment_types_cache.json
           [ -f appointment_cache.json ] && git add appointment_cache.json
           git diff --cached --quiet || (
