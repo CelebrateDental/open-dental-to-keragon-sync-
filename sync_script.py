@@ -988,15 +988,19 @@ def process_clinic_optimized(
     pat_nums = set()
     for appt in appointments:
         apt_num = str(appt.get('AptNum', ''))
-        if apt_num in sent_appointments:
-            logger.debug(f"Skipping already sent appointment {apt_num}")
-            continue
         pat_num = appt.get('PatNum')
-        if pat_num:
-            pat_nums.add(pat_num)
-            new_appointments.append(appt)
-        else:
+        if not pat_num:
             logger.warning(f"Skipping appointment {apt_num} with missing PatNum")
+            continue
+        
+        # Check if the appointment is new or updated
+        date_tstamp = parse_time(appt.get('DateTStamp'))
+        if apt_num in sent_appointments and (since is None or date_tstamp is None or date_tstamp <= since):
+            logger.debug(f"Skipping already sent appointment {apt_num} with no recent updates")
+            continue
+        
+        pat_nums.add(pat_num)
+        new_appointments.append(appt)
     
     logger.info(f"Clinic {clinic}: Found {len(new_appointments)} new or updated appointments for {len(pat_nums)} patients")
     
