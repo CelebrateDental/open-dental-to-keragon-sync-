@@ -40,6 +40,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests python-dateutil
 
+      - name: Download patient cache
+        uses: actions/download-artifact@v4
+        with:
+          name: patient-cache
+          path: .
+        continue-on-error: true  # Don't fail if artifact doesn't exist (e.g., first run)
+
       - name: Check for last_sync_state.json
         id: check_state
         run: |
@@ -78,6 +85,14 @@ jobs:
             echo "Running incremental sync"
             python3 sync_script.py --verbose --once
           fi
+
+      - name: Upload patient cache
+        if: always()  # Upload even if sync fails to preserve cache
+        uses: actions/upload-artifact@v4
+        with:
+          name: patient-cache
+          path: patient_cache.json
+          retention-days: 30  # Retain for 30 days, adjust as needed
 
       - name: Commit and push state files
         if: steps.sync.outcome == 'success'
