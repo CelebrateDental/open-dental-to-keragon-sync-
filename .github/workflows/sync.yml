@@ -8,8 +8,8 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: sync-open-dental-to-keragon
-  cancel-in-progress: true
+  group: sync-open-dental-to-keragon-${{ github.event_name == 'schedule' && github.event.schedule || 'manual' }}
+  cancel-in-progress: false
 
 jobs:
   sync:
@@ -37,12 +37,32 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests python-dateutil
 
+      - name: Find latest patient-cache artifact
+        id: find-artifact
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Fetching latest patient-cache artifact"
+          ARTIFACT=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/actions/artifacts | \
+            jq -r '.artifacts | sort_by(.created_at) | reverse | .[] | select(.name == "patient-cache" and .expired == false) | .id' | head -1)
+          if [ -n "$ARTIFACT" ]; then
+            echo "artifact_id=$ARTIFACT" >> $GITHUB_OUTPUT
+            echo "Found patient-cache artifact ID: $ARTIFACT"
+          else
+            echo "No patient-cache artifact found"
+            echo "artifact_id=" >> $GITHUB_OUTPUT
+          fi
+
       - name: Download patient cache
         id: download
+        if: steps.find-artifact.outputs.artifact_id != ''
         uses: actions/download-artifact@v4
         with:
           name: patient-cache
           path: .
+          github-token: ${{ secrets.GITHUB_TOKEN }}
         continue-on-error: true
 
       - name: Debug download artifact
@@ -54,6 +74,12 @@ jobs:
           else
             echo "Failed to download patient-cache artifact (expected for first run or if missing)"
           fi
+
+      - name: Initialize patient cache if missing
+        if: steps.download.outcome != 'success'
+        run: |
+          echo "No patient-cache artifact downloaded, creating empty patient_cache.json"
+          echo '{"cache_date": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'", "patients": {}}' > patient_cache.json
 
       - name: Check for last_sync_state.json
         id: check_state
@@ -87,7 +113,7 @@ jobs:
           INCREMENTAL_SYNC_MINUTES: "15"
           DEEP_SYNC_HOURS: "720"
           SAFETY_OVERLAP_HOURS: "2"
-          ENABLE_CACHING: "true"
+          ENABLE_CACING: "true"
           CACHE_EXPIRY_MINUTES: "30"
           USE_SPECIFIC_FIELDS: "false"
           ENABLE_PAGINATION: "true"
