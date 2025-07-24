@@ -844,7 +844,7 @@ def fetch_appointments_optimized(
         exclude_ghl_tagged=True
     )
     windows = generate_sync_windows(clinic, since, force_deep_sync)
-    window = windows[0]  # Use the first (and only) window
+    window = windows[0]
     window_type = 'incremental' if window.is_incremental else 'full'
     logger.info(f"Clinic {clinic}: Processing {window_type} sync from {window.start_time} to {window.end_time}")
     
@@ -891,14 +891,11 @@ def fetch_appointments_optimized(
     if not all_appointments:
         logger.warning(f"Clinic {clinic}: No appointments found for specified operatories and statuses")
     
-    # Apply DateTStamp filter
     time_filtered_appointments = [
         appt for appt in all_appointments
         if window.start_time <= parse_time(appt.get('DateTStamp', '')) <= window.end_time
     ]
-    # Apply additional filters
     filtered_appointments = apply_appointment_filters(time_filtered_appointments, appointment_filter)
-    # Deduplicate
     deduplicated_appointments = deduplicate_appointments(filtered_appointments)
     logger.info(
         f"Clinic {clinic}: {len(all_appointments)} raw → "

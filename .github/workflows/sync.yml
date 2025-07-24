@@ -38,11 +38,22 @@ jobs:
           pip install requests python-dateutil
 
       - name: Download patient cache
+        id: download
         uses: actions/download-artifact@v4
         with:
           name: patient-cache
           path: .
         continue-on-error: true
+
+      - name: Debug download artifact
+        run: |
+          echo "## Download artifact status"
+          if [ "${{ steps.download.outcome }}" == "success" ]; then
+            echo "Successfully downloaded patient-cache artifact"
+            ls -l patient_cache.json || echo "patient_cache.json not found after download"
+          else
+            echo "Failed to download patient-cache artifact (expected for first run or if missing)"
+          fi
 
       - name: Check for last_sync_state.json
         id: check_state
@@ -114,7 +125,7 @@ jobs:
         with:
           name: patient-cache
           path: patient_cache.json
-          retention-days: 120
+          retention-days: 30
           if-no-files-found: warn
           compression-level: 6
 
