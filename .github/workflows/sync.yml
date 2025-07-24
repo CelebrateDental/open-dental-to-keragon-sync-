@@ -53,7 +53,18 @@ jobs:
           if [ -f last_sync_state.json ]; then
             echo "state_file_exists=true" >> $GITHUB_OUTPUT
           else
-            echo "state_file_exists=false" >> $GITHUB_OUTPUT
+            echo "state_file_exists=true" >> $GITHUB_OUTPUT  # Force deep sync if no state
+          fi
+
+      - name: Debug workspace files before sync
+        run: |
+          echo "## Workspace files before sync"
+          find $GITHUB_WORKSPACE -type f
+          if [ -f patient_cache.json ]; then
+            echo "patient_cache.json contents:"
+            cat patient_cache.json
+          else
+            echo "patient_cache.json not found"
           fi
 
       - name: Run sync
@@ -86,13 +97,36 @@ jobs:
             python3 sync_script.py --verbose --once
           fi
 
+      - name: Debug workspace files after sync
+        if: always()
+        run: |
+          echo "## Workspace files after sync"
+          find $GITHUB_WORKSPACE -type f
+          if [ -f patient_cache.json ]; then
+            echo "patient_cache.json contents:"
+            cat patient_cache.json
+          else
+            echo "patient_cache.json not found"
+          fi
+
       - name: Upload patient cache
         if: always()  # Upload even if sync fails to preserve cache
         uses: actions/upload-artifact@v4
         with:
           name: patient-cache
           path: patient_cache.json
-          retention-days: 30  # Retain for 30 days, adjust as needed
+          retention-days: 30
+          if-no-files-found: warn  # Warn instead of error if file is missing
+          compression-level: 6  # Default compression
+
+      - name: Upload appointment types cache
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: appointment-types-cache
+          path: appointment_types_cache.json
+          retention-days: 30
+          if-no-files-found: warn
 
       - name: Commit and push state files
         if: steps.sync.outcome == 'success'
