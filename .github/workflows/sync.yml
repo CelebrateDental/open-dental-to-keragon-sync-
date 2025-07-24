@@ -58,11 +58,17 @@ jobs:
       - name: Download patient cache
         id: download
         if: steps.find-artifact.outputs.artifact_id != ''
-        uses: actions/download-artifact@v4
-        with:
-          name: patient-cache
-          path: .
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Downloading patient-cache artifact ID: ${{ steps.find-artifact.outputs.artifact_id }}"
+          curl -L -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/actions/artifacts/${{ steps.find-artifact.outputs.artifact_id }}/zip \
+            -o patient-cache.zip
+          unzip -o patient-cache.zip -d .
+          rm patient-cache.zip
+          ls -l patient_cache.json || echo "patient_cache.json not found after download"
         continue-on-error: true
 
       - name: Debug download artifact
@@ -113,7 +119,7 @@ jobs:
           INCREMENTAL_SYNC_MINUTES: "15"
           DEEP_SYNC_HOURS: "720"
           SAFETY_OVERLAP_HOURS: "2"
-          ENABLE_CACING: "true"
+          ENABLE_CACHING: "true"
           CACHE_EXPIRY_MINUTES: "30"
           USE_SPECIFIC_FIELDS: "false"
           ENABLE_PAGINATION: "true"
@@ -130,6 +136,13 @@ jobs:
             echo "Running incremental sync"
             python3 sync_script.py --verbose --once
           fi
+
+      - name: Clean up debug appointment files
+        if: always()
+        run: |
+          echo "Cleaning up debug appointment files"
+          rm -f appointments_op_*.json
+          echo "Removed appointments_op_*.json files"
 
       - name: Debug workspace files after sync
         if: always()

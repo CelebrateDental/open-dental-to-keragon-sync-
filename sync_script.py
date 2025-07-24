@@ -367,16 +367,54 @@ def load_patient_cache() -> Dict[int, Dict[str, Any]]:
 
 def save_patient_cache(patient_cache: Dict[int, Dict[str, Any]]):
     temp_file = None
+    existing_patients = {}
+    
+    # Load existing patient cache if it exists
+    if os.path.exists(PATIENT_CACHE_FILE):
+        try:
+            with open(PATIENT_CACHE_FILE, 'r') as f:
+                existing_data = json.load(f)
+                existing_patients = {int(k): v for k, v in existing_data.get('patients', {}).items()}
+                existing_cache_date = existing_data.get('cache_date', '')
+                logger.debug(f"Loaded existing patient cache with {len(existing_patients)} patients, dated {existing_cache_date}")
+        except Exception as e:
+            logger.error(f"Failed to load existing patient cache: {e}")
+    
+    # Merge existing patients with new patient_cache
+    merged_patients = existing_patients.copy()
+    new_patients_count = 0
+    updated_patients_count = 0
+    
+    for patnum, patient_data in patient_cache.items():
+        if patnum not in merged_patients:
+            merged_patients[patnum] = patient_data
+            new_patients_count += 1
+        else:
+            # Update only if new data is more recent (based on DateTStamp or similar)
+            existing_timestamp = merged_patients[patnum].get('DateTStamp', '')
+            new_timestamp = patient_data.get('DateTStamp', '')
+            if new_timestamp and (not existing_timestamp or new_timestamp > existing_timestamp):
+                merged_patients[patnum] = patient_data
+                updated_patients_count += 1
+    
+    # Write merged cache to file
     try:
         with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.tmp', dir=os.path.dirname(PATIENT_CACHE_FILE) or '.') as f:
             cache_data = {
                 'cache_date': datetime.datetime.now(CLINIC_TIMEZONE).isoformat(),
-                'patients': {str(k): v for k, v in patient_cache.items()}
+                'patients': {str(k): v for k, v in merged_patients.items()}
             }
             json.dump(cache_data, f, indent=2)
             temp_file = f.name
         shutil.move(temp_file, PATIENT_CACHE_FILE)
-        logger.info(f"Saved patient cache to {PATIENT_CACHE_FILE}")
+        logger.info(f"Saved patient cache to {PATIENT_CACHE_FILE} with {len(merged_patients)} patients "
+                    f"({new_patients_count} new, {updated_patients_count} updated)")
+        if len(merged_patients) == 0:
+            logger.warning(f"Saved empty patient cache to {PATIENT_CACHE_FILE}")
+        if os.path.exists(PATIENT_CACHE_FILE):
+            logger.debug(f"Verified patient_cache.json exists at {PATIENT_CACHE_FILE}")
+        else:
+            logger.error(f"patient_cache.json was not created at {PATIENT_CACHE_FILE}")
     except Exception as e:
         logger.error(f"Failed to save patient cache: {e}")
         if temp_file and os.path.exists(temp_file):
@@ -384,6 +422,12 @@ def save_patient_cache(patient_cache: Dict[int, Dict[str, Any]]):
                 os.unlink(temp_file)
             except:
                 pass
+        # Create empty file as fallback
+        logger.warning(f"Creating empty patient_cache.json due to error")
+        with open(PATIENT_CACHE_FILE, 'w') as f:
+            json.dump({'cache_date': datetime.datetime.now(CLINIC_TIMEZONE).isoformat(), 'patients': {}}, f, indent=2)
+        if os.path.exists(PATIENT_CACHE_FILE):
+            logger.debug(f"Created empty patient_cache.json at {PATIENT_CACHE_FILE}")
 
 # === STATE MANAGEMENT ===
 def load_last_sync_times() -> Dict[int, Optional[datetime.datetime]]:
