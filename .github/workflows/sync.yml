@@ -9,7 +9,7 @@ on:
 
 concurrency:
   group: sync-open-dental-to-keragon-${{ github.event_name == 'schedule' && github.event.schedule || 'manual' }}
-  cancel-in-progress: false
+  cancel-in-progress: true  # Cancel concurrent runs to avoid cache conflicts
 
 jobs:
   sync:
@@ -44,8 +44,9 @@ jobs:
           path: |
             patient_cache.json
             appointment_types_cache.json
-          key: sync-cache-${{ github.run_id }}
+          key: sync-cache-patients
           restore-keys: |
+            sync-cache-patients-
             sync-cache-
         continue-on-error: true
 
@@ -201,12 +202,23 @@ jobs:
 
       - name: Save cache
         if: always()
+        id: save-cache
         uses: actions/cache@v3
         with:
           path: |
             patient_cache.json
             appointment_types_cache.json
-          key: sync-cache-${{ github.run_id }}
+          key: sync-cache-patients
+
+      - name: Debug cache save
+        if: always()
+        run: |
+          echo "## Cache save status"
+          if [ "${{ steps.save-cache.outcome }}" == "success" ]; then
+            echo "Cache saved successfully with key sync-cache-patients"
+          else
+            echo "Cache save failed, possibly due to concurrent run or cache reservation"
+          fi
 
       - name: Commit and push state files
         if: steps.sync.outcome == 'success'
