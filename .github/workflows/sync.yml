@@ -35,24 +35,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests python-dateutil
-
-      - name: Acquire lock to prevent concurrent runs
-        run: |
-          echo "Acquiring lock to prevent concurrent runs"
-          for i in {1..10}; do
-            if [ ! -f lockfile ]; then
-              echo "Lock acquired" > lockfile
-              echo "Lock acquired successfully"
-              break
-            fi
-            echo "Lockfile exists, waiting... (attempt $i)"
-            sleep 30
-          done
-          if [ ! -f lockfile ]; then
-            echo "Failed to acquire lock after 10 attempts"
-            exit 1
-          fi
+          pip install requests python-dateutil jq
 
       - name: Restore cache
         id: restore-cache
@@ -61,7 +44,7 @@ jobs:
           path: |
             patient_cache.json
             appointment_types_cache.json
-          key: sync-cache-patients-${{ github.run_number }}
+          key: sync-cache-patients-${{ github.run_number }}-${{ github.run_attempt }}
           restore-keys: |
             sync-cache-patients-
         continue-on-error: true
@@ -69,13 +52,13 @@ jobs:
       - name: Debug cache restore
         run: |
           echo "## Cache restore status"
-          if [ "${{ steps.restore-cache.outputs.cache-hit }}" == "true" ]; then
-            echo "Cache hit: Successfully restored patient_cache.json and appointment_types_cache.json"
+          if [ -f patient_cache.json ] || [ -f appointment_types_cache.json ]; then
+            echo "Cache hit: Successfully restored cache"
             ls -l patient_cache.json appointment_types_cache.json || echo "Cache files not found after restore"
             if [ -f patient_cache.json ]; then
               echo "patient_cache.json contents:"
               cat patient_cache.json
-              jq '.patients | length' patient_cache.json || echo "Failed to count patients"
+              echo "Number of patients: $(jq '.patients | length' patient_cache.json || echo 'Failed to count patients')"
             fi
             if [ -f appointment_types_cache.json ]; then
               echo "appointment_types_cache.json contents:"
@@ -87,15 +70,21 @@ jobs:
           fi
 
       - name: Initialize patient cache if missing
-        if: steps.restore-cache.outputs.cache-hit != 'true'
+        if: steps.restore-cache.outputs.cache-hit != 'true' && !exists('patient_cache.json')
         run: |
           echo "No patient cache restored, creating patient_cache.json with initial data"
-          cat << EOF > patient_cache.json
-          {
-            "cache_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-            "patients": {}
-          }
-          EOF
+          if [ -f init_patient_cache.py ]; then
+            echo "Running init_patient_cache.py to seed patient_cache.json"
+            python3 init_patient_cache.py
+          else
+            echo "init_patient_cache.py not found, creating empty patient_cache.json"
+            cat << EOF > patient_cache.json
+            {
+              "cache_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+              "patients": {}
+            }
+            EOF
+          fi
           if [ ! -f appointment_types_cache.json ]; then
             echo "No appointment types cache restored, creating empty appointment_types_cache.json"
             echo '{"cache_date": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'", "appointment_types": {"shared": {}}}' > appointment_types_cache.json
@@ -117,7 +106,7 @@ jobs:
           if [ -f patient_cache.json ]; then
             echo "patient_cache.json contents:"
             cat patient_cache.json
-            jq '.patients | length' patient_cache.json || echo "Failed to count patients"
+            echo "Number of patients: $(jq '.patients | length' patient_cache.json || echo 'Failed to count patients')"
           else
             echo "patient_cache.json not found"
           fi
@@ -137,7 +126,6 @@ jobs:
             grep -q "last_sync_state.json" .gitignore || echo "Warning: last_sync_state.json not in .gitignore"
             grep -q "sent_appointments.json" .gitignore || echo "Warning: sent_appointments.json not in .gitignore"
             grep -q "appointment_cache.json" .gitignore || echo "Warning: appointment_cache.json not in .gitignore"
-            grep -q "lockfile" .gitignore || echo "Warning: lockfile not in .gitignore"
           else
             echo "Error: .gitignore file not found, sensitive files may be exposed"
           fi
@@ -187,7 +175,7 @@ jobs:
           if [ -f patient_cache.json ]; then
             echo "patient_cache.json contents:"
             cat patient_cache.json
-            jq '.patients | length' patient_cache.json || echo "Failed to count patients"
+            echo "Number of patients: $(jq '.patients | length' patient_cache.json || echo 'Failed to count patients')"
           else
             echo "patient_cache.json not found"
             echo "Creating empty patient_cache.json to ensure cache save"
@@ -210,31 +198,31 @@ jobs:
           path: |
             patient_cache.json
             appointment_types_cache.json
-          key: sync-cache-patients-${{ github.run_number }}
+          key: sync-cache-patients-${{ github.run_number }}-${{ github.run_attempt }}
 
       - name: Debug cache save
         if: always()
         run: |
           echo "## Cache save status"
           if [ "${{ steps.save-cache.outcome }}" == "success" ]; then
-            echo "Cache saved successfully with key sync-cache-patients-${{ github.run_number }}"
+            echo "Cache saved successfully with key sync-cache-patients-${{ github.run_number }}-${{ github.run_attempt }}"
             echo "Cache contents:"
             ls -l patient_cache.json appointment_types_cache.json || echo "Cache files not found"
             if [ -f patient_cache.json ]; then
               echo "patient_cache.json contents:"
               cat patient_cache.json
-              jq '.patients | length' patient_cache.json || echo "Failed to count patients"
+              echo "Number of patients: $(jq '.patients | length' patient_cache.json || echo 'Failed to count patients')"
             fi
           else
-            echo "Cache save failed, possibly due to concurrent run or cache reservation"
+            echo "Cache save failed, possibly due to cache reservation or backend issue"
+            echo "Cache contents (unsaved):"
+            ls -l patient_cache.json appointment_types_cache.json || echo "Cache files not found"
+            if [ -f patient_cache.json ]; then
+              echo "patient_cache.json contents:"
+              cat patient_cache.json
+              echo "Number of patients: $(jq '.patients | length' patient_cache.json || echo 'Failed to count patients')"
+            fi
           fi
-
-      - name: Release lock
-        if: always()
-        run: |
-          echo "Releasing lock"
-          rm -f lockfile
-          echo "Lock released"
 
       - name: Commit and push state files
         if: steps.sync.outcome == 'success'
