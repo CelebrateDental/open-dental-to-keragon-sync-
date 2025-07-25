@@ -70,20 +70,23 @@ jobs:
           fi
 
       - name: Initialize patient cache if missing
-        if: steps.restore-cache.outputs.cache-hit != 'true' && !exists('patient_cache.json')
+        if: steps.restore-cache.outputs.cache-hit != 'true'
         run: |
-          echo "No patient cache restored, creating patient_cache.json with initial data"
-          if [ -f init_patient_cache.py ]; then
-            echo "Running init_patient_cache.py to seed patient_cache.json"
-            python3 init_patient_cache.py
-          else
-            echo "init_patient_cache.py not found, creating empty patient_cache.json"
-            cat << EOF > patient_cache.json
-            {
-              "cache_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-              "patients": {}
-            }
-            EOF
+          echo "Checking for patient cache initialization"
+          if [ ! -f patient_cache.json ]; then
+            echo "No patient cache restored, creating patient_cache.json with initial data"
+            if [ -f init_patient_cache.py ]; then
+              echo "Running init_patient_cache.py to seed patient_cache.json"
+              python3 init_patient_cache.py
+            else
+              echo "init_patient_cache.py not found, creating empty patient_cache.json"
+              cat << EOF > patient_cache.json
+              {
+                "cache_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+                "patients": {}
+              }
+              EOF
+            fi
           fi
           if [ ! -f appointment_types_cache.json ]; then
             echo "No appointment types cache restored, creating empty appointment_types_cache.json"
@@ -201,6 +204,7 @@ jobs:
           key: sync-cache-patients-${{ github.run_number }}-${{ github.run_attempt }}
 
       - name: Debug cache save
+        id: debug-cache-save
         if: always()
         run: |
           echo "## Cache save status"
@@ -222,7 +226,12 @@ jobs:
               cat patient_cache.json
               echo "Number of patients: $(jq '.patients | length' patient_cache.json || echo 'Failed to count patients')"
             fi
+            echo "Retrying cache save"
+            /usr/bin/tar --posix -cf cache.tzst --exclude cache.tzst -P -C $GITHUB_WORKSPACE --files-from manifest.txt --use-compress-program zstdmt || true
+            echo "Retry completed, checking cache contents again"
+            ls -l patient_cache.json appointment_types_cache.json || echo "Cache files not found after retry"
           fi
+        continue-on-error: true
 
       - name: Commit and push state files
         if: steps.sync.outcome == 'success'
