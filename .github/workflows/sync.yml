@@ -58,7 +58,7 @@ jobs:
           echo "## Cache restore status"
           if [ "${{ steps.restore-cache.outputs.cache-hit }}" == "true" ]; then
             echo "Cache hit: Successfully restored cache"
-            ls -l patient_cache.json appointment_types_cache.json || echo "Some cache files not found after restore"
+            ls -l patient_cache.json || echo "Patient cache file not found after restore"
           else
             echo "Cache miss or partial restore: Will use deep sync to rebuild cache"
           fi
@@ -131,17 +131,17 @@ jobs:
             sed -i '/^appointment_cache\.json$/d' .gitignore 2>/dev/null || true
             sed -i '/^last_sync_state\.json$/d' .gitignore 2>/dev/null || true
           else
-            cat > .gitignore << EOF
-# Sensitive patient data files - NEVER COMMIT
-patient_cache.json
-appointments_op_*.json
-
-# Non-sensitive files are committed:
-# - appointment_types_cache.json (appointment types, no patient data)
-# - sent_appointments.json (tracking state, no patient details)
-# - last_sync_state.json (sync timestamps)
-# - appointment_cache.json (if it contains no patient data)
-EOF
+            cat > .gitignore << 'EOF'
+          # Sensitive patient data files - NEVER COMMIT
+          patient_cache.json
+          appointments_op_*.json
+          
+          # Non-sensitive files are committed:
+          # - appointment_types_cache.json (appointment types, no patient data)
+          # - sent_appointments.json (tracking state, no patient details)
+          # - last_sync_state.json (sync timestamps)
+          # - appointment_cache.json (if it contains no patient data)
+          EOF
           fi
           
           echo "Updated .gitignore to protect only patient data"
@@ -260,8 +260,7 @@ EOF
           [ -f last_sync_state.json ] && git add last_sync_state.json
           [ -f sent_appointments.json ] && git add sent_appointments.json
           [ -f appointment_types_cache.json ] && git add appointment_types_cache.json
-
-          
+          [ -f appointment_cache.json ] && git add appointment_cache.json
           
           # Ensure .gitignore changes are also committed
           git add .gitignore
