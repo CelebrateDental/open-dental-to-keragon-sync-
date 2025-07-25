@@ -65,7 +65,8 @@ jobs:
               cat appointment_types_cache.json
             fi
           else
-            echo "Cache miss: No cache found or cache restore failed (expected for first run)"
+            echo "Cache miss: No cache found or cache restore failed"
+            echo "Will initialize patient_cache.json"
           fi
 
       - name: Initialize patient cache if missing
@@ -75,26 +76,7 @@ jobs:
           cat << EOF > patient_cache.json
           {
             "cache_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-            "patients": {
-              "1001": {
-                "PatNum": "1001",
-                "FName": "Test",
-                "LName": "Patient1",
-                "DateTStamp": "2025-07-24T12:00:00+00:00",
-                "Email": "test1@example.com",
-                "HmPhone": "555-0001",
-                "Birthdate": "1980-01-01"
-              },
-              "1002": {
-                "PatNum": "1002",
-                "FName": "Test",
-                "LName": "Patient2",
-                "DateTStamp": "2025-07-24T12:00:00+00:00",
-                "Email": "test2@example.com",
-                "HmPhone": "555-0002",
-                "Birthdate": "1985-02-02"
-              }
-            }
+            "patients": {}
           }
           EOF
           if [ ! -f appointment_types_cache.json ]; then
