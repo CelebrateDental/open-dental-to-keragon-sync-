@@ -80,17 +80,12 @@ jobs:
               python3 init_patient_cache.py
             else
               echo "init_patient_cache.py not found, creating empty patient_cache.json"
-              cat << EOF > patient_cache.json
-              {
-                "cache_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-                "patients": {}
-              }
-              EOF
+              echo "{\"cache_date\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\", \"patients\": {}}" > patient_cache.json
             fi
           fi
           if [ ! -f appointment_types_cache.json ]; then
             echo "No appointment types cache restored, creating empty appointment_types_cache.json"
-            echo '{"cache_date": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'", "appointment_types": {"shared": {}}}' > appointment_types_cache.json
+            echo "{\"cache_date\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\", \"appointment_types\": {\"shared\": {}}}" > appointment_types_cache.json
           fi
 
       - name: Check for last_sync_state.json
@@ -227,7 +222,7 @@ jobs:
               echo "Number of patients: $(jq '.patients | length' patient_cache.json || echo 'Failed to count patients')"
             fi
             echo "Retrying cache save"
-            /usr/bin/tar --posix -cf cache.tzst --exclude cache.tzst -P -C $GITHUB_WORKSPACE --files-from manifest.txt --use-compress-program zstdmt || true
+            /usr/bin/tar --posix -cf cache.tzst --exclude cache.tzst -P -C $GITHUB_WORKSPACE --files-from manifest.txt || true
             echo "Retry completed, checking cache contents again"
             ls -l patient_cache.json appointment_types_cache.json || echo "Cache files not found after retry"
           fi
