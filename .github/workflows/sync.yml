@@ -2,14 +2,14 @@ name: Open Dental to Keragon Sync
 
 on:
   schedule:
-    - cron: '0 7 * * *'  # Deep sync at 2 AM CDT (7 AM UTC)
-    - cron: '2,17,32,47 13-23 * * *'  # Incremental sync 8:02 AM–8:47 PM CDT
-    - cron: '2,17,32,47 0-1 * * *'  # Incremental sync 8:02 PM CDT
+    - cron: '0 7 * * *'              # Deep sync at 2 AM CDT (07:00 UTC)
+    - cron: '2,17,32,47 13-23 * * *' # Incremental sync 8:02 AM–8:47 PM CDT
+    - cron: '2,17,32,47 0-1 * * *'   # Incremental sync 8:02 PM–9:47 PM CDT
   workflow_dispatch:
 
 concurrency:
   group: sync-open-dental-to-keragon
-  cancel-in-progress: true  # Cancel concurrent runs to avoid cache conflicts
+  cancel-in-progress: true
 
 jobs:
   sync:
@@ -41,12 +41,12 @@ jobs:
         id: restore-cache
         uses: actions/cache@v3
         with:
-          path: |
-            patient_cache.json
-            appointment_types_cache.json
-          key: sync-cache-patients-${{ github.run_number }}-${{ github.run_attempt }}
-          restore-keys: |
-            sync-cache-patients-
+          path:
+            - patient_cache.json
+            - appointment_types_cache.json
+          key: sync-cache-patients-${{ runner.os }}-${{ github.run_number }}-${{ github.run_attempt }}
+          restore-keys:
+            - sync-cache-patients-${{ runner.os }}-
         continue-on-error: true
 
       - name: Debug cache restore
@@ -70,11 +70,10 @@ jobs:
           fi
 
       - name: Initialize patient cache if missing
-        if: steps.restore-cache.outputs.cache-hit != 'true'
         run: |
           echo "Checking for patient cache initialization"
           if [ ! -f patient_cache.json ]; then
-            echo "No patient cache restored, creating patient_cache.json with initial data"
+            echo "Creating patient_cache.json"
             if [ -f init_patient_cache.py ]; then
               echo "Running init_patient_cache.py to seed patient_cache.json"
               python3 init_patient_cache.py
@@ -89,8 +88,13 @@ jobs:
             fi
           fi
           if [ ! -f appointment_types_cache.json ]; then
-            echo "No appointment types cache restored, creating empty appointment_types_cache.json"
-            echo '{"cache_date": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'", "appointment_types": {"shared": {}}}' > appointment_types_cache.json
+            echo "Creating appointment_types_cache.json"
+            cat << EOF > appointment_types_cache.json
+            {
+              "cache_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+              "appointment_types": {"shared": {}}
+            }
+            EOF
           fi
 
       - name: Check for last_sync_state.json
@@ -139,18 +143,18 @@ jobs:
           OPEN_DENTAL_DEVELOPER_KEY: ${{ secrets.OPEN_DENTAL_DEVELOPER_KEY }}
           OPEN_DENTAL_CUSTOMER_KEY: ${{ secrets.OPEN_DENTAL_CUSTOMER_KEY }}
           KERAGON_WEBHOOK_URL: ${{ secrets.KERAGON_WEBHOOK_URL }}
-          CLINIC_NUMS: "${{ secrets.CLINIC_NUM_1 }},${{ secrets.CLINIC_NUM_2 }}"
-          LOG_LEVEL: "DEBUG"
-          CLINIC_DELAY_SECONDS: "5.0"
-          INCREMENTAL_SYNC_MINUTES: "15"
-          DEEP_SYNC_HOURS: "720"
-          SAFETY_OVERLAP_HOURS: "2"
-          ENABLE_CACHING: "true"
-          CACHE_EXPIRY_MINUTES: "30"
-          USE_SPECIFIC_FIELDS: "false"
-          ENABLE_PAGINATION: "true"
-          PAGE_SIZE: "100"
-          MAX_RECORDS_PER_REQUEST: "100"
+          CLINIC_NUMS: ${{ secrets.CLINIC_NUMS }}
+          LOG_LEVEL: DEBUG
+          CLINIC_DELAY_SECONDS: 5.0
+          INCREMENTAL_SYNC_MINUTES: 15
+          DEEP_SYNC_HOURS: 720
+          SAFETY_OVERLAP_HOURS: 2
+          ENABLE_CACHING: true
+          CACHE_EXPIRY_MINUTES: 30
+          USE_SPECIFIC_FIELDS: false
+          ENABLE_PAGINATION: true
+          PAGE_SIZE: 100
+          MAX_RECORDS_PER_REQUEST: 100
         run: |
           if [ "${{ steps.check_state.outputs.state_file_exists }}" == "false" ]; then
             echo "No last_sync_state.json found, running deep sync"
@@ -163,7 +167,7 @@ jobs:
             python3 sync_script.py --verbose --once
           fi
 
-      - name: Clean up debug appointment files
+      - name: Clean up debug files
         if: always()
         run: |
           echo "Cleaning up debug appointment files"
@@ -198,18 +202,17 @@ jobs:
         id: save-cache
         uses: actions/cache@v3
         with:
-          path: |
-            patient_cache.json
-            appointment_types_cache.json
-          key: sync-cache-patients-${{ github.run_number }}-${{ github.run_attempt }}
+          path:
+            - patient_cache.json
+            - appointment_types_cache.json
+          key: sync-cache-patients-${{ runner.os }}-${{ github.run_number }}-${{ github.run_attempt }}
 
       - name: Debug cache save
-        id: debug-cache-save
         if: always()
         run: |
           echo "## Cache save status"
           if [ "${{ steps.save-cache.outcome }}" == "success" ]; then
-            echo "Cache saved successfully with key sync-cache-patients-${{ github.run_number }}-${{ github.run_attempt }}"
+            echo "Cache saved successfully with key sync-cache-patients-${{ runner.os }}-${{ github.run_number }}-${{ github.run_attempt }}"
             echo "Cache contents:"
             ls -l patient_cache.json appointment_types_cache.json || echo "Cache files not found"
             if [ -f patient_cache.json ]; then
@@ -240,12 +243,8 @@ jobs:
         run: |
           git config --local user.name "GitHub Actions Bot"
           git config --local user.email "actions@github.com"
-          # Add state and cache files if they exist, exclude patient_cache.json
-          [ -f last_sync_state.json ] && git add last_sync_state.json
-          [ -f sent_appointments.json ] && git add sent_appointments.json
-          [ -f appointment_types_cache.json ] && git add appointment_types_cache.json
-          [ -f appointment_cache.json ] && git add appointment_cache.json
+          git add last_sync_state.json sent_appointments.json appointment_types_cache.json appointment_cache.json || true
           git diff --cached --quiet || (
-            git commit -m "chore(sync): update sync state and cache files [skip ci]" &&
+            git commit -m "chore(sync): update state and cache [skip ci]" &&
             git push
           )
