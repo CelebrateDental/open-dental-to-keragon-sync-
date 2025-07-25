@@ -3,12 +3,12 @@ name: Open Dental to Keragon Sync
 on:
   schedule:
     - cron: '0 7 * * *'  # Deep sync at 2 AM CDT (7 AM UTC)
-    - cron: '0,15,30,45 13-23 * * *'  # Incremental sync 8 AM–8 PM CDT
-    - cron: '0,15,30,45 0-1 * * *'  # Incremental sync 8 PM CDT
+    - cron: '2,17,32,47 13-23 * * *'  # Incremental sync 8:02 AM–8:47 PM CDT
+    - cron: '2,17,32,47 0-1 * * *'  # Incremental sync 8:02 PM CDT
   workflow_dispatch:
 
 concurrency:
-  group: sync-open-dental-to-keragon-${{ github.event_name == 'schedule' && github.event.schedule || 'manual' }}
+  group: sync-open-dental-to-keragon
   cancel-in-progress: true  # Cancel concurrent runs to avoid cache conflicts
 
 jobs:
@@ -48,6 +48,8 @@ jobs:
           restore-keys: |
             sync-cache-patients-
             sync-cache-
+            sync-cache-patients-${{ github.run_number - 1 }}
+            sync-cache-patients-${{ github.run_number - 2 }}
         continue-on-error: true
 
       - name: Debug cache restore
@@ -198,6 +200,12 @@ jobs:
           echo "## Cache save status"
           if [ "${{ steps.save-cache.outcome }}" == "success" ]; then
             echo "Cache saved successfully with key sync-cache-patients-${{ github.run_number }}"
+            echo "Cache contents:"
+            ls -l patient_cache.json appointment_types_cache.json || echo "Cache files not found"
+            if [ -f patient_cache.json ]; then
+              echo "patient_cache.json contents:"
+              cat patient_cache.json
+            fi
           else
             echo "Cache save failed, possibly due to concurrent run or cache reservation"
           fi
@@ -212,7 +220,7 @@ jobs:
           # Add state and cache files if they exist, exclude patient_cache.json
           [ -f last_sync_state.json ] && git add last_sync_state.json
           [ -f sent_appointments.json ] && git add sent_appointments.json
-          [ -f appointment_types_cache.json ] && git add appointment_types_cache.json
+          [ - distingue appointment_types_cache.json ] && git add appointment_types_cache.json
           [ -f appointment_cache.json ] && git add appointment_cache.json
           git diff --cached --quiet || (
             git commit -m "chore(sync): update sync state and cache files [skip ci]" &&
