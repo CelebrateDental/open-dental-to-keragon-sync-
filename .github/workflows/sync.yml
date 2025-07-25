@@ -55,6 +55,14 @@ jobs:
           if [ "${{ steps.restore-cache.outputs.cache-hit }}" == "true" ]; then
             echo "Cache hit: Successfully restored patient_cache.json and appointment_types_cache.json"
             ls -l patient_cache.json appointment_types_cache.json || echo "Cache files not found after restore"
+            if [ -f patient_cache.json ]; then
+              echo "patient_cache.json contents:"
+              cat patient_cache.json
+            fi
+            if [ -f appointment_types_cache.json ]; then
+              echo "appointment_types_cache.json contents:"
+              cat appointment_types_cache.json
+            fi
           else
             echo "Cache miss: No cache found or cache restore failed (expected for first run)"
           fi
@@ -62,8 +70,32 @@ jobs:
       - name: Initialize patient cache if missing
         if: steps.restore-cache.outputs.cache-hit != 'true'
         run: |
-          echo "No patient cache restored, creating empty patient_cache.json"
-          echo '{"cache_date": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'", "patients": {}}' > patient_cache.json
+          echo "No patient cache restored, creating patient_cache.json with initial data"
+          cat << EOF > patient_cache.json
+          {
+            "cache_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "patients": {
+              "1001": {
+                "PatNum": "1001",
+                "FName": "Test",
+                "LName": "Patient1",
+                "DateTStamp": "2025-07-24T12:00:00+00:00",
+                "Email": "test1@example.com",
+                "HmPhone": "555-0001",
+                "Birthdate": "1980-01-01"
+              },
+              "1002": {
+                "PatNum": "1002",
+                "FName": "Test",
+                "LName": "Patient2",
+                "DateTStamp": "2025-07-24T12:00:00+00:00",
+                "Email": "test2@example.com",
+                "HmPhone": "555-0002",
+                "Birthdate": "1985-02-02"
+              }
+            }
+          }
+          EOF
           if [ ! -f appointment_types_cache.json ]; then
             echo "No appointment types cache restored, creating empty appointment_types_cache.json"
             echo '{"cache_date": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'", "appointment_types": {"shared": {}}}' > appointment_types_cache.json
@@ -155,7 +187,7 @@ jobs:
             cat patient_cache.json
           else
             echo "patient_cache.json not found"
-            echo "Creating empty patient_cache.json to ensure commit"
+            echo "Creating empty patient_cache.json to ensure cache save"
             echo '{"cache_date": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'", "patients": {}}' > patient_cache.json
           fi
           if [ -f appointment_types_cache.json ]; then
@@ -163,7 +195,7 @@ jobs:
             cat appointment_types_cache.json
           else
             echo "appointment_types_cache.json not found"
-            echo "Creating empty appointment_types_cache.json to ensure commit"
+            echo "Creating empty appointment_types_cache.json to ensure cache save"
             echo '{"cache_date": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'", "appointment_types": {"shared": {}}}' > appointment_types_cache.json
           fi
 
@@ -183,12 +215,11 @@ jobs:
         run: |
           git config --local user.name "GitHub Actions Bot"
           git config --local user.email "actions@github.com"
-          # Add cache and state files if they exist
+          # Add state and cache files if they exist, exclude patient_cache.json
           [ -f last_sync_state.json ] && git add last_sync_state.json
           [ -f sent_appointments.json ] && git add sent_appointments.json
           [ -f appointment_types_cache.json ] && git add appointment_types_cache.json
           [ -f appointment_cache.json ] && git add appointment_cache.json
-          [ -f patient_cache.json ] && git add patient_cache.json
           git diff --cached --quiet || (
             git commit -m "chore(sync): update sync state and cache files [skip ci]" &&
             git push
