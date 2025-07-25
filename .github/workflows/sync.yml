@@ -48,7 +48,7 @@ jobs:
         with:
           path: |
             patient_cache.json
-          key: sync-cache-patients-${{ hashFiles('sync_script.py') }}
+          key: sync-cache-patients-${{ hashFiles('sync_script.py', 'patient_cache.json') }}
           restore-keys: |
             sync-cache-patients-
         continue-on-error: true
