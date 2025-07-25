@@ -53,7 +53,7 @@ INCREMENTAL_INTERVAL_MINUTES = 60
 
 # === CACHING AND OPTIMIZATION ===
 ENABLE_CACHING = os.environ.get('ENABLE_CACHING', 'true').lower() == 'true'
-CACHE_EXPIRY_MINUTES = int(os.environ.get('CACHE_EXPIRY_MINUTES', '30'))
+CACHE_EXPIRY_MINUTES = int(os.environ.get('CACHE_EXPIRY_MINUTES', '5'))
 USE_SPECIFIC_FIELDS = os.environ.get('USE_SPECIFIC_FIELDS', 'true').lower() == 'true'
 ENABLE_PAGINATION = os.environ.get('ENABLE_PAGINATION', 'true').lower() == 'true'
 PAGE_SIZE = 100
@@ -784,15 +784,18 @@ def fetch_appointments_for_window(
     start_time_utc = window.start_time.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     end_time_utc = window.end_time.astimezone(timezone.utc).replace(hour=23, minute=59, second=59, microsecond=999999)
     params = {
-        'ClinicNum': clinic,
+        'ClinicNum': str(clinic),
         'dateStart': start_time_utc.strftime('%Y-%m-%d'),
         'dateEnd': end_time_utc.strftime('%Y-%m-%d'),
         'limit': PAGE_SIZE,
         'fields': ','.join(REQUIRED_APPOINTMENT_FIELDS)
     }
     
+    # Bypass cache for incremental syncs or data within 30 minutes
+    use_cache = not window.is_incremental and (window.end_time - datetime.datetime.now(timezone.utc)).total_seconds() > 1800  # 30 minutes
+    
     try:
-        operatory_data = make_optimized_request_paginated('operatories', {'ClinicNum': clinic, 'limit': PAGE_SIZE})
+        operatory_data = make_optimized_request_paginated('operatories', {'ClinicNum': clinic, 'limit': PAGE_SIZE}, use_cache=use_cache)
         if operatory_data:
             operatory_info = [
                 {'OperatoryNum': op.get('OperatoryNum'), 'OperatoryName': op.get('OpName', 'Unknown')}
@@ -813,10 +816,12 @@ def fetch_appointments_for_window(
             single_params['AptStatus'] = status
             single_params['Op'] = str(op_num)
             try:
-                appointments = make_optimized_request_paginated('appointments', single_params)
+                appointments = make_optimized_request_paginated('appointments', single_params, use_cache=use_cache)
                 logger.debug(f"Clinic {clinic}: Raw API response for AptStatus={status}, Op={op_num}: {len(appointments or [])} records")
                 if appointments:
                     logger.debug(f"Clinic {clinic}: AptStatus={status}, Op={op_num} returned {len(appointments)} appointments")
+                    for appt in appointments:
+                        logger.debug(f"Appt {appt.get('AptNum')}: Op={appt.get('Op')}, DateTStamp={appt.get('DateTStamp')}")
                     all_appointments.extend(appointments)
                 else:
                     logger.debug(f"Clinic {clinic}: AptStatus={status}, Op={op_num} returned no appointments")
@@ -839,24 +844,36 @@ def apply_appointment_filters(
     for appt in appointments:
         apt_num = str(appt.get('AptNum', ''))
         status = str(appt.get('AptStatus', ''))
-        op_num = appt.get('Op') or appt.get('OperatoryNum')
+        op_num = appt.get('Op')
         pat_num = appt.get('PatNum')
+        
+        logger.debug(f"Checking appointment {apt_num}: Op={op_num}, DateTStamp={appt.get('DateTStamp')}")
+        
         if not pat_num:
-            logger.debug(f"Excluding appointment {apt_num} due to missing PatNum")
+            logger.error(f"Excluding appointment {apt_num}: missing PatNum")
+            continue
+        if not op_num:
+            logger.error(f"Excluding appointment {apt_num}: missing Op (unexpected)")
             continue
         if appointment_filter.exclude_ghl_tagged and has_ghl_tag(appt):
-            logger.debug(f"Excluding appointment {apt_num} due to GHL tag")
+            logger.debug(f"Excluding appointment {apt_num}: GHL tag")
             continue
         if appointment_filter.valid_statuses and status not in appointment_filter.valid_statuses:
-            logger.debug(f"Excluding appointment {apt_num} due to invalid status: {status}")
+            logger.debug(f"Excluding appointment {apt_num}: invalid status: {status}")
             continue
-        if appointment_filter.operatory_nums and op_num not in appointment_filter.operatory_nums:
-            logger.debug(f"Excluding appointment {apt_num} due to invalid operatory: {op_num}")
-            continue
+        if appointment_filter.operatory_nums:
+            try:
+                op_num_int = int(op_num)
+                if op_num_int not in appointment_filter.operatory_nums:
+                    logger.debug(f"Excluding appointment {apt_num}: invalid operatory: {op_num}")
+                    continue
+            except (ValueError, TypeError):
+                logger.error(f"Excluding appointment {apt_num}: invalid operatory format: {op_num}")
+                continue
         if status == 'Broken' and appointment_filter.broken_appointment_types:
             apt_type_name = get_appointment_type_name(appt, clinic)
             if apt_type_name not in appointment_filter.broken_appointment_types:
-                logger.debug(f"Excluding broken appointment {apt_num} due to invalid type: {apt_type_name}")
+                logger.debug(f"Excluding broken appointment {apt_num}: invalid type: {apt_type_name}")
                 continue
         valid.append(appt)
     logger.info(f"Clinic {clinic}: Filtered {len(appointments)} → {len(valid)} appointments")
