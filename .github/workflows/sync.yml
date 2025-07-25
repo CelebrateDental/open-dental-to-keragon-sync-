@@ -37,55 +37,37 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests python-dateutil
 
-      - name: Find latest patient-cache artifact
-        id: find-artifact
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          echo "Fetching latest patient-cache artifact"
-          ARTIFACT=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
-            -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/${{ github.repository }}/actions/artifacts | \
-            jq -r '.artifacts | sort_by(.created_at) | reverse | .[] | select(.name == "patient-cache" and .expired == false) | .id' | head -1)
-          if [ -n "$ARTIFACT" ]; then
-            echo "artifact_id=$ARTIFACT" >> $GITHUB_OUTPUT
-            echo "Found patient-cache artifact ID: $ARTIFACT"
-          else
-            echo "No patient-cache artifact found"
-            echo "artifact_id=" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Download patient cache
-        id: download
-        if: steps.find-artifact.outputs.artifact_id != ''
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          echo "Downloading patient-cache artifact ID: ${{ steps.find-artifact.outputs.artifact_id }}"
-          curl -L -H "Authorization: Bearer $GITHUB_TOKEN" \
-            -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/${{ github.repository }}/actions/artifacts/${{ steps.find-artifact.outputs.artifact_id }}/zip \
-            -o patient-cache.zip
-          unzip -o patient-cache.zip -d .
-          rm patient-cache.zip
-          ls -l patient_cache.json || echo "patient_cache.json not found after download"
+      - name: Restore cache
+        id: restore-cache
+        uses: actions/cache@v3
+        with:
+          path: |
+            patient_cache.json
+            appointment_types_cache.json
+          key: sync-cache-${{ github.run_id }}
+          restore-keys: |
+            sync-cache-
         continue-on-error: true
 
-      - name: Debug download artifact
+      - name: Debug cache restore
         run: |
-          echo "## Download artifact status"
-          if [ "${{ steps.download.outcome }}" == "success" ]; then
-            echo "Successfully downloaded patient-cache artifact"
-            ls -l patient_cache.json || echo "patient_cache.json not found after download"
+          echo "## Cache restore status"
+          if [ "${{ steps.restore-cache.outputs.cache-hit }}" == "true" ]; then
+            echo "Cache hit: Successfully restored patient_cache.json and appointment_types_cache.json"
+            ls -l patient_cache.json appointment_types_cache.json || echo "Cache files not found after restore"
           else
-            echo "Failed to download patient-cache artifact (expected for first run or if missing)"
+            echo "Cache miss: No cache found or cache restore failed (expected for first run)"
           fi
 
       - name: Initialize patient cache if missing
-        if: steps.download.outcome != 'success'
+        if: steps.restore-cache.outputs.cache-hit != 'true'
         run: |
-          echo "No patient-cache artifact downloaded, creating empty patient_cache.json"
+          echo "No patient cache restored, creating empty patient_cache.json"
           echo '{"cache_date": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'", "patients": {}}' > patient_cache.json
+          if [ ! -f appointment_types_cache.json ]; then
+            echo "No appointment types cache restored, creating empty appointment_types_cache.json"
+            echo '{"cache_date": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'", "appointment_types": {"shared": {}}}' > appointment_types_cache.json
+          fi
 
       - name: Check for last_sync_state.json
         id: check_state
@@ -105,6 +87,25 @@ jobs:
             cat patient_cache.json
           else
             echo "patient_cache.json not found"
+          fi
+          if [ -f appointment_types_cache.json ]; then
+            echo "appointment_types_cache.json contents:"
+            cat appointment_types_cache.json
+          else
+            echo "appointment_types_cache.json not found"
+          fi
+
+      - name: Ensure .gitignore includes sensitive files
+        run: |
+          echo "Checking .gitignore for sensitive files"
+          if [ -f .gitignore ]; then
+            grep -q "patient_cache.json" .gitignore || echo "Warning: patient_cache.json not in .gitignore"
+            grep -q "appointment_types_cache.json" .gitignore || echo "Warning: appointment_types_cache.json not in .gitignore"
+            grep -q "last_sync_state.json" .gitignore || echo "Warning: last_sync_state.json not in .gitignore"
+            grep -q "sent_appointments.json" .gitignore || echo "Warning: sent_appointments.json not in .gitignore"
+            grep -q "appointment_cache.json" .gitignore || echo "Warning: appointment_cache.json not in .gitignore"
+          else
+            echo "Error: .gitignore file not found, sensitive files may be exposed"
           fi
 
       - name: Run sync
@@ -154,28 +155,26 @@ jobs:
             cat patient_cache.json
           else
             echo "patient_cache.json not found"
-            echo "Creating empty patient_cache.json to ensure upload"
+            echo "Creating empty patient_cache.json to ensure commit"
             echo '{"cache_date": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'", "patients": {}}' > patient_cache.json
           fi
+          if [ -f appointment_types_cache.json ]; then
+            echo "appointment_types_cache.json contents:"
+            cat appointment_types_cache.json
+          else
+            echo "appointment_types_cache.json not found"
+            echo "Creating empty appointment_types_cache.json to ensure commit"
+            echo '{"cache_date": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'", "appointment_types": {"shared": {}}}' > appointment_types_cache.json
+          fi
 
-      - name: Upload patient cache
+      - name: Save cache
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/cache@v3
         with:
-          name: patient-cache
-          path: patient_cache.json
-          retention-days: 30
-          if-no-files-found: warn
-          compression-level: 6
-
-      - name: Upload appointment types cache
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: appointment-types-cache
-          path: appointment_types_cache.json
-          retention-days: 30
-          if-no-files-found: warn
+          path: |
+            patient_cache.json
+            appointment_types_cache.json
+          key: sync-cache-${{ github.run_id }}
 
       - name: Commit and push state files
         if: steps.sync.outcome == 'success'
@@ -184,12 +183,13 @@ jobs:
         run: |
           git config --local user.name "GitHub Actions Bot"
           git config --local user.email "actions@github.com"
-          # Only add files if they exist
+          # Add cache and state files if they exist
           [ -f last_sync_state.json ] && git add last_sync_state.json
           [ -f sent_appointments.json ] && git add sent_appointments.json
           [ -f appointment_types_cache.json ] && git add appointment_types_cache.json
           [ -f appointment_cache.json ] && git add appointment_cache.json
+          [ -f patient_cache.json ] && git add patient_cache.json
           git diff --cached --quiet || (
-            git commit -m "chore(sync): update sync state and caches [skip ci]" &&
+            git commit -m "chore(sync): update sync state and cache files [skip ci]" &&
             git push
           )
