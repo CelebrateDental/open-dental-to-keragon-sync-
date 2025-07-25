@@ -37,6 +37,23 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests python-dateutil
 
+      - name: Acquire lock to prevent concurrent runs
+        run: |
+          echo "Acquiring lock to prevent concurrent runs"
+          for i in {1..10}; do
+            if [ ! -f lockfile ]; then
+              echo "Lock acquired" > lockfile
+              echo "Lock acquired successfully"
+              break
+            fi
+            echo "Lockfile exists, waiting... (attempt $i)"
+            sleep 30
+          done
+          if [ ! -f lockfile ]; then
+            echo "Failed to acquire lock after 10 attempts"
+            exit 1
+          fi
+
       - name: Restore cache
         id: restore-cache
         uses: actions/cache@v3
@@ -47,9 +64,6 @@ jobs:
           key: sync-cache-patients-${{ github.run_number }}
           restore-keys: |
             sync-cache-patients-
-            sync-cache-
-            sync-cache-patients-${{ github.run_number - 1 }}
-            sync-cache-patients-${{ github.run_number - 2 }}
         continue-on-error: true
 
       - name: Debug cache restore
@@ -61,6 +75,7 @@ jobs:
             if [ -f patient_cache.json ]; then
               echo "patient_cache.json contents:"
               cat patient_cache.json
+              jq '.patients | length' patient_cache.json || echo "Failed to count patients"
             fi
             if [ -f appointment_types_cache.json ]; then
               echo "appointment_types_cache.json contents:"
@@ -102,6 +117,7 @@ jobs:
           if [ -f patient_cache.json ]; then
             echo "patient_cache.json contents:"
             cat patient_cache.json
+            jq '.patients | length' patient_cache.json || echo "Failed to count patients"
           else
             echo "patient_cache.json not found"
           fi
@@ -121,6 +137,7 @@ jobs:
             grep -q "last_sync_state.json" .gitignore || echo "Warning: last_sync_state.json not in .gitignore"
             grep -q "sent_appointments.json" .gitignore || echo "Warning: sent_appointments.json not in .gitignore"
             grep -q "appointment_cache.json" .gitignore || echo "Warning: appointment_cache.json not in .gitignore"
+            grep -q "lockfile" .gitignore || echo "Warning: lockfile not in .gitignore"
           else
             echo "Error: .gitignore file not found, sensitive files may be exposed"
           fi
@@ -170,6 +187,7 @@ jobs:
           if [ -f patient_cache.json ]; then
             echo "patient_cache.json contents:"
             cat patient_cache.json
+            jq '.patients | length' patient_cache.json || echo "Failed to count patients"
           else
             echo "patient_cache.json not found"
             echo "Creating empty patient_cache.json to ensure cache save"
@@ -205,10 +223,18 @@ jobs:
             if [ -f patient_cache.json ]; then
               echo "patient_cache.json contents:"
               cat patient_cache.json
+              jq '.patients | length' patient_cache.json || echo "Failed to count patients"
             fi
           else
             echo "Cache save failed, possibly due to concurrent run or cache reservation"
           fi
+
+      - name: Release lock
+        if: always()
+        run: |
+          echo "Releasing lock"
+          rm -f lockfile
+          echo "Lock released"
 
       - name: Commit and push state files
         if: steps.sync.outcome == 'success'
@@ -220,7 +246,7 @@ jobs:
           # Add state and cache files if they exist, exclude patient_cache.json
           [ -f last_sync_state.json ] && git add last_sync_state.json
           [ -f sent_appointments.json ] && git add sent_appointments.json
-          [ - distingue appointment_types_cache.json ] && git add appointment_types_cache.json
+          [ -f appointment_types_cache.json ] && git add appointment_types_cache.json
           [ -f appointment_cache.json ] && git add appointment_cache.json
           git diff --cached --quiet || (
             git commit -m "chore(sync): update sync state and cache files [skip ci]" &&
