@@ -44,7 +44,7 @@ jobs:
           path: |
             patient_cache.json
             appointment_types_cache.json
-          key: sync-cache-patients
+          key: sync-cache-patients-${{ github.run_number }}
           restore-keys: |
             sync-cache-patients-
             sync-cache-
@@ -190,14 +190,14 @@ jobs:
           path: |
             patient_cache.json
             appointment_types_cache.json
-          key: sync-cache-patients
+          key: sync-cache-patients-${{ github.run_number }}
 
       - name: Debug cache save
         if: always()
         run: |
           echo "## Cache save status"
           if [ "${{ steps.save-cache.outcome }}" == "success" ]; then
-            echo "Cache saved successfully with key sync-cache-patients"
+            echo "Cache saved successfully with key sync-cache-patients-${{ github.run_number }}"
           else
             echo "Cache save failed, possibly due to concurrent run or cache reservation"
           fi
