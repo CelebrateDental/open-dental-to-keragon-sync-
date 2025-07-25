@@ -2,13 +2,18 @@ name: Open Dental to Keragon Sync
 
 on:
   schedule:
-    - cron: '0 7 * * *'              # Deep sync at 2 AM CDT (07:00 UTC)
-    - cron: '2,17,32,47 13-23 * * *' # Incremental sync 8:02 AM–8:47 PM CDT
-    - cron: '2,17,32,47 0-1 * * *'   # Incremental sync 8:02 PM–9:47 PM CDT
+    - cron: '0 7 * * *'  # Deep sync at 2 AM CDT (7 AM UTC)
+    - cron: '0,30 13-23 * * *'  # Incremental sync every 30 minutes from 8:00 AM–6:00 PM CDT
+    - cron: '0,30 0-1 * * *'   # Incremental sync every 30 minutes from 7:00 PM–8:00 PM CDT
   workflow_dispatch:
+    inputs:
+      force_deep_sync:
+        description: 'Force a deep sync to repopulate cache'
+        required: false
+        default: 'false'
 
 concurrency:
-  group: sync-open-dental-to-keragon
+  group: sync-open-dental-to-keragon-${{ github.run_id }}
   cancel-in-progress: true
 
 jobs:
@@ -39,62 +44,38 @@ jobs:
 
       - name: Restore cache
         id: restore-cache
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
-          path:
-            - patient_cache.json
-            - appointment_types_cache.json
-          key: sync-cache-patients-${{ runner.os }}-${{ github.run_number }}-${{ github.run_attempt }}
-          restore-keys:
-            - sync-cache-patients-${{ runner.os }}-
+          path: |
+            patient_cache.json
+          key: sync-cache-patients-${{ hashFiles('sync_script.py') }}
+          restore-keys: |
+            sync-cache-patients-
         continue-on-error: true
 
       - name: Debug cache restore
         run: |
           echo "## Cache restore status"
-          if [ -f patient_cache.json ] || [ -f appointment_types_cache.json ]; then
+          if [ "${{ steps.restore-cache.outputs.cache-hit }}" == "true" ]; then
             echo "Cache hit: Successfully restored cache"
-            ls -l patient_cache.json appointment_types_cache.json || echo "Cache files not found after restore"
-            if [ -f patient_cache.json ]; then
-              echo "patient_cache.json contents:"
-              cat patient_cache.json
-              echo "Number of patients: $(jq '.patients | length' patient_cache.json || echo 'Failed to count patients')"
-            fi
-            if [ -f appointment_types_cache.json ]; then
-              echo "appointment_types_cache.json contents:"
-              cat appointment_types_cache.json
-            fi
+            ls -l patient_cache.json || echo "Patient cache file not found after restore"
           else
-            echo "Cache miss: No cache found or cache restore failed"
-            echo "Will initialize patient_cache.json"
+            echo "Cache miss or partial restore: Will use deep sync to rebuild cache"
           fi
-
-      - name: Initialize patient cache if missing
-        run: |
-          echo "Checking for patient cache initialization"
-          if [ ! -f patient_cache.json ]; then
-            echo "Creating patient_cache.json"
-            if [ -f init_patient_cache.py ]; then
-              echo "Running init_patient_cache.py to seed patient_cache.json"
-              python3 init_patient_cache.py
-            else
-              echo "init_patient_cache.py not found, creating empty patient_cache.json"
-              cat << EOF > patient_cache.json
-              {
-                "cache_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-                "patients": {}
-              }
-              EOF
-            fi
+          
+          # Show what cache files exist (only check patient cache for restore)
+          if [ -f patient_cache.json ]; then
+            echo "patient_cache.json found, size: $(stat -f%z patient_cache.json 2>/dev/null || stat -c%s patient_cache.json)"
+            echo "Number of patients: $(jq '.patients | length' patient_cache.json 2>/dev/null || echo 'Failed to count patients')"
+          else
+            echo "patient_cache.json not found"
           fi
-          if [ ! -f appointment_types_cache.json ]; then
-            echo "Creating appointment_types_cache.json"
-            cat << EOF > appointment_types_cache.json
-            {
-              "cache_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-              "appointment_types": {"shared": {}}
-            }
-            EOF
+          
+          # appointment_types_cache.json will be restored from git if it exists
+          if [ -f appointment_types_cache.json ]; then
+            echo "appointment_types_cache.json found in repository"
+          else
+            echo "appointment_types_cache.json not found - will be created by sync"
           fi
 
       - name: Check for last_sync_state.json
@@ -102,40 +83,68 @@ jobs:
         run: |
           if [ -f last_sync_state.json ]; then
             echo "state_file_exists=true" >> $GITHUB_OUTPUT
+            echo "last_sync_state.json exists"
           else
             echo "state_file_exists=false" >> $GITHUB_OUTPUT
+            echo "last_sync_state.json not found"
           fi
 
-      - name: Debug workspace files before sync
+      - name: Determine sync type
+        id: sync_type
         run: |
-          echo "## Workspace files before sync"
-          find $GITHUB_WORKSPACE -type f
-          if [ -f patient_cache.json ]; then
-            echo "patient_cache.json contents:"
-            cat patient_cache.json
-            echo "Number of patients: $(jq '.patients | length' patient_cache.json || echo 'Failed to count patients')"
-          else
-            echo "patient_cache.json not found"
+          FORCE_DEEP_SYNC="false"
+          SYNC_REASON="incremental"
+          
+          # Check if manual deep sync requested
+          if [ "${{ github.event.inputs.force_deep_sync }}" == "true" ]; then
+            FORCE_DEEP_SYNC="true"
+            SYNC_REASON="manual_deep_sync"
+          # Check if scheduled deep sync (2 AM CDT)
+          elif [[ "${{ github.event_name }}" == "schedule" && "${{ github.event.schedule }}" == "0 7 * * *" ]]; then
+            FORCE_DEEP_SYNC="true"
+            SYNC_REASON="scheduled_deep_sync"
+          # Check if no state file exists (first run)
+          elif [ "${{ steps.check_state.outputs.state_file_exists }}" == "false" ]; then
+            FORCE_DEEP_SYNC="true"
+            SYNC_REASON="first_run_no_state"
+          # Check if cache is completely missing
+          elif [ ! -f patient_cache.json ]; then
+            FORCE_DEEP_SYNC="true"
+            SYNC_REASON="cache_missing"
           fi
-          if [ -f appointment_types_cache.json ]; then
-            echo "appointment_types_cache.json contents:"
-            cat appointment_types_cache.json
-          else
-            echo "appointment_types_cache.json not found"
-          fi
+          
+          echo "force_deep_sync=$FORCE_DEEP_SYNC" >> $GITHUB_OUTPUT
+          echo "sync_reason=$SYNC_REASON" >> $GITHUB_OUTPUT
+          echo "Sync type determined: $SYNC_REASON (deep_sync=$FORCE_DEEP_SYNC)"
 
       - name: Ensure .gitignore includes sensitive files
         run: |
-          echo "Checking .gitignore for sensitive files"
+          echo "Ensuring .gitignore excludes ONLY patient data files"
           if [ -f .gitignore ]; then
-            grep -q "patient_cache.json" .gitignore || echo "Warning: patient_cache.json not in .gitignore"
-            grep -q "appointment_types_cache.json" .gitignore || echo "Warning: appointment_types_cache.json not in .gitignore"
-            grep -q "last_sync_state.json" .gitignore || echo "Warning: last_sync_state.json not in .gitignore"
-            grep -q "sent_appointments.json" .gitignore || echo "Warning: sent_appointments.json not in .gitignore"
-            grep -q "appointment_cache.json" .gitignore || echo "Warning: appointment_cache.json not in .gitignore"
+            # Only exclude patient_cache.json (contains sensitive patient data)
+            grep -q "patient_cache.json" .gitignore || echo "patient_cache.json" >> .gitignore
+            # Add debug appointment files that might contain patient data
+            grep -q "appointments_op_*.json" .gitignore || echo "appointments_op_*.json" >> .gitignore
+            # Remove other files from gitignore if they exist (we want to commit them)
+            sed -i '/^appointment_types_cache\.json$/d' .gitignore 2>/dev/null || true
+            sed -i '/^sent_appointments\.json$/d' .gitignore 2>/dev/null || true
+            sed -i '/^appointment_cache\.json$/d' .gitignore 2>/dev/null || true
+            sed -i '/^last_sync_state\.json$/d' .gitignore 2>/dev/null || true
           else
-            echo "Error: .gitignore file not found, sensitive files may be exposed"
+            cat > .gitignore << 'EOF'
+          # Sensitive patient data files - NEVER COMMIT
+          patient_cache.json
+          appointments_op_*.json
+          
+          # Non-sensitive files are committed:
+          # - appointment_types_cache.json (appointment types, no patient data)
+          # - sent_appointments.json (tracking state, no patient details)
+          # - last_sync_state.json (sync timestamps)
+          # - appointment_cache.json (if it contains no patient data)
+          EOF
           fi
+          
+          echo "Updated .gitignore to protect only patient data"
 
       - name: Run sync
         id: sync
@@ -143,108 +152,128 @@ jobs:
           OPEN_DENTAL_DEVELOPER_KEY: ${{ secrets.OPEN_DENTAL_DEVELOPER_KEY }}
           OPEN_DENTAL_CUSTOMER_KEY: ${{ secrets.OPEN_DENTAL_CUSTOMER_KEY }}
           KERAGON_WEBHOOK_URL: ${{ secrets.KERAGON_WEBHOOK_URL }}
-          CLINIC_NUMS: ${{ secrets.CLINIC_NUMS }}
-          LOG_LEVEL: DEBUG
-          CLINIC_DELAY_SECONDS: 5.0
-          INCREMENTAL_SYNC_MINUTES: 15
-          DEEP_SYNC_HOURS: 720
-          SAFETY_OVERLAP_HOURS: 2
-          ENABLE_CACHING: true
-          CACHE_EXPIRY_MINUTES: 30
-          USE_SPECIFIC_FIELDS: false
-          ENABLE_PAGINATION: true
-          PAGE_SIZE: 100
-          MAX_RECORDS_PER_REQUEST: 100
+          CLINIC_NUMS: "${{ secrets.CLINIC_NUM_1 }},${{ secrets.CLINIC_NUM_2 }}"
+          LOG_LEVEL: "DEBUG"
+          CLINIC_DELAY_SECONDS: "5.0"
+          INCREMENTAL_SYNC_MINUTES: "15"
+          DEEP_SYNC_HOURS: "720"
+          SAFETY_OVERLAP_HOURS: "2"
+          ENABLE_CACHING: "true"
+          CACHE_EXPIRY_MINUTES: "30"
+          USE_SPECIFIC_FIELDS: "false"
+          ENABLE_PAGINATION: "true"
+          PAGE_SIZE: "100"
+          MAX_RECORDS_PER_REQUEST: "100"
         run: |
-          if [ "${{ steps.check_state.outputs.state_file_exists }}" == "false" ]; then
-            echo "No last_sync_state.json found, running deep sync"
-            python3 sync_script.py --force-deep-sync --verbose --once
-          elif [[ "${{ github.event_name }}" == "schedule" && "${{ github.event.schedule }}" == "0 7 * * *" ]]; then
-            echo "Running deep sync at 2 AM CDT"
+          echo "Starting sync for run_id=${{ github.run_id }}, run_number=${{ github.run_number }}, run_attempt=${{ github.run_attempt }}"
+          echo "Sync reason: ${{ steps.sync_type.outputs.sync_reason }}"
+          
+          if [ "${{ steps.sync_type.outputs.force_deep_sync }}" == "true" ]; then
+            echo "Running deep sync (reason: ${{ steps.sync_type.outputs.sync_reason }})"
             python3 sync_script.py --force-deep-sync --verbose --once
           else
             echo "Running incremental sync"
             python3 sync_script.py --verbose --once
           fi
 
-      - name: Clean up debug files
+      - name: Validate sync results
+        run: |
+          echo "## Validating sync results"
+          
+          # Check if essential cache files were created
+          if [ ! -f patient_cache.json ]; then
+            echo "ERROR: patient_cache.json was not created by sync"
+            echo "This indicates the sync failed to complete successfully"
+            exit 1
+          fi
+          
+          # Validate cache file contents
+          if ! jq empty patient_cache.json 2>/dev/null; then
+            echo "ERROR: patient_cache.json contains invalid JSON"
+            exit 1
+          fi
+          
+          PATIENT_COUNT=$(jq '.patients | length' patient_cache.json 2>/dev/null || echo "0")
+          echo "Sync completed successfully. Patient cache contains $PATIENT_COUNT patients"
+          
+          if [ -f appointment_types_cache.json ]; then
+            if jq empty appointment_types_cache.json 2>/dev/null; then
+              echo "appointment_types_cache.json is valid"
+            else
+              echo "WARNING: appointment_types_cache.json contains invalid JSON"
+            fi
+          fi
+
+      - name: Clean up debug appointment files
         if: always()
         run: |
           echo "Cleaning up debug appointment files"
           rm -f appointments_op_*.json
           echo "Removed appointments_op_*.json files"
 
-      - name: Debug workspace files after sync
-        if: always()
-        run: |
-          echo "## Workspace files after sync"
-          find $GITHUB_WORKSPACE -type f
-          if [ -f patient_cache.json ]; then
-            echo "patient_cache.json contents:"
-            cat patient_cache.json
-            echo "Number of patients: $(jq '.patients | length' patient_cache.json || echo 'Failed to count patients')"
-          else
-            echo "patient_cache.json not found"
-            echo "Creating empty patient_cache.json to ensure cache save"
-            echo '{"cache_date": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'", "patients": {}}' > patient_cache.json
-          fi
-          if [ -f appointment_types_cache.json ]; then
-            echo "appointment_types_cache.json contents:"
-            cat appointment_types_cache.json
-          else
-            echo "appointment_types_cache.json not found"
-            echo "Creating empty appointment_types_cache.json to ensure cache save"
-            echo '{"cache_date": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'", "appointment_types": {"shared": {}}}' > appointment_types_cache.json
-          fi
-
-      - name: Save cache
-        if: always()
+      - name: Save cache with retry
         id: save-cache
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
-          path:
-            - patient_cache.json
-            - appointment_types_cache.json
-          key: sync-cache-patients-${{ runner.os }}-${{ github.run_number }}-${{ github.run_attempt }}
-
-      - name: Debug cache save
-        if: always()
-        run: |
-          echo "## Cache save status"
-          if [ "${{ steps.save-cache.outcome }}" == "success" ]; then
-            echo "Cache saved successfully with key sync-cache-patients-${{ runner.os }}-${{ github.run_number }}-${{ github.run_attempt }}"
-            echo "Cache contents:"
-            ls -l patient_cache.json appointment_types_cache.json || echo "Cache files not found"
-            if [ -f patient_cache.json ]; then
-              echo "patient_cache.json contents:"
-              cat patient_cache.json
-              echo "Number of patients: $(jq '.patients | length' patient_cache.json || echo 'Failed to count patients')"
-            fi
-          else
-            echo "Cache save failed, possibly due to cache reservation or backend issue"
-            echo "Cache contents (unsaved):"
-            ls -l patient_cache.json appointment_types_cache.json || echo "Cache files not found"
-            if [ -f patient_cache.json ]; then
-              echo "patient_cache.json contents:"
-              cat patient_cache.json
-              echo "Number of patients: $(jq '.patients | length' patient_cache.json || echo 'Failed to count patients')"
-            fi
-            echo "Retrying cache save"
-            /usr/bin/tar --posix -cf cache.tzst --exclude cache.tzst -P -C $GITHUB_WORKSPACE --files-from manifest.txt --use-compress-program zstdmt || true
-            echo "Retry completed, checking cache contents again"
-            ls -l patient_cache.json appointment_types_cache.json || echo "Cache files not found after retry"
-          fi
+          path: |
+            patient_cache.json
+          key: sync-cache-patients-${{ hashFiles('sync_script.py') }}
         continue-on-error: true
 
-      - name: Commit and push state files
+      - name: Handle cache save failure
+        if: steps.save-cache.outcome != 'success' && steps.sync.outcome == 'success'
+        run: |
+          echo "## Cache save failed - will rebuild from scratch on next run"
+          echo "This is expected behavior when GitHub Actions cache backend has issues"
+          echo "Next run will automatically detect missing cache and perform deep sync"
+
+      - name: Debug cache operation
+        if: always()
+        run: |
+          echo "## Final cache status"
+          echo "Cache save outcome: ${{ steps.save-cache.outcome }}"
+          
+          if [ -f patient_cache.json ]; then
+            PATIENT_COUNT=$(jq '.patients | length' patient_cache.json 2>/dev/null || echo "unknown")
+            FILE_SIZE=$(stat -c%s patient_cache.json 2>/dev/null || stat -f%z patient_cache.json 2>/dev/null || echo "unknown")
+            echo "patient_cache.json: $PATIENT_COUNT patients, $FILE_SIZE bytes"
+          else
+            echo "patient_cache.json: missing"
+          fi
+          
+          if [ -f appointment_types_cache.json ]; then
+            FILE_SIZE=$(stat -c%s appointment_types_cache.json 2>/dev/null || stat -f%z appointment_types_cache.json 2>/dev/null || echo "unknown")
+            echo "appointment_types_cache.json: $FILE_SIZE bytes"
+          else
+            echo "appointment_types_cache.json: missing"
+          fi
+
+      - name: Commit and push state files (excluding patient data)
         if: steps.sync.outcome == 'success'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git config --local user.name "GitHub Actions Bot"
           git config --local user.email "actions@github.com"
-          git add last_sync_state.json sent_appointments.json appointment_types_cache.json appointment_cache.json || true
-          git diff --cached --quiet || (
-            git commit -m "chore(sync): update state and cache [skip ci]" &&
+          
+          # Add non-sensitive files that can be safely committed
+          [ -f last_sync_state.json ] && git add last_sync_state.json
+          [ -f sent_appointments.json ] && git add sent_appointments.json
+          [ -f appointment_types_cache.json ] && git add appointment_types_cache.json
+          [ -f appointment_cache.json ] && git add appointment_cache.json
+          
+          # Ensure .gitignore changes are also committed
+          git add .gitignore
+          
+          # Commit only if there are changes
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(sync): update sync state and cache files [skip ci]"
             git push
-          )
+            echo "Non-sensitive state and cache files committed and pushed"
+            
+            # Show what was committed
+            echo "Files committed:"
+            git show --name-only HEAD
+          else
+            echo "No changes to commit"
+          fi

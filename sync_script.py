@@ -1145,7 +1145,12 @@ def main_loop(dry_run: bool = False, force_deep_sync: bool = False, once: bool =
                 logger.error(f"Failed to save state: {e}")
         
         logger.info(f"Sync complete: sent {total_sent} appointments across {len(CLINIC_NUMS)} clinics")
-        
+        # === Final safety: ensure cache exists even if no appointments were sent ===
+        if not os.path.exists(PATIENT_CACHE_FILE):
+            logger.warning("No appointments sent and no patient cache found — creating empty persistent patient_cache.json")
+            save_patient_cache({})
+        else:
+            logger.info("Patient cache exists — no fallback needed")
         if once:
             break
         # Ensure the sync is fully complete before calculating the next run time
