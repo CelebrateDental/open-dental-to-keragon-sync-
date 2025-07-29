@@ -217,7 +217,7 @@ jobs:
         with:
           path: |
             patient_cache.json
-          key: sync-cache-patients-${{ github.run_id }}
+          key: sync-cache-patients-${{ hashFiles('sync_script.py') }}
         continue-on-error: true
 
       - name: Handle cache save failure
