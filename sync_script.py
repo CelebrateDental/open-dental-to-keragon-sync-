@@ -797,11 +797,12 @@ def fetch_appointments_for_window(
     try:
         operatory_data = make_optimized_request_paginated('operatories', {'ClinicNum': clinic, 'limit': PAGE_SIZE}, use_cache=use_cache)
         if operatory_data:
+            valid_operatories = set(appointment_filter.operatory_nums)
             operatory_info = [
                 {'OperatoryNum': op.get('OperatoryNum'), 'OperatoryName': op.get('OpName', 'Unknown')}
-                for op in operatory_data if op.get('OperatoryNum') in appointment_filter.operatory_nums
+                for op in operatory_data if op.get('OperatoryNum') in valid_operatories
             ]
-            logger.info(f"Clinic {clinic}: Operatories - {operatory_info}")
+            logger.info(f"Clinic {clinic}: Valid operatories - {operatory_info}")
         else:
             logger.warning(f"Clinic {clinic}: No operatory data retrieved")
             return []
@@ -819,12 +820,17 @@ def fetch_appointments_for_window(
                 appointments = make_optimized_request_paginated('appointments', single_params, use_cache=use_cache)
                 logger.debug(f"Clinic {clinic}: Raw API response for AptStatus={status}, Op={op_num}: {len(appointments or [])} records")
                 if appointments:
-                    logger.debug(f"Clinic {clinic}: AptStatus={status}, Op={op_num} returned {len(appointments)} appointments")
-                    for appt in appointments:
+                    # Additional operatory validation
+                    filtered_appointments = [
+                        appt for appt in appointments 
+                        if appt.get('Op') in appointment_filter.operatory_nums or appt.get('OperatoryNum') in appointment_filter.operatory_nums
+                    ]
+                    logger.debug(f"Clinic {clinic}: AptStatus={status}, Op={op_num} returned {len(appointments)} appointments, {len(filtered_appointments)} after operatory filter")
+                    for appt in filtered_appointments:
                         logger.debug(f"Appt {appt.get('AptNum')}: Op={appt.get('Op')}, DateTStamp={appt.get('DateTStamp')}")
-                    all_appointments.extend(appointments)
+                    all_appointments.extend(filtered_appointments)
                 else:
-                    logger.debug(f"Clinic {clinic}: AptStatus={status}, Op={op_num} returned no appointments")
+                    logger.debug(f"Client {clinic}: AptStatus={status}, Op={op_num} returned no appointments")
             except Exception as e:
                 logger.error(f"Clinic {clinic}: Error with AptStatus={status}, Op={op_num}: {e}")
             time.sleep(1)
@@ -844,7 +850,7 @@ def apply_appointment_filters(
     for appt in appointments:
         apt_num = str(appt.get('AptNum', ''))
         status = str(appt.get('AptStatus', ''))
-        op_num = appt.get('Op')
+        op_num = appt.get('Op') or appt.get('OperatoryNum')
         pat_num = appt.get('PatNum')
         
         logger.debug(f"Checking appointment {apt_num}: Op={op_num}, DateTStamp={appt.get('DateTStamp')}")
@@ -853,7 +859,7 @@ def apply_appointment_filters(
             logger.error(f"Excluding appointment {apt_num}: missing PatNum")
             continue
         if not op_num:
-            logger.error(f"Excluding appointment {apt_num}: missing Op (unexpected)")
+            logger.error(f"Excluding appointment {apt_num}: missing Op or OperatoryNum")
             continue
         if appointment_filter.exclude_ghl_tagged and has_ghl_tag(appt):
             logger.debug(f"Excluding appointment {apt_num}: GHL tag")
@@ -921,11 +927,12 @@ def fetch_appointments_optimized(
     try:
         operatory_data = make_optimized_request_paginated('operatories', {'ClinicNum': clinic, 'limit': PAGE_SIZE})
         if operatory_data:
+            valid_operatories = set(appointment_filter.operatory_nums)
             operatory_info = [
                 {'OperatoryNum': op.get('OperatoryNum'), 'OperatoryName': op.get('OpName', 'Unknown')}
-                for op in operatory_data if op.get('OperatoryNum') in appointment_filter.operatory_nums
+                for op in operatory_data if op.get('OperatoryNum') in valid_operatories
             ]
-            logger.info(f"Clinic {clinic}: Operatories - {operatory_info}")
+            logger.info(f"Clinic {clinic}: Valid operatories - {operatory_info}")
         else:
             logger.warning(f"Clinic {clinic}: No operatory data retrieved")
             return []
@@ -943,8 +950,13 @@ def fetch_appointments_optimized(
                 if appointments is None:
                     logger.error(f"Clinic {clinic}: No appointments returned for AptStatus={status}, Op={op_num}")
                     continue
-                logger.debug(f"Clinic {clinic}: AptStatus={status}, Op={op_num} returned {len(appointments)} appointments")
-                all_appointments.extend(appointments)
+                # Additional operatory validation
+                filtered_appointments = [
+                    appt for appt in appointments 
+                    if appt.get('Op') in appointment_filter.operatory_nums or appt.get('OperatoryNum') in appointment_filter.operatory_nums
+                ]
+                logger.debug(f"Clinic {clinic}: AptStatus={status}, Op={op_num} returned {len(appointments)} appointments, {len(filtered_appointments)} after operatory filter")
+                all_appointments.extend(filtered_appointments)
             except Exception as e:
                 logger.error(f"Clinic {clinic}: Error fetching appointments for AptStatus={status}, Op={op_num}: {e}")
             time.sleep(1)
@@ -1099,11 +1111,19 @@ def process_clinic_optimized(
             logger.warning(f"Skipping appointment {apt_num} with missing PatNum")
             continue
         
-        # Check if the appointment is new or updated
+        # Check if the appointment is new or has been updated since last sync
         date_tstamp = parse_time(appt.get('DateTStamp'))
-        if apt_num in sent_appointments and (since is None or date_tstamp is None or date_tstamp <= since):
-            logger.debug(f"Skipping already sent appointment {apt_num} with no recent updates")
+        if not date_tstamp:
+            logger.warning(f"Skipping appointment {apt_num} with invalid or missing DateTStamp")
             continue
+        
+        # Strict check to prevent sending unchanged appointments
+        if apt_num in sent_appointments:
+            if since and date_tstamp <= since:
+                logger.debug(f"Skipping already sent appointment {apt_num}: DateTStamp {date_tstamp} not newer than last sync {since}")
+                continue
+            else:
+                logger.debug(f"Appointment {apt_num} has been updated: DateTStamp {date_tstamp} > last sync {since or 'None'}")
         
         pat_nums.add(pat_num)
         new_appointments.append(appt)
