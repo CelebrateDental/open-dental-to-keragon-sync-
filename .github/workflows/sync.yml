@@ -121,11 +121,8 @@ jobs:
         run: |
           echo "Ensuring .gitignore excludes ONLY patient data files"
           if [ -f .gitignore ]; then
-            # Only exclude patient_cache.json (contains sensitive patient data)
             grep -q "patient_cache.json" .gitignore || echo "patient_cache.json" >> .gitignore
-            # Add debug appointment files that might contain patient data
             grep -q "appointments_op_*.json" .gitignore || echo "appointments_op_*.json" >> .gitignore
-            # Remove other files from gitignore if they exist (we want to commit them)
             sed -i '/^appointment_types_cache\.json$/d' .gitignore 2>/dev/null || true
             sed -i '/^sent_appointments\.json$/d' .gitignore 2>/dev/null || true
             sed -i '/^appointment_cache\.json$/d' .gitignore 2>/dev/null || true
@@ -179,23 +176,16 @@ jobs:
       - name: Validate sync results
         run: |
           echo "## Validating sync results"
-          
-          # Check if essential cache files were created
           if [ ! -f patient_cache.json ]; then
             echo "ERROR: patient_cache.json was not created by sync"
-            echo "This indicates the sync failed to complete successfully"
             exit 1
           fi
-          
-          # Validate cache file contents
           if ! jq empty patient_cache.json 2>/dev/null; then
             echo "ERROR: patient_cache.json contains invalid JSON"
             exit 1
           fi
-          
           PATIENT_COUNT=$(jq '.patients | length' patient_cache.json 2>/dev/null || echo "0")
           echo "Sync completed successfully. Patient cache contains $PATIENT_COUNT patients"
-          
           if [ -f appointment_types_cache.json ]; then
             if jq empty appointment_types_cache.json 2>/dev/null; then
               echo "appointment_types_cache.json is valid"
@@ -220,11 +210,18 @@ jobs:
           key: sync-cache-patients-${{ github.run_id }}
         continue-on-error: true
 
+      - name: Update latest cache pointer
+        uses: actions/cache@v4
+        with:
+          path: |
+            patient_cache.json
+          key: sync-cache-patients-latest
+        continue-on-error: true
+
       - name: Handle cache save failure
         if: steps.save-cache.outcome != 'success' && steps.sync.outcome == 'success'
         run: |
           echo "## Cache save failed - will rebuild from scratch on next run"
-          echo "This is expected behavior when GitHub Actions cache backend has issues"
           echo "Next run will automatically detect missing cache and perform deep sync"
 
       - name: Debug cache operation
@@ -232,7 +229,6 @@ jobs:
         run: |
           echo "## Final cache status"
           echo "Cache save outcome: ${{ steps.save-cache.outcome }}"
-          
           if [ -f patient_cache.json ]; then
             PATIENT_COUNT=$(jq '.patients | length' patient_cache.json 2>/dev/null || echo "unknown")
             FILE_SIZE=$(stat -c%s patient_cache.json 2>/dev/null || stat -f%z patient_cache.json 2>/dev/null || echo "unknown")
@@ -240,7 +236,6 @@ jobs:
           else
             echo "patient_cache.json: missing"
           fi
-          
           if [ -f appointment_types_cache.json ]; then
             FILE_SIZE=$(stat -c%s appointment_types_cache.json 2>/dev/null || stat -f%z appointment_types_cache.json 2>/dev/null || echo "unknown")
             echo "appointment_types_cache.json: $FILE_SIZE bytes"
@@ -255,25 +250,15 @@ jobs:
         run: |
           git config --local user.name "GitHub Actions Bot"
           git config --local user.email "actions@github.com"
-          
-          # Add non-sensitive files that can be safely committed
           [ -f last_sync_state.json ] && git add last_sync_state.json
           [ -f sent_appointments.json ] && git add sent_appointments.json
           [ -f appointment_types_cache.json ] && git add appointment_types_cache.json
           [ -f appointment_cache.json ] && git add appointment_cache.json
-          
-          # Ensure .gitignore changes are also committed
           git add .gitignore
-          
-          # Commit only if there are changes
           if ! git diff --cached --quiet; then
             git commit -m "chore(sync): update sync state and cache files [skip ci]"
             git push
-            echo "Non-sensitive state and cache files committed and pushed"
-            
-            # Show what was committed
-            echo "Files committed:"
-            git show --name-only HEAD
+            echo "Files committed:"; git show --name-only HEAD
           else
             echo "No changes to commit"
           fi
