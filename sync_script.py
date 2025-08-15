@@ -29,6 +29,8 @@ SENT_APPTS_FILE = 'sent_appointments.json'
 APPT_CACHE_FILE = 'appointment_cache.json'
 APPT_TYPES_CACHE_FILE = 'appointment_types_cache.json'
 PATIENT_CACHE_FILE = 'patient_cache.json'
+PROVIDER_CACHE_FILE = 'provider_cache.json'
+EMPLOYEE_CACHE_FILE = 'employee_cache.json'
 LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO')
 
 # === DATABASE PERFORMANCE OPTIMIZATIONS ===
@@ -75,11 +77,14 @@ VALID_STATUSES = {'Scheduled', 'Complete', 'Broken'}
 
 REQUIRED_APPOINTMENT_FIELDS = [
     'AptNum', 'AptDateTime', 'AptStatus', 'PatNum', 'Op', 'OperatoryNum',
-    'Pattern', 'AppointmentTypeNum', 'Note', 'DateTStamp', 'FName', 'LName'
+    'Pattern', 'AppointmentTypeNum', 'Note', 'DateTStamp', 'FName', 'LName',
+    'ProvNum', 'ProvHyg', 'Asst'
 ]
 
 _appointment_types_cache: Dict[str, Dict[int, str]] = {}
 _patient_cache: Dict[int, Dict[str, Any]] = {}
+_provider_cache: Dict[int, Dict[str, Any]] = {}
+_employee_cache: Dict[int, Dict[str, Any]] = {}
 _session = None
 _session_lock = threading.Lock()
 _request_cache: Dict[str, Tuple[datetime.datetime, Any]] = {}
@@ -428,6 +433,126 @@ def save_patient_cache(patient_cache: Dict[int, Dict[str, Any]]):
             json.dump({'cache_date': datetime.datetime.now(CLINIC_TIMEZONE).isoformat(), 'patients': {}}, f, indent=2)
         if os.path.exists(PATIENT_CACHE_FILE):
             logger.debug(f"Created empty patient_cache.json at {PATIENT_CACHE_FILE}")
+
+# === PROVIDER CACHE ===
+def load_provider_cache() -> Dict[int, Dict[str, Any]]:
+    if not os.path.exists(PROVIDER_CACHE_FILE):
+        logger.info("No provider cache file found")
+        return {}
+    try:
+        with open(PROVIDER_CACHE_FILE) as f:
+            data = json.load(f)
+            logger.info(f"Loaded provider cache from {PROVIDER_CACHE_FILE} with {len(data.get('providers', {}))} providers")
+            return {int(k): v for k, v in data.get('providers', {}).items()}
+    except Exception as e:
+        logger.error(f"Failed to load provider cache: {e}")
+        return {}
+
+def save_provider_cache(provider_cache: Dict[int, Dict[str, Any]]):
+    temp_file = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.tmp', dir=os.path.dirname(PROVIDER_CACHE_FILE) or '.') as f:
+            cache_data = {
+                'cache_date': datetime.datetime.now(CLINIC_TIMEZONE).isoformat(),
+                'providers': {str(k): v for k, v in provider_cache.items()}
+            }
+            json.dump(cache_data, f, indent=2)
+            temp_file = f.name
+        shutil.move(temp_file, PROVIDER_CACHE_FILE)
+        logger.info(f"Saved provider cache to {PROVIDER_CACHE_FILE} with {len(provider_cache)} providers")
+    except Exception as e:
+        logger.error(f"Failed to save provider cache: {e}")
+        if temp_file and os.path.exists(temp_file):
+            try:
+                os.unlink(temp_file)
+            except:
+                pass
+
+def get_all_providers(force_refresh: bool = False) -> Dict[int, Dict[str, Any]]:
+    global _provider_cache
+    if not force_refresh and _provider_cache:
+        return _provider_cache
+    
+    _provider_cache = load_provider_cache()
+    if _provider_cache:
+        return _provider_cache
+    
+    try:
+        data = make_optimized_request('providers', {'limit': 1000, 'fields': 'ProvNum,FName,LName'})
+        if data is None:
+            logger.warning("Failed to fetch providers: No data returned")
+            return {}
+        _provider_cache = {int(p['ProvNum']): p for p in data if 'ProvNum' in p}
+        save_provider_cache(_provider_cache)
+        logger.info(f"Fetched and cached {len(_provider_cache)} providers")
+        return _provider_cache
+    except Exception as e:
+        logger.warning(f"Failed to fetch providers: {e}")
+        return {}
+
+def get_provider_details(prov_num: int) -> Dict[str, Any]:
+    providers = get_all_providers()
+    return providers.get(prov_num, {})
+
+# === EMPLOYEE CACHE ===
+def load_employee_cache() -> Dict[int, Dict[str, Any]]:
+    if not os.path.exists(EMPLOYEE_CACHE_FILE):
+        logger.info("No employee cache file found")
+        return {}
+    try:
+        with open(EMPLOYEE_CACHE_FILE) as f:
+            data = json.load(f)
+            logger.info(f"Loaded employee cache from {EMPLOYEE_CACHE_FILE} with {len(data.get('employees', {}))} employees")
+            return {int(k): v for k, v in data.get('employees', {}).items()}
+    except Exception as e:
+        logger.error(f"Failed to load employee cache: {e}")
+        return {}
+
+def save_employee_cache(employee_cache: Dict[int, Dict[str, Any]]):
+    temp_file = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.tmp', dir=os.path.dirname(EMPLOYEE_CACHE_FILE) or '.') as f:
+            cache_data = {
+                'cache_date': datetime.datetime.now(CLINIC_TIMEZONE).isoformat(),
+                'employees': {str(k): v for k, v in employee_cache.items()}
+            }
+            json.dump(cache_data, f, indent=2)
+            temp_file = f.name
+        shutil.move(temp_file, EMPLOYEE_CACHE_FILE)
+        logger.info(f"Saved employee cache to {EMPLOYEE_CACHE_FILE} with {len(employee_cache)} employees")
+    except Exception as e:
+        logger.error(f"Failed to save employee cache: {e}")
+        if temp_file and os.path.exists(temp_file):
+            try:
+                os.unlink(temp_file)
+            except:
+                pass
+
+def get_all_employees(force_refresh: bool = False) -> Dict[int, Dict[str, Any]]:
+    global _employee_cache
+    if not force_refresh and _employee_cache:
+        return _employee_cache
+    
+    _employee_cache = load_employee_cache()
+    if _employee_cache:
+        return _employee_cache
+    
+    try:
+        data = make_optimized_request('employees', {'limit': 1000, 'fields': 'EmployeeNum,FName,LName'})
+        if data is None:
+            logger.warning("Failed to fetch employees: No data returned")
+            return {}
+        _employee_cache = {int(e['EmployeeNum']): e for e in data if 'EmployeeNum' in e}
+        save_employee_cache(_employee_cache)
+        logger.info(f"Fetched and cached {len(_employee_cache)} employees")
+        return _employee_cache
+    except Exception as e:
+        logger.warning(f"Failed to fetch employees: {e}")
+        return {}
+
+def get_employee_details(emp_num: int) -> Dict[str, Any]:
+    employees = get_all_employees()
+    return employees.get(emp_num, {})
 
 # === STATE MANAGEMENT ===
 def load_last_sync_times() -> Dict[int, Optional[datetime.datetime]]:
@@ -1012,6 +1137,31 @@ def send_to_keragon(appointment: Dict[str, Any], clinic: int, patient_data: Dict
         pattern = appointment.get('Pattern', '')
         end_time = calculate_end_time(start_time, pattern) if start_time and pattern else start_time + timedelta(minutes=60)
         
+        # Build staff string
+        parts = []
+        prov_num = appointment.get('ProvNum')
+        if prov_num:
+            prov = get_provider_details(int(prov_num))
+            if prov:
+                prov_name = f"Dr. {prov.get('LName', '').strip()}"
+                if prov_name != "Dr.":
+                    parts.append(prov_name)
+        prov_hyg = appointment.get('ProvHyg')
+        if prov_hyg:
+            hyg = get_provider_details(int(prov_hyg))
+            if hyg:
+                hyg_name = f"{hyg.get('FName', '').strip()} {hyg.get('LName', '').strip()}".strip()
+                if hyg_name:
+                    parts.append(hyg_name)
+        asst = appointment.get('Asst')
+        if asst:
+            asst_emp = get_employee_details(int(asst))
+            if asst_emp:
+                asst_name = f"{asst_emp.get('FName', '').strip()} {asst_emp.get('LName', '').strip()}".strip()
+                if asst_name:
+                    parts.append(asst_name)
+        staff = ",".join(parts)
+        
         payload = {
             'appointment': {
                 'AptNum': apt_num,
@@ -1023,7 +1173,8 @@ def send_to_keragon(appointment: Dict[str, Any], clinic: int, patient_data: Dict
                 'AppointmentTypeName': get_appointment_type_name(appointment, clinic),
                 'ClinicNum': str(clinic),
                 'PatNum': str(pat_num),
-                'OperatoryNum': str(appointment.get('Op') or appointment.get('OperatoryNum', ''))
+                'OperatoryNum': str(appointment.get('Op') or appointment.get('OperatoryNum', '')),
+                'Staff': staff
             },
             'patient': {
                 'FName': patient.get('FName', ''),
@@ -1142,6 +1293,9 @@ def main_loop(dry_run: bool = False, force_deep_sync: bool = False, once: bool =
     if not validate_configuration():
         logger.error("Configuration validation failed, exiting")
         sys.exit(1)
+    
+    get_all_providers()
+    get_all_employees()
     
     last_syncs = load_last_sync_times()
     sent_appointments = load_sent_appointments()
