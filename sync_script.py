@@ -1143,21 +1143,21 @@ def send_to_keragon(appointment: Dict[str, Any], clinic: int, patient_data: Dict
         if prov_num:
             prov = get_provider_details(int(prov_num))
             if prov:
-                prov_name = f"Dr. {prov.get('LName', '').strip()}"
+                prov_name = f"Dr.%20{prov.get('LName', '').strip()}"
                 if prov_name != "Dr.":
                     parts.append(prov_name)
         prov_hyg = appointment.get('ProvHyg')
         if prov_hyg:
             hyg = get_provider_details(int(prov_hyg))
             if hyg:
-                hyg_name = f"{hyg.get('FName', '').strip()} {hyg.get('LName', '').strip()}".strip()
+                hyg_name = f"{hyg.get('FName', '').strip()}%20{hyg.get('LName', '').strip()}".strip()
                 if hyg_name:
                     parts.append(hyg_name)
         asst = appointment.get('Asst')
         if asst:
             asst_emp = get_employee_details(int(asst))
             if asst_emp:
-                asst_name = f"{asst_emp.get('FName', '').strip()} {asst_emp.get('LName', '').strip()}".strip()
+                asst_name = f"{asst_emp.get('FName', '').strip()}%20{asst_emp.get('LName', '').strip()}".strip()
                 if asst_name:
                     parts.append(asst_name)
         staff = ",".join(parts)
