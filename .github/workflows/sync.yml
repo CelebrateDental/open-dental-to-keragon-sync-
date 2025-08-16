@@ -19,6 +19,8 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Check out repository code
         uses: actions/checkout@v4
@@ -245,20 +247,9 @@ jobs:
 
       - name: Commit and push state files (excluding patient data)
         if: steps.sync.outcome == 'success'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          git config --local user.name "GitHub Actions Bot"
-          git config --local user.email "actions@github.com"
-          [ -f last_sync_state.json ] && git add last_sync_state.json
-          [ -f sent_appointments.json ] && git add sent_appointments.json
-          [ -f appointment_types_cache.json ] && git add appointment_types_cache.json
-          [ -f appointment_cache.json ] && git add appointment_cache.json
-          git add .gitignore
-          if ! git diff --cached --quiet; then
-            git commit -m "chore(sync): update sync state and cache files [skip ci]"
-            git push
-            echo "Files committed:"; git show --name-only HEAD
-          else
-            echo "No changes to commit"
-          fi
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: 'chore(sync): update sync state and cache files [skip ci]'
+          file_pattern: 'last_sync_state.json sent_appointments.json appointment_types_cache.json appointment_cache.json operatory_cache.json .gitignore'
+          commit_user_name: 'GitHub Actions Bot'
+          commit_user_email: 'actions@github.com'
