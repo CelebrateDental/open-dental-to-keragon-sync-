@@ -31,6 +31,7 @@ APPT_TYPES_CACHE_FILE = 'appointment_types_cache.json'
 PATIENT_CACHE_FILE = 'patient_cache.json'
 PROVIDER_CACHE_FILE = 'provider_cache.json'
 EMPLOYEE_CACHE_FILE = 'employee_cache.json'
+OPERATORY_CACHE_FILE = 'operatory_cache.json'
 LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO')
 
 # === DATABASE PERFORMANCE OPTIMIZATIONS ===
@@ -85,6 +86,7 @@ _appointment_types_cache: Dict[str, Dict[int, str]] = {}
 _patient_cache: Dict[int, Dict[str, Any]] = {}
 _provider_cache: Dict[int, Dict[str, Any]] = {}
 _employee_cache: Dict[int, Dict[str, Any]] = {}
+_operatory_cache: Dict[int, List[Dict[str, Any]]] = {}
 _session = None
 _session_lock = threading.Lock()
 _request_cache: Dict[str, Tuple[datetime.datetime, Any]] = {}
@@ -554,6 +556,66 @@ def get_employee_details(emp_num: int) -> Dict[str, Any]:
     employees = get_all_employees()
     return employees.get(emp_num, {})
 
+# === OPERATORY CACHE ===
+def load_operatory_cache() -> Dict[int, List[Dict[str, Any]]]:
+    if not os.path.exists(OPERATORY_CACHE_FILE):
+        logger.info("No operatory cache file found")
+        return {}
+    try:
+        with open(OPERATORY_CACHE_FILE) as f:
+            data = json.load(f)
+            cache = {}
+            for clinic_str, ops in data.get('operatories', {}).items():
+                clinic = int(clinic_str)
+                cache[clinic] = ops
+            logger.info(f"Loaded operatory cache from {OPERATORY_CACHE_FILE} with {sum(len(ops) for ops in cache.values())} operatories across {len(cache)} clinics")
+            return cache
+    except Exception as e:
+        logger.error(f"Failed to load operatory cache: {e}")
+        return {}
+
+def save_operatory_cache(operatory_cache: Dict[int, List[Dict[str, Any]]]):
+    temp_file = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.tmp', dir=os.path.dirname(OPERATORY_CACHE_FILE) or '.') as f:
+            cache_data = {
+                'cache_date': datetime.datetime.now(CLINIC_TIMEZONE).isoformat(),
+                'operatories': {str(k): v for k, v in operatory_cache.items()}
+            }
+            json.dump(cache_data, f, indent=2)
+            temp_file = f.name
+        shutil.move(temp_file, OPERATORY_CACHE_FILE)
+        logger.info(f"Saved operatory cache to {OPERATORY_CACHE_FILE} with {sum(len(ops) for ops in operatory_cache.values())} operatories across {len(operatory_cache)} clinics")
+    except Exception as e:
+        logger.error(f"Failed to save operatory cache: {e}")
+        if temp_file and os.path.exists(temp_file):
+            try:
+                os.unlink(temp_file)
+            except:
+                pass
+
+def get_operatories(clinic_num: int, force_refresh: bool = False) -> List[Dict[str, Any]]:
+    global _operatory_cache
+    if not _operatory_cache:
+        _operatory_cache = load_operatory_cache()
+    
+    if not force_refresh and clinic_num in _operatory_cache:
+        logger.debug(f"Using cached operatories for clinic {clinic_num}")
+        return _operatory_cache[clinic_num]
+    
+    try:
+        data = make_optimized_request_paginated('operatories', {'ClinicNum': clinic_num, 'limit': PAGE_SIZE})
+        if data is None:
+            logger.warning(f"Failed to fetch operatories for clinic {clinic_num}: No data returned")
+            return []
+        _operatory_cache[clinic_num] = data
+        save_operatory_cache(_operatory_cache)
+        logger.info(f"Fetched and cached {len(data)} operatories for clinic {clinic_num}")
+        return data
+    except Exception as e:
+        logger.warning(f"Failed to fetch operatories for clinic {clinic_num}: {e}")
+        return []
+
 # === STATE MANAGEMENT ===
 def load_last_sync_times() -> Dict[int, Optional[datetime.datetime]]:
     state: Dict[int, Optional[datetime.datetime]] = {c: None for c in CLINIC_NUMS}
@@ -920,7 +982,7 @@ def fetch_appointments_for_window(
     use_cache = not window.is_incremental and (window.end_time - datetime.datetime.now(timezone.utc)).total_seconds() > 1800  # 30 minutes
     
     try:
-        operatory_data = make_optimized_request_paginated('operatories', {'ClinicNum': clinic, 'limit': PAGE_SIZE}, use_cache=use_cache)
+        operatory_data = get_operatories(clinic)
         if operatory_data:
             valid_operatories = set(appointment_filter.operatory_nums)
             operatory_info = [
@@ -1050,7 +1112,7 @@ def fetch_appointments_optimized(
     }
     
     try:
-        operatory_data = make_optimized_request_paginated('operatories', {'ClinicNum': clinic, 'limit': PAGE_SIZE})
+        operatory_data = get_operatories(clinic)
         if operatory_data:
             valid_operatories = set(appointment_filter.operatory_nums)
             operatory_info = [
