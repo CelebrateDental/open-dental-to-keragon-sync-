@@ -250,6 +250,6 @@ jobs:
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: 'chore(sync): update sync state and cache files [skip ci]'
-          file_pattern: 'last_sync_state.json sent_appointments.json appointment_types_cache.json appointment_cache.json operatory_cache.json .gitignore'
+          file_pattern: '*.json .gitignore'
           commit_user_name: 'GitHub Actions Bot'
           commit_user_email: 'actions@github.com'
