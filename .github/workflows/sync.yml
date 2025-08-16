@@ -239,7 +239,7 @@ jobs:
             echo "patient_cache.json: missing"
           fi
           if [ -f appointment_types_cache.json ]; then
-            FILE_SIZE=$(stat -c%s appointment_types_cache.json 2>/dev/null || stat -f%z appointment_types_cache.json 2>/dev/null || echo "unknown")
+            FILE_SIZE=(stat -c%s appointment_types_cache.json 2>/dev/null || stat -f%z appointment_types_cache.json 2>/dev/null || echo "unknown")
             echo "appointment_types_cache.json: $FILE_SIZE bytes"
           else
             echo "appointment_types_cache.json: missing"
@@ -250,6 +250,6 @@ jobs:
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: 'chore(sync): update sync state and cache files [skip ci]'
-          file_pattern: '*.json .gitignore'
+          file_pattern: 'last_sync_state.json sent_appointments.json appointment_types_cache.json operatory_cache.json .gitignore'
           commit_user_name: 'GitHub Actions Bot'
           commit_user_email: 'actions@github.com'
