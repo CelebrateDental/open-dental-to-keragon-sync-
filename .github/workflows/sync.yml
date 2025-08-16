@@ -239,7 +239,7 @@ jobs:
             echo "patient_cache.json: missing"
           fi
           if [ -f appointment_types_cache.json ]; then
-            FILE_SIZE=(stat -c%s appointment_types_cache.json 2>/dev/null || stat -f%z appointment_types_cache.json 2>/dev/null || echo "unknown")
+            FILE_SIZE=$(stat -c%s appointment_types_cache.json 2>/dev/null || stat -f%z appointment_types_cache.json 2>/dev/null || echo "unknown")
             echo "appointment_types_cache.json: $FILE_SIZE bytes"
           else
             echo "appointment_types_cache.json: missing"
