@@ -43,7 +43,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install requests python-dateutil jq
-          pip install mega.py==1.0.8 requests urllib3 python-dateutil jq
+          pip install git+https://github.com/odwyersoftware/mega.py.git@main tenacity==8.5.0 requests urllib3 python-dateutil jq
 
       - name: Restore cache
         id: restore-cache
