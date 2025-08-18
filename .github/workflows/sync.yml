@@ -43,7 +43,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install requests python-dateutil jq
-          pip install mega.py==2.1.4 tenacity==8.5.0 requests urllib3
+          pip install mega.py==1.0.8 tenacity==8.5.0 requests urllib3
 
       - name: Restore cache
         id: restore-cache
