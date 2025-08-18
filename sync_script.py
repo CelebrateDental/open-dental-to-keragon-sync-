@@ -365,100 +365,83 @@ def has_ghl_tag(appointment: Dict[str, Any]) -> bool:
 # === PATIENT CACHE ===
 def load_patient_cache() -> Dict[int, Dict[str, Any]]:
     mega = Mega()
-    m = mega.login(os.environ.get('MEGA_EMAIL'), os.environ.get('MEGA_PASSWORD'))
-    folder_path = 'patient_cache.json'
-    file_name = 'patient.txt'
-    cache_path = f"{folder_path}/{file_name}"
-    local_cache_file = PATIENT_CACHE_FILE
-
-    if not os.path.exists(local_cache_file):
-        try:
-            folder = m.find(folder_path)
-            if not folder:
-                m.create_folder(folder_path)
-                logger.info(f"Created MEGA folder: {folder_path}")
-                folder = m.find(folder_path)
-            file = m.find(file_name, folder=folder[0])
-            if file:
-                m.download(file, local_cache_file)
-                logger.info(f"Downloaded patient cache from MEGA: {cache_path} to {local_cache_file}")
-            else:
-                logger.info("No patient cache found in MEGA, starting with empty")
-                return {}
-        except Exception as e:
-            logger.error(f"Failed to download patient cache from MEGA: {e}")
-            return {}
-
-    if os.path.exists(local_cache_file):
-        try:
-            with open(local_cache_file) as f:
-                data = json.load(f)
-                logger.info(f"Loaded patient cache from {local_cache_file} with {len(data.get('patients', {}))} patients")
-                return {int(k): v for k, v in data.get('patients', {}).items()}
-        except Exception as e:
-            logger.error(f"Failed to load patient cache: {e}")
-            return {}
-    return {}
+    try:
+        m = mega.login(os.environ.get('MEGA_EMAIL'), os.environ.get('MEGA_PASSWORD'))
+        logger.info("Logging in user...")
+        # Get or create the patient_cache.json folder
+        folder = None
+        files = m.get_files()
+        for file_id, file_info in files.items():
+            if file_info['t'] == 1 and file_info['n'] == 'patient_cache.json':  # t=1 means folder
+                folder = file_id
+                break
+        if not folder:
+            folder = m.create_folder('patient_cache.json')
+            logger.info("Created MEGA folder: patient_cache.json")
+        
+        # Find patient.txt in the folder
+        file = None
+        for file_id, file_info in files.items():
+            if file_info['t'] == 0 and file_info['n'] == 'patient.txt' and file_info.get('p') == folder:  # t=0 means file
+                file = file_id
+                break
+        
+        if file:
+            m.download(file, dest_path=PATIENT_CACHE_FILE)
+            logger.info(f"Downloaded patient cache from MEGA: patient_cache.json/patient.txt to {PATIENT_CACHE_FILE}")
+        else:
+            logger.info("No patient cache file found on MEGA")
+    except Exception as e:
+        logger.error(f"Failed to download patient cache from MEGA: {e}")
+    
+    if not os.path.exists(PATIENT_CACHE_FILE):
+        logger.info("No patient cache file found")
+        return {}
+    
+    try:
+        with open(PATIENT_CACHE_FILE) as f:
+            data = json.load(f)
+            logger.info(f"Loaded patient cache from {PATIENT_CACHE_FILE} with {len(data.get('patients', {}))} patients")
+            return {int(k): v for k, v in data.get('patients', {}).items()}
+    except Exception as e:
+        logger.error(f"Failed to load patient cache: {e}")
+        return {}
 
 def save_patient_cache(patient_cache: Dict[int, Dict[str, Any]]):
     mega = Mega()
-    m = mega.login(os.environ.get('MEGA_EMAIL'), os.environ.get('MEGA_PASSWORD'))
-    folder_path = 'patient_cache.json'
-    file_name = 'patient.txt'
-    cache_path = f"{folder_path}/{file_name}"
-    local_cache_file = PATIENT_CACHE_FILE
-
     temp_file = None
-    existing_patients = {}
-    
-    # Load existing patient cache if it exists
-    if os.path.exists(PATIENT_CACHE_FILE):
-        try:
-            with open(PATIENT_CACHE_FILE, 'r') as f:
-                existing_data = json.load(f)
-                existing_patients = {int(k): v for k, v in existing_data.get('patients', {}).items()}
-                existing_cache_date = existing_data.get('cache_date', '')
-                logger.debug(f"Loaded existing patient cache with {len(existing_patients)} patients, dated {existing_cache_date}")
-        except Exception as e:
-            logger.error(f"Failed to load existing patient cache: {e}")
-    
-    # Merge existing patients with new patient_cache
-    merged_patients = existing_patients.copy()
-    new_patients_count = 0
-    updated_patients_count = 0
-    
-    for patnum, patient_data in patient_cache.items():
-        if patnum not in merged_patients:
-            merged_patients[patnum] = patient_data
-            new_patients_count += 1
-        else:
-            # Update only if new data is more recent (based on DateTStamp or similar)
-            existing_timestamp = merged_patients[patnum].get('DateTStamp', '')
-            new_timestamp = patient_data.get('DateTStamp', '')
-            if new_timestamp and (not existing_timestamp or new_timestamp > existing_timestamp):
-                merged_patients[patnum] = patient_data
-                updated_patients_count += 1
-    
-    # Write merged cache to local file
     try:
+        # Save locally first
         with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.tmp', dir=os.path.dirname(PATIENT_CACHE_FILE) or '.') as f:
             cache_data = {
-                'cache_date': datetime.datetime.now(CLINIC_TIMEZONE).isoformat(),
-                'patients': {str(k): v for k, v in merged_patients.items()}
+                'cache_date': datetime.now(CLINIC_TIMEZONE).isoformat(),
+                'patients': {str(k): v for k, v in patient_cache.items()}
             }
             json.dump(cache_data, f, indent=2)
             temp_file = f.name
         shutil.move(temp_file, PATIENT_CACHE_FILE)
-        logger.info(f"Saved patient cache to {PATIENT_CACHE_FILE} with {len(merged_patients)} patients "
-                    f"({new_patients_count} new, {updated_patients_count} updated)")
-        if len(merged_patients) == 0:
-            logger.warning(f"Saved empty patient cache to {PATIENT_CACHE_FILE}")
-        if os.path.exists(PATIENT_CACHE_FILE):
-            logger.debug(f"Verified patient_cache.json exists at {PATIENT_CACHE_FILE}")
-        else:
-            logger.error(f"patient_cache.json was not created at {PATIENT_CACHE_FILE}")
+        logger.info(f"Saved patient cache to {PATIENT_CACHE_FILE} with {len(patient_cache)} patients")
+        logger.debug(f"Verified patient_cache.json exists at {PATIENT_CACHE_FILE}")
+
+        # Upload to MEGA
+        m = mega.login(os.environ.get('MEGA_EMAIL'), os.environ.get('MEGA_PASSWORD'))
+        logger.info("Logging in user...")
+        # Get or create the patient_cache.json folder
+        folder = None
+        files = m.get_files()
+        for file_id, file_info in files.items():
+            if file_info['t'] == 1 and file_info['n'] == 'patient_cache.json':  # t=1 means folder
+                folder = file_id
+                break
+        if not folder:
+            folder = m.create_folder('patient_cache.json')
+            logger.info("Created MEGA folder: patient_cache.json")
+        
+        # Upload patient.txt to the folder
+        m.upload(PATIENT_CACHE_FILE, folder, dest_filename='patient.txt')
+        logger.info(f"Uploaded patient cache to MEGA: patient_cache.json/patient.txt")
     except Exception as e:
-        logger.error(f"Failed to save patient cache: {e}")
+        logger.error(f"Failed to upload patient cache to MEGA: {e}")
         if temp_file and os.path.exists(temp_file):
             try:
                 os.unlink(temp_file)
