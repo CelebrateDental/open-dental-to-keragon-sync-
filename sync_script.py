@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/
 import os
 import sys
 import json
@@ -417,7 +417,7 @@ def save_patient_cache(patient_cache: Dict[int, Dict[str, Any]]):
         # Save locally first
         with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.tmp', dir=os.path.dirname(PATIENT_CACHE_FILE) or '.') as f:
             cache_data = {
-                'cache_date': datetime.datetime.now(CLINIC_TIMEZONE).isoformat(),  # Fixed datetime.now
+                'cache_date': datetime.datetime.now(CLINIC_TIMEZONE).isoformat(),
                 'patients': {str(k): v for k, v in patient_cache.items()}
             }
             json.dump(cache_data, f, indent=2)
@@ -434,46 +434,48 @@ def save_patient_cache(patient_cache: Dict[int, Dict[str, Any]]):
         folder = None
         files = m.get_files()
         for file_id, file_info in files.items():
-            # Check for folder (t=1) with name 'patient_cache.json'
             if file_info.get('t') == 1 and file_info.get('n') == 'patient_cache.json':
                 folder = file_id
                 break
         if not folder:
             folder = m.create_folder('patient_cache.json')
             logger.info("Created MEGA folder: patient_cache.json")
+            # Refresh files list to ensure folder is available
+            files = m.get_files()
+            for file_id, file_info in files.items():
+                if file_info.get('t') == 1 and file_info.get('n') == 'patient_cache.json':
+                    folder = file_id
+                    break
+            if not folder:
+                logger.error("Failed to verify patient_cache.json folder after creation")
+                raise Exception("Failed to verify patient_cache.json folder after creation")
+        
+        # Delete existing patient.txt if it exists to avoid duplicates
+        for file_id, file_info in files.items():
+            if (file_info.get('t') == 0 and 
+                file_info.get('n') == 'patient.txt' and 
+                file_info.get('p') == folder):
+                m.delete(file_id)
+                logger.info(f"Deleted existing patient.txt from MEGA folder: patient_cache.json")
+                break
         
         # Upload patient.txt to the folder
         m.upload(PATIENT_CACHE_FILE, folder, dest_filename='patient.txt')
         logger.info(f"Uploaded patient cache to MEGA: patient_cache.json/patient.txt")
     except Exception as e:
         logger.error(f"Failed to upload patient cache to MEGA: {e}")
+        # Create empty file as fallback
+        if not os.path.exists(PATIENT_CACHE_FILE):
+            logger.warning(f"Creating empty patient_cache.json due to error")
+            with open(PATIENT_CACHE_FILE, 'w') as f:
+                json.dump({'cache_date': datetime.datetime.now(CLINIC_TIMEZONE).isoformat(), 'patients': {}}, f, indent=2)
+            logger.debug(f"Created empty patient_cache.json at {PATIENT_CACHE_FILE}")
     finally:
         if temp_file and os.path.exists(temp_file):
             try:
                 os.unlink(temp_file)
             except Exception as e:
                 logger.error(f"Failed to clean up temp file {temp_file}: {e}")
-        # Create empty file as fallback
-        logger.warning(f"Creating empty patient_cache.json due to error")
-        with open(PATIENT_CACHE_FILE, 'w') as f:
-            json.dump({'cache_date': datetime.datetime.now(CLINIC_TIMEZONE).isoformat(), 'patients': {}}, f, indent=2)
-        if os.path.exists(PATIENT_CACHE_FILE):
-            logger.debug(f"Created empty patient_cache.json at {PATIENT_CACHE_FILE}")
-
-    # Upload to MEGA as patient.txt
-    try:
-        folder = m.find(folder_path)
-        if not folder:
-            m.create_folder(folder_path)
-            folder = m.find(folder_path)
-        file = m.find(file_name, folder=folder[0])
-        if file:
-            m.delete(file[0])
-            logger.debug(f"Deleted existing patient cache in MEGA: {cache_path}")
-        m.upload(PATIENT_CACHE_FILE, dest=folder[0], dest_filename=file_name)
-        logger.info(f"Uploaded patient cache to MEGA: {cache_path}")
-    except Exception as e:
-        logger.error(f"Failed to upload patient cache to MEGA: {e}")
 
 # === PROVIDER CACHE ===
 def load_provider_cache() -> Dict[int, Dict[str, Any]]:
