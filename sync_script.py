@@ -1153,7 +1153,7 @@ def fetch_appointments_optimized(
     
     time_filtered_appointments = [
         appt for appt in all_appointments
-        if window.start_time <= parse_time(appt.get('DateTStamp', '')) <= window.end_time
+        if window.start_time <= parse_time(appt.get('AptDateTime' if not window.is_incremental else 'DateTStamp', '')) <= window.end_time
     ]
     filtered_appointments = apply_appointment_filters(time_filtered_appointments, appointment_filter)
     deduplicated_appointments = deduplicate_appointments(filtered_appointments)
