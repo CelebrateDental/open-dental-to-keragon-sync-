@@ -18,6 +18,8 @@ from dataclasses import dataclass, asdict
 from collections import defaultdict
 import hashlib
 
+from mega import Mega
+
 # === CONFIGURATION ===
 API_BASE_URL = os.environ.get('OPEN_DENTAL_API_URL', 'https://api.opendental.com/api/v1')
 DEVELOPER_KEY = os.environ.get('OPEN_DENTAL_DEVELOPER_KEY')
@@ -343,36 +345,69 @@ def get_appointment_types(clinic_num: int, force_refresh: bool = False) -> Dict[
 
 def get_appointment_type_name(appointment: Dict[str, Any], clinic_num: int) -> str:
     apt_type_num = appointment.get('AppointmentTypeNum')
-    if apt_type_num is not None:
-        appointment_types = get_appointment_types(clinic_num)
-        apt_type_name = appointment_types.get(int(apt_type_num), '')
-        if apt_type_name:
-            return apt_type_name
-        else:
-            logger.warning(f"No AppointmentTypeName for AppointmentTypeNum {apt_type_num} in clinic {clinic_num}")
-    apt_type_direct = appointment.get('AptType', '') or appointment.get('AppointmentType', '')
-    if not apt_type_direct:
-        logger.debug(f"No AppointmentTypeNum or AptType for appointment {appointment.get('AptNum')}")
-    return apt_type_direct
+    if apt_type_num is None:
+        apt_type_direct = appointment.get('AptType', '') or appointment.get('AppointmentType', '')
+        if not apt_type_direct:
+            logger.debug(f"No AppointmentTypeNum or AptType for appointment {appointment.get('AptNum')}")
+        return apt_type_direct
+
+    appointment_types = get_appointment_types(clinic_num)
+    apt_type_name = appointment_types.get(int(apt_type_num), '')
+    if apt_type_name:
+        return apt_type_name
+    else:
+        logger.warning(f"No AppointmentTypeName for AppointmentTypeNum {apt_type_num} in clinic {clinic_num}")
+    return apt_type_name
 
 def has_ghl_tag(appointment: Dict[str, Any]) -> bool:
     return '[fromGHL]' in (appointment.get('Note', '') or '')
 
 # === PATIENT CACHE ===
 def load_patient_cache() -> Dict[int, Dict[str, Any]]:
-    if not os.path.exists(PATIENT_CACHE_FILE):
-        logger.info("No patient cache file found")
-        return {}
-    try:
-        with open(PATIENT_CACHE_FILE) as f:
-            data = json.load(f)
-            logger.info(f"Loaded patient cache from {PATIENT_CACHE_FILE} with {len(data.get('patients', {}))} patients")
-            return {int(k): v for k, v in data.get('patients', {}).items()}
-    except Exception as e:
-        logger.error(f"Failed to load patient cache: {e}")
-        return {}
+    mega = Mega()
+    m = mega.login(os.environ.get('MEGA_EMAIL'), os.environ.get('MEGA_PASSWORD'))
+    folder_path = 'patient_cache.json'
+    file_name = 'patient.txt'
+    cache_path = f"{folder_path}/{file_name}"
+    local_cache_file = PATIENT_CACHE_FILE
+
+    if not os.path.exists(local_cache_file):
+        try:
+            folder = m.find(folder_path)
+            if not folder:
+                m.create_folder(folder_path)
+                logger.info(f"Created MEGA folder: {folder_path}")
+                folder = m.find(folder_path)
+            file = m.find(file_name, folder=folder[0])
+            if file:
+                m.download(file, local_cache_file)
+                logger.info(f"Downloaded patient cache from MEGA: {cache_path} to {local_cache_file}")
+            else:
+                logger.info("No patient cache found in MEGA, starting with empty")
+                return {}
+        except Exception as e:
+            logger.error(f"Failed to download patient cache from MEGA: {e}")
+            return {}
+
+    if os.path.exists(local_cache_file):
+        try:
+            with open(local_cache_file) as f:
+                data = json.load(f)
+                logger.info(f"Loaded patient cache from {local_cache_file} with {len(data.get('patients', {}))} patients")
+                return {int(k): v for k, v in data.get('patients', {}).items()}
+        except Exception as e:
+            logger.error(f"Failed to load patient cache: {e}")
+            return {}
+    return {}
 
 def save_patient_cache(patient_cache: Dict[int, Dict[str, Any]]):
+    mega = Mega()
+    m = mega.login(os.environ.get('MEGA_EMAIL'), os.environ.get('MEGA_PASSWORD'))
+    folder_path = 'patient_cache.json'
+    file_name = 'patient.txt'
+    cache_path = f"{folder_path}/{file_name}"
+    local_cache_file = PATIENT_CACHE_FILE
+
     temp_file = None
     existing_patients = {}
     
@@ -404,7 +439,7 @@ def save_patient_cache(patient_cache: Dict[int, Dict[str, Any]]):
                 merged_patients[patnum] = patient_data
                 updated_patients_count += 1
     
-    # Write merged cache to file
+    # Write merged cache to local file
     try:
         with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.tmp', dir=os.path.dirname(PATIENT_CACHE_FILE) or '.') as f:
             cache_data = {
@@ -435,6 +470,21 @@ def save_patient_cache(patient_cache: Dict[int, Dict[str, Any]]):
             json.dump({'cache_date': datetime.datetime.now(CLINIC_TIMEZONE).isoformat(), 'patients': {}}, f, indent=2)
         if os.path.exists(PATIENT_CACHE_FILE):
             logger.debug(f"Created empty patient_cache.json at {PATIENT_CACHE_FILE}")
+
+    # Upload to MEGA as patient.txt
+    try:
+        folder = m.find(folder_path)
+        if not folder:
+            m.create_folder(folder_path)
+            folder = m.find(folder_path)
+        file = m.find(file_name, folder=folder[0])
+        if file:
+            m.delete(file[0])
+            logger.debug(f"Deleted existing patient cache in MEGA: {cache_path}")
+        m.upload(PATIENT_CACHE_FILE, dest=folder[0], dest_filename=file_name)
+        logger.info(f"Uploaded patient cache to MEGA: {cache_path}")
+    except Exception as e:
+        logger.error(f"Failed to upload patient cache to MEGA: {e}")
 
 # === PROVIDER CACHE ===
 def load_provider_cache() -> Dict[int, Dict[str, Any]]:
