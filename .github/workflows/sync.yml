@@ -149,6 +149,8 @@ jobs:
         id: sync
         env:
           OPEN_DENTAL_DEVELOPER_KEY: ${{ secrets.OPEN_DENTAL_DEVELOPER_KEY }}
+          MEGA_EMAIL: ${{ secrets.MEGA_EMAIL }}
+          MEGA_PASSWORD: ${{ secrets.MEGA_PASSWORD }}
           OPEN_DENTAL_CUSTOMER_KEY: ${{ secrets.OPEN_DENTAL_CUSTOMER_KEY }}
           KERAGON_WEBHOOK_URL: ${{ secrets.KERAGON_WEBHOOK_URL }}
           CLINIC_NUMS: "${{ secrets.CLINIC_NUM_1 }},${{ secrets.CLINIC_NUM_2 }}"
