@@ -372,7 +372,8 @@ def load_patient_cache() -> Dict[int, Dict[str, Any]]:
         folder = None
         files = m.get_files()
         for file_id, file_info in files.items():
-            if file_info['t'] == 1 and file_info['n'] == 'patient_cache.json':  # t=1 means folder
+            # Check for folder (t=1) with name 'patient_cache.json'
+            if file_info.get('t') == 1 and file_info.get('n') == 'patient_cache.json':
                 folder = file_id
                 break
         if not folder:
@@ -382,7 +383,10 @@ def load_patient_cache() -> Dict[int, Dict[str, Any]]:
         # Find patient.txt in the folder
         file = None
         for file_id, file_info in files.items():
-            if file_info['t'] == 0 and file_info['n'] == 'patient.txt' and file_info.get('p') == folder:  # t=0 means file
+            # Check for file (t=0) with name 'patient.txt' in the folder
+            if (file_info.get('t') == 0 and 
+                file_info.get('n') == 'patient.txt' and 
+                file_info.get('p') == folder):
                 file = file_id
                 break
         
@@ -408,13 +412,12 @@ def load_patient_cache() -> Dict[int, Dict[str, Any]]:
         return {}
 
 def save_patient_cache(patient_cache: Dict[int, Dict[str, Any]]):
-    mega = Mega()
     temp_file = None
     try:
         # Save locally first
         with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.tmp', dir=os.path.dirname(PATIENT_CACHE_FILE) or '.') as f:
             cache_data = {
-                'cache_date': datetime.now(CLINIC_TIMEZONE).isoformat(),
+                'cache_date': datetime.datetime.now(CLINIC_TIMEZONE).isoformat(),  # Fixed datetime.now
                 'patients': {str(k): v for k, v in patient_cache.items()}
             }
             json.dump(cache_data, f, indent=2)
@@ -424,13 +427,15 @@ def save_patient_cache(patient_cache: Dict[int, Dict[str, Any]]):
         logger.debug(f"Verified patient_cache.json exists at {PATIENT_CACHE_FILE}")
 
         # Upload to MEGA
+        mega = Mega()
         m = mega.login(os.environ.get('MEGA_EMAIL'), os.environ.get('MEGA_PASSWORD'))
         logger.info("Logging in user...")
         # Get or create the patient_cache.json folder
         folder = None
         files = m.get_files()
         for file_id, file_info in files.items():
-            if file_info['t'] == 1 and file_info['n'] == 'patient_cache.json':  # t=1 means folder
+            # Check for folder (t=1) with name 'patient_cache.json'
+            if file_info.get('t') == 1 and file_info.get('n') == 'patient_cache.json':
                 folder = file_id
                 break
         if not folder:
@@ -442,11 +447,12 @@ def save_patient_cache(patient_cache: Dict[int, Dict[str, Any]]):
         logger.info(f"Uploaded patient cache to MEGA: patient_cache.json/patient.txt")
     except Exception as e:
         logger.error(f"Failed to upload patient cache to MEGA: {e}")
+    finally:
         if temp_file and os.path.exists(temp_file):
             try:
                 os.unlink(temp_file)
-            except:
-                pass
+            except Exception as e:
+                logger.error(f"Failed to clean up temp file {temp_file}: {e}")
         # Create empty file as fallback
         logger.warning(f"Creating empty patient_cache.json due to error")
         with open(PATIENT_CACHE_FILE, 'w') as f:
