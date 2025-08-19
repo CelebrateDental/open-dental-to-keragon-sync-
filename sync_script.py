@@ -45,7 +45,7 @@ RETRY_ATTEMPTS = int(os.environ.get('RETRY_ATTEMPTS', '5'))
 BACKOFF_FACTOR = float(os.environ.get('BACKOFF_FACTOR', '3.0'))
 
 # === SMART SYNC OPTIMIZATION ===
-INCREMENTAL_SYNC_MINUTES = int(os.environ.get('INCREMENTAL_SYNC_MINUTES', '15'))
+INCREMENTAL_SYNC_MINUTES = int(os.environ.get('INCREMENTAL_SYNC_MINUTES', '336'))
 DEEP_SYNC_HOURS = int(os.environ.get('DEEP_SYNC_HOURS', '720'))
 SAFETY_OVERLAP_HOURS = int(os.environ.get('SAFETY_OVERLAP_HOURS', '2'))
 
