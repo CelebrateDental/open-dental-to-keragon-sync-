@@ -156,7 +156,7 @@ jobs:
           CLINIC_NUMS: "${{ secrets.CLINIC_NUM_1 }},${{ secrets.CLINIC_NUM_2 }}"
           LOG_LEVEL: "DEBUG"
           CLINIC_DELAY_SECONDS: "5.0"
-          INCREMENTAL_SYNC_MINUTES: "336"
+          INCREMENTAL_SYNC_MINUTES: "20160"
           DEEP_SYNC_HOURS: "720"
           SAFETY_OVERLAP_HOURS: "2"
           ENABLE_CACHING: "true"
