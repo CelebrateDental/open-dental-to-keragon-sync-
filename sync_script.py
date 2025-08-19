@@ -428,40 +428,65 @@ def save_patient_cache(patient_cache: Dict[int, Dict[str, Any]]):
 
         # Upload to MEGA
         mega = Mega()
-        m = mega.login(os.environ.get('MEGA_EMAIL'), os.environ.get('MEGA_PASSWORD'))
         logger.info("Logging in user...")
-        # Get or create the patient_cache.json folder
+        m = mega.login(os.environ.get('MEGA_EMAIL'), os.environ.get('MEGA_PASSWORD'))
+        # Get or create the patient_cache folder
         folder = None
         files = m.get_files()
         for file_id, file_info in files.items():
-            if file_info.get('t') == 1 and file_info.get('n') == 'patient_cache.json':
+            if file_info.get('t') == 1 and file_info.get('n') == 'patient_cache':
                 folder = file_id
                 break
         if not folder:
-            folder = m.create_folder('patient_cache.json')
-            logger.info("Created MEGA folder: patient_cache.json")
+            folder = m.create_folder('patient_cache')
+            logger.info("Created MEGA folder: patient_cache")
+            time.sleep(2)  # Allow propagation delay
             # Refresh files list to ensure folder is available
             files = m.get_files()
             for file_id, file_info in files.items():
-                if file_info.get('t') == 1 and file_info.get('n') == 'patient_cache.json':
+                if file_info.get('t') == 1 and file_info.get('n') == 'patient_cache':
                     folder = file_id
                     break
             if not folder:
-                logger.error("Failed to verify patient_cache.json folder after creation")
-                raise Exception("Failed to verify patient_cache.json folder after creation")
+                logger.error("Failed to verify patient_cache folder after creation")
+                raise Exception("Failed to verify patient_cache folder after creation")
         
-        # Delete existing patient.txt if it exists to avoid duplicates
+        # Delete existing patient_cache.json if it exists to avoid duplicates
         for file_id, file_info in files.items():
             if (file_info.get('t') == 0 and 
-                file_info.get('n') == 'patient.txt' and 
+                file_info.get('n') == 'patient_cache.json' and 
                 file_info.get('p') == folder):
                 m.delete(file_id)
-                logger.info(f"Deleted existing patient.txt from MEGA folder: patient_cache.json")
+                logger.info(f"Deleted existing patient_cache.json from MEGA folder: patient_cache")
                 break
         
-        # Upload patient.txt to the folder
-        m.upload(PATIENT_CACHE_FILE, folder, dest_filename='patient.txt')
-        logger.info(f"Uploaded patient cache to MEGA: patient_cache.json/patient.txt")
+        # Upload patient_cache.json to the folder
+        try:
+            m.upload(PATIENT_CACHE_FILE, folder, dest_filename='patient_cache.json')
+        except Exception as e:
+            if 'ENOENT' in str(e):
+                logger.warning("ENOENT detected, refreshing folder and retrying upload")
+                time.sleep(2)
+                files = m.get_files()
+                folder = None
+                for file_id, file_info in files.items():
+                    if file_info.get('t') == 1 and file_info.get('n') == 'patient_cache':
+                        folder = file_id
+                        break
+                if not folder:
+                    raise Exception("Folder not found after retry refresh")
+                # Delete existing if any (though unlikely)
+                for file_id, file_info in files.items():
+                    if (file_info.get('t') == 0 and 
+                        file_info.get('n') == 'patient_cache.json' and 
+                        file_info.get('p') == folder):
+                        m.delete(file_id)
+                        logger.info(f"Deleted existing patient_cache.json from MEGA folder: patient_cache on retry")
+                        break
+                m.upload(PATIENT_CACHE_FILE, folder, dest_filename='patient_cache.json')
+            else:
+                raise
+        logger.info(f"Uploaded patient cache to MEGA: patient_cache/patient_cache.json")
     except Exception as e:
         logger.error(f"Failed to upload patient cache to MEGA: {e}")
         # Create empty file as fallback
