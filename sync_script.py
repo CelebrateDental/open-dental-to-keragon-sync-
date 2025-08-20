@@ -637,7 +637,7 @@ def get_operatories(clinic_num: int, force_refresh: bool = False) -> List[Dict[s
         logger.warning(f"Failed to fetch operatories for clinic {clinic_num}: {e}")
         return []
 
-# === STATE MANAGEMENT (REPLACED / ENHANCED) ===
+# === STATE MANAGEMENT ===
 def load_last_sync_times() -> Dict[int, Optional[datetime.datetime]]:
     state: Dict[int, Optional[datetime.datetime]] = {c: None for c in CLINIC_NUMS}
     if os.path.exists(STATE_FILE):
@@ -661,80 +661,6 @@ def load_last_sync_times() -> Dict[int, Optional[datetime.datetime]]:
             logger.error(f"Error reading state file: {e}")
     return state
 
-
-def _normalize_sent_index(raw: Any) -> Dict[str, Dict[str, str]]:
-    """
-    Backward-compatible normalization:
-    - Old format: list of AptNum strings -> become {apt: {"last_sent_tstamp": ""}}
-    - New format: {"apt": {"last_sent_tstamp": ISO8601}}
-    """
-    if isinstance(raw, dict):
-        out = {}
-        for k, v in raw.items():
-            if isinstance(v, dict) and "last_sent_tstamp" in v:
-                out[str(k)] = {"last_sent_tstamp": str(v.get("last_sent_tstamp") or "")}
-            else:
-                out[str(k)] = {"last_sent_tstamp": ""}
-        return out
-    elif isinstance(raw, list):
-        return {str(x): {"last_sent_tstamp": ""} for x in raw}
-    else:
-        return {}
-
-
-def load_sent_appointments() -> Dict[str, Dict[str, str]]:
-    """
-    Returns a mapping:
-        { "<AptNum>": {"last_sent_tstamp": "<ISO8601 or ''>"} }
-    """
-    if os.path.exists(SENT_APPTS_FILE):
-        try:
-            with open(SENT_APPTS_FILE) as f:
-                data = json.load(f)
-                idx = _normalize_sent_index(data)
-                logger.info(f"Loaded sent index for {len(idx)} appointments")
-                return idx
-        except json.JSONDecodeError as e:
-            logger.error(f"Corrupted sent appointments file: {e}")
-        except Exception as e:
-            logger.error(f"Error reading sent appointments file: {e}")
-    return {}
-
-
-def save_state_atomically(sync_times: Dict[int, Optional[datetime.datetime]],
-                          sent_index: Dict[str, Dict[str, str]]) -> None:
-    """
-    Atomically writes both:
-      - last sync per clinic (unchanged format)
-      - sent index as a dict {apt: {last_sent_tstamp: ISO}}
-    """
-    temp_sync_file = None
-    temp_sent_file = None
-    try:
-        sync_data = {str(c): dt.isoformat() if dt else None for c, dt in sync_times.items()}
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.tmp',
-                                         dir=os.path.dirname(STATE_FILE) or '.') as f:
-            json.dump(sync_data, f, indent=2)
-            temp_sync_file = f.name
-
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.tmp',
-                                         dir=os.path.dirname(SENT_APPTS_FILE) or '.') as f:
-            json.dump(sent_index, f, indent=2)
-            temp_sent_file = f.name
-
-        shutil.move(temp_sync_file, STATE_FILE)
-        shutil.move(temp_sent_file, SENT_APPTS_FILE)
-        logger.info(f"Saved state files with {len(sent_index)} sent appointment records")
-    except Exception as e:
-        logger.error(f"Error in atomic save: {e}")
-        for temp_file in [temp_sync_file, temp_sent_file]:
-            if temp_file and os.path.exists(temp_file):
-                try:
-                    os.unlink(temp_file)
-                except:
-                    pass
-        raise
-
 def validate_sync_time_update(clinic: int, old_time: Optional[datetime.datetime], 
                              new_time: Optional[datetime.datetime]) -> bool:
     if not old_time:
@@ -751,46 +677,61 @@ def validate_sync_time_update(clinic: int, old_time: Optional[datetime.datetime]
         return False
     return True
 
-# === APPOINTMENT IDEMPOTENCY HELPERS (NEW) ===
-def _last_sent_dt_for(apt_num: str, sent_index: Dict[str, Dict[str, str]]) -> Optional[datetime.datetime]:
-    rec = sent_index.get(apt_num)
-    if not rec:
-        return None
-    ts = rec.get("last_sent_tstamp") or ""
-    return parse_time(ts) if ts else None
+def save_state_atomically(sync_times: Dict[int, Optional[datetime.datetime]], 
+                         sent_appointments: Dict[str, Dict[str, str]]) -> None:
+    temp_sync_file = None
+    temp_sent_file = None
+    try:
+        sync_data = {str(c): dt.isoformat() if dt else None for c, dt in sync_times.items()}
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.tmp', 
+                                        dir=os.path.dirname(STATE_FILE) or '.') as f:
+            json.dump(sync_data, f, indent=2)
+            temp_sync_file = f.name
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.tmp',
+                                        dir=os.path.dirname(SENT_APPTS_FILE) or '.') as f:
+            json.dump(sent_appointments, f, indent=2)
+            temp_sent_file = f.name
+        shutil.move(temp_sync_file, STATE_FILE)
+        shutil.move(temp_sent_file, SENT_APPTS_FILE)
+        logger.info(f"Saved state files with {len(sent_appointments)} sent appointment entries")
+    except Exception as e:
+        logger.error(f"Error in atomic save: {e}")
+        for temp_file in [temp_sync_file, temp_sent_file]:
+            if temp_file and os.path.exists(temp_file):
+                try:
+                    os.unlink(temp_file)
+                except:
+                    pass
+        raise
 
+def load_sent_appointments() -> Dict[str, Dict[str, str]]:
+    if os.path.exists(SENT_APPTS_FILE):
+        try:
+            with open(SENT_APPTS_FILE) as f:
+                data = json.load(f)
 
-def should_send_appointment(appointment: Dict[str, Any],
-                            sent_index: Dict[str, Dict[str, str]]) -> bool:
-    """Send only if never sent OR DateTStamp strictly newer than last_sent_tstamp."""
-    apt_num = str(appointment.get('AptNum', '')).strip()
-    if not apt_num:
-        logger.warning("Appointment without AptNum encountered; skipping.")
-        return False
+                # New (dict) format: {"AptNum": {"last_sent_tstamp": "..."}, ...}
+                if isinstance(data, dict):
+                    out = {}
+                    for k, v in data.items():
+                        if isinstance(v, dict):
+                            ts = v.get('last_sent_tstamp', '') or ''
+                        else:
+                            ts = str(v) if v else ''
+                        out[str(k)] = {"last_sent_tstamp": ts}
+                    return out
 
-    dt_cur = parse_time(appointment.get('DateTStamp'))
-    if not dt_cur:
-        logger.warning(f"Appointment {apt_num} missing/invalid DateTStamp; skipping for safety.")
-        return False
+                # Legacy (list) format: ["AptNum1","AptNum2",...]
+                if isinstance(data, list):
+                    return {str(x): {"last_sent_tstamp": ""} for x in data}
 
-    dt_last = _last_sent_dt_for(apt_num, sent_index)
-    if dt_last is None:
-        return True
-
-    return dt_cur > dt_last
-
-
-def mark_sent_appointments(sent_index: Dict[str, Dict[str, str]],
-                           appointments: List[Dict[str, Any]],
-                           sent_ids: List[str]) -> None:
-    """Update the persistent sent index ONLY for successfully sent appointments."""
-    by_id = {str(a.get('AptNum', '')).strip(): a for a in appointments}
-    for aid in sent_ids:
-        appt = by_id.get(str(aid).strip())
-        if not appt:
-            continue
-        ts = appt.get('DateTStamp') or ''
-        sent_index[str(aid)] = {"last_sent_tstamp": ts}
+                logger.error(f"Invalid sent appointments file format: expected dict or list, got {type(data)}")
+                return {}
+        except json.JSONDecodeError as e:
+            logger.error(f"Corrupted sent appointments file: {e}")
+        except Exception as e:
+            logger.error(f"Error reading sent appointments file: {e}")
+    return {}
 
 # === UTILITIES ===
 def parse_time(s: Optional[str]) -> Optional[datetime.datetime]:
@@ -1247,7 +1188,7 @@ def fetch_appointments_optimized(
     
     time_filtered_appointments = [
         appt for appt in all_appointments
-        if window.start_time <= parse_time(appt.get('AptDateTime' if not window.is_incremental else 'DateTStamp', '')) <= window.end_time
+        if windows[0].start_time <= parse_time(appt.get('AptDateTime' if not windows[0].is_incremental else 'DateTStamp', '')) <= windows[0].end_time
     ]
     filtered_appointments = apply_appointment_filters(time_filtered_appointments, appointment_filter)
     deduplicated_appointments = deduplicate_appointments(filtered_appointments)
@@ -1400,7 +1341,7 @@ def send_batch_to_keragon(appointments: List[Dict[str, Any]], clinic: int, patie
 def process_clinic_optimized(
     clinic: int,
     last_syncs: Dict[int, Optional[datetime.datetime]],
-    sent_appointments: Set[str],
+    sent_appointments: Dict[str, Dict[str, str]],
     dry_run: bool = False,
     force_deep_sync: bool = False
 ) -> Tuple[int, List[str], datetime.datetime]:
@@ -1411,21 +1352,48 @@ def process_clinic_optimized(
     
     new_appointments = []
     pat_nums = set()
-
+    apt_map: Dict[str, Dict[str, Any]] = {}
     for appt in appointments:
-        apt_num = str(appt.get('AptNum', '')).strip()
+        apt_num = str(appt.get('AptNum', ''))
         pat_num = appt.get('PatNum')
         if not pat_num:
             logger.warning(f"Skipping appointment {apt_num} with missing PatNum")
             continue
-
-        # Send only if never sent OR DateTStamp strictly newer than last sent for this AptNum
-        if not should_send_appointment(appt, sent_appointments):
-            logger.debug(f"Skipping unchanged appointment {apt_num}")
+        
+        # Must have valid DateTStamp to avoid duplicates
+        date_tstamp = parse_time(appt.get('DateTStamp'))
+        if not date_tstamp:
+            logger.warning(f"Skipping appointment {apt_num} with invalid or missing DateTStamp")
             continue
 
+        sent_entry = sent_appointments.get(apt_num)
+
+        if sent_entry is not None:
+            last_sent_raw = (sent_entry.get('last_sent_tstamp') or '').strip()
+
+            # Presence-only rule: if in file but empty timestamp, treat as already sent.
+            # Backfill to current DateTStamp and skip sending now.
+            if not last_sent_raw:
+                sent_entry['last_sent_tstamp'] = appt.get('DateTStamp') or ''
+                logger.debug(
+                    f"Presence-only record for {apt_num}; backfilled last_sent_tstamp "
+                    f"to '{sent_entry['last_sent_tstamp']}' and skipping send"
+                )
+                continue
+
+            # Normal rule: only send if changed since last_sent_tstamp
+            last_sent = parse_time(last_sent_raw)
+            if last_sent and date_tstamp <= last_sent:
+                logger.debug(
+                    f"Skipping already-sent appointment {apt_num}: "
+                    f"DateTStamp {date_tstamp} <= last_sent_tstamp {last_sent}"
+                )
+                continue
+
+        # Not in file (never sent) OR updated (DateTStamp > last_sent_tstamp)
         pat_nums.add(pat_num)
         new_appointments.append(appt)
+        apt_map[apt_num] = appt
     
     logger.info(f"Clinic {clinic}: Found {len(new_appointments)} new or updated appointments for {len(pat_nums)} patients")
     
@@ -1434,9 +1402,13 @@ def process_clinic_optimized(
     sent_count, sent_ids = send_batch_to_keragon(new_appointments, clinic, patient_data, dry_run)
     logger.info(f"Clinic {clinic}: Successfully sent {sent_count} appointments")
 
-    # Persist per-appointment last-sent DateTStamp for idempotency
-    if sent_ids:
-        mark_sent_appointments(sent_appointments, new_appointments, sent_ids)
+    # Mark only the ones that truly succeeded
+    for apt_id in sent_ids:
+        appt = apt_map.get(str(apt_id))
+        if appt:
+            ts = appt.get('DateTStamp') or ''
+            entry = sent_appointments.setdefault(str(apt_id), {})
+            entry['last_sent_tstamp'] = ts
     
     sync_time = datetime.datetime.utcnow().replace(tzinfo=timezone.utc)
     return sent_count, sent_ids, sync_time
@@ -1479,13 +1451,10 @@ def main_loop(dry_run: bool = False, force_deep_sync: bool = False, once: bool =
             else:
                 logger.warning(f"Clinic {clinic}: Skipping sync time update due to invalid timestamp")
         
-        # process_clinic_optimized updates sent_appointments dict itself for successful sends
+        # Persist state unconditionally to capture backfills and sent timestamps
         try:
             save_state_atomically(last_syncs, sent_appointments)
-            if new_sent_ids:
-                logger.info("Committed state and updated per-appointment idempotency index")
-            else:
-                logger.info("Committed state (no new sends this run)")
+            logger.info("Committed state and sent appointments")
         except Exception as e:
             logger.error(f"Failed to save state: {e}")
         
