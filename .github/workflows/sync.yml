@@ -3,7 +3,7 @@ name: Open Dental to Keragon Sync
 on:
   schedule:
     - cron: '0 7 * * *'  # Deep sync at 2 AM CDT (7 AM UTC)
-    - cron: '0 13-23,0-1 * * *'  # Hourly at :00 from 8 AM–8 PM CDT (in UTC)
+    - cron: '0 13-23,0-4 * * *'  # Hourly at :00 from 8 AM–8 PM CDT (in UTC)
   workflow_dispatch:
     inputs:
       force_deep_sync:
