@@ -246,7 +246,7 @@
     "last_sent_tstamp": "2025-08-20 17:45:08"
   },
   "3801201": {
-    "last_sent_tstamp": "2025-08-20 17:20:41"
+    "last_sent_tstamp": "2025-08-20 18:28:37"
   },
   "3804661": {
     "last_sent_tstamp": ""
@@ -432,7 +432,7 @@
     "last_sent_tstamp": ""
   },
   "3800017": {
-    "last_sent_tstamp": "2025-08-20 18:02:51"
+    "last_sent_tstamp": "2025-08-20 18:36:03"
   },
   "3804304": {
     "last_sent_tstamp": ""
@@ -654,7 +654,7 @@
     "last_sent_tstamp": ""
   },
   "3805760": {
-    "last_sent_tstamp": ""
+    "last_sent_tstamp": "2025-08-20 19:20:08"
   },
   "3806217": {
     "last_sent_tstamp": ""
@@ -702,7 +702,7 @@
     "last_sent_tstamp": ""
   },
   "3799935": {
-    "last_sent_tstamp": "2025-08-20 18:01:32"
+    "last_sent_tstamp": "2025-08-20 18:48:42"
   },
   "3805219": {
     "last_sent_tstamp": ""
@@ -717,7 +717,7 @@
     "last_sent_tstamp": "2025-08-20 16:52:46"
   },
   "3807038": {
-    "last_sent_tstamp": ""
+    "last_sent_tstamp": "2025-08-20 18:21:31"
   },
   "3787787": {
     "last_sent_tstamp": "2025-08-20 14:49:24"
@@ -751,5 +751,8 @@
   },
   "3807917": {
     "last_sent_tstamp": "2025-08-20 16:31:18"
+  },
+  "3808040": {
+    "last_sent_tstamp": "2025-08-20 19:33:17"
   }
 }
