@@ -246,6 +246,14 @@ jobs:
             echo "appointment_types_cache.json: missing"
           fi
 
+      # === ADDED: Rebase on latest to avoid non-fast-forward push errors ===
+      - name: Rebase on latest main
+        run: |
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+          git fetch origin "${GITHUB_REF_NAME:-main}"
+          git pull --rebase origin "${GITHUB_REF_NAME:-main}"
+
       - name: Commit and push state files (excluding patient data)
         if: steps.sync.outcome == 'success'
         uses: stefanzweifel/git-auto-commit-action@v5
@@ -254,3 +262,4 @@ jobs:
           file_pattern: 'last_sync_state.json sent_appointments.json appointment_types_cache.json operatory_cache.json .gitignore'
           commit_user_name: 'GitHub Actions Bot'
           commit_user_email: 'actions@github.com'
+          branch: ${{ github.ref_name }}
