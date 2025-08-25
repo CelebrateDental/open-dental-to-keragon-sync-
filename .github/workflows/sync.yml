@@ -246,13 +246,17 @@ jobs:
             echo "appointment_types_cache.json: missing"
           fi
 
-      # === ADDED: Rebase on latest to avoid non-fast-forward push errors ===
-      - name: Rebase on latest main
+      # === MODIFIED: Rebase on latest with stash to handle unstaged changes ===
+      - name: Rebase on latest main (stash working tree)
         run: |
           git config user.name "GitHub Actions Bot"
           git config user.email "actions@github.com"
+          # Stash all changes (tracked + untracked) so rebase can proceed
+          git stash push --include-untracked --all -m "pre-rebase-$(date +%s)" || true
           git fetch origin "${GITHUB_REF_NAME:-main}"
           git pull --rebase origin "${GITHUB_REF_NAME:-main}"
+          # Re-apply your changes
+          git stash pop || true
 
       - name: Commit and push state files (excluding patient data)
         if: steps.sync.outcome == 'success'
