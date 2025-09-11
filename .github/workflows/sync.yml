@@ -121,7 +121,7 @@ jobs:
           # ---- GoHighLevel / LeadConnector ----
           # Provide either/both:
           GHL_LOCATION_ID:           ${{ secrets.GHL_LOCATION_ID }}
-          GHL_LOCATION_ACCESS_TOKEN: ${{ secrets.GHL_LOCATION_ACCESS_TOKEN }}   # Location OAuth token (JWT)
+          GHL_AUTH_TOKEN:            ${{ secrets.GHL_AUTH_TOKEN }}  # Location OAuth token (JWT)
           GHL_LOCATION_API_KEY:      ${{ secrets.GHL_LOCATION_API_KEY }}        # Location API Key (static)
 
           # Mappings (JSON strings)
