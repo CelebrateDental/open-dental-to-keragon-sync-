@@ -1,1367 +1,982 @@
-#!/usr/
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+OpenDental → GoHighLevel (LeadConnector) sync
+
+What this does:
+- Pull appointments from OpenDental for selected clinics & operatories.
+- Ensure a GHL Contact with your required fields (phone-first lookup; if not found, create).
+  Fields we send to GHL Contacts: firstName, lastName, dateOfBirth, email (validated/normalized),
+  phone (normalized), address1, postalCode, gender, locationId, and a custom field "Clinic".
+- Map clinic → calendarId and assignedUserId (9034/9035 strict routing).
+- If AptNum already mapped to a GHL event → UPDATE that exact event (even if date/time changed).
+- If AptNum not mapped:
+    * If contact is NEW → CREATE new appointment immediately (no prior fetch).
+    * If existing contact → fetch that contact’s appointments, filter to same clinic-local day
+      **and** same calendar, pick the **latest by `dateUpdated`/`updatedAt`**, then UPDATE it;
+      if none match, CREATE a new one.
+- Appointment status mapping:
+    Broken → cancelled
+    Complete → showed
+    Scheduled → confirmed
+- Both CREATE and UPDATE set `ignoreFreeSlotValidation = true`.
+- Persist mappings/state in MEGA:
+    - `ghl_contacts_map.json`: PatNum → contactId (plus phone/email snapshot)
+    - `ghl_appointments_map.json`: AptNum → { eventId, contactId, calendarId, clinic }
+    - plus last_sync_state.json, sent_appointments.json, appointments_store.json
+
+Requirements:
+- Python 3.11+
+- pip install: requests, mega.py
+- Environment variables (see bottom).
+"""
+
 import os
+import re
 import sys
 import json
-import logging
-import datetime
-import requests
-import tempfile
-import shutil
 import time
+import copy
+import shutil
+import tempfile
+import logging
 import threading
+import datetime
+from typing import Any, Dict, List, Optional, Set, Tuple
+from dataclasses import dataclass
 from datetime import timezone, timedelta
 from zoneinfo import ZoneInfo
-from typing import List, Dict, Any, Optional, Set, Tuple
-from urllib3.util.retry import Retry
+
+import requests
 from requests.adapters import HTTPAdapter
-from dataclasses import dataclass, asdict
-from collections import defaultdict
-import hashlib
+from urllib3.util.retry import Retry
 
-# MEGA integration removed
+# =========================
+# ====== CONFIG ===========
+# =========================
 
-# === CONFIGURATION ===
-API_BASE_URL = os.environ.get('OPEN_DENTAL_API_URL', 'https://api.opendental.com/api/v1')
-DEVELOPER_KEY = os.environ.get('OPEN_DENTAL_DEVELOPER_KEY')
-CUSTOMER_KEY = os.environ.get('OPEN_DENTAL_CUSTOMER_KEY')
-KERAGON_WEBHOOK_URL = os.environ.get('KERAGON_WEBHOOK_URL')
+# OpenDental API
+API_BASE_URL = os.environ.get('OPEN_DENTAL_API_URL', 'https://api.opendental.com/api/v1').rstrip('/')
+DEVELOPER_KEY = os.environ.get('OPEN_DENTAL_DEVELOPER_KEY', '').strip()
+CUSTOMER_KEY = os.environ.get('OPEN_DENTAL_CUSTOMER_KEY', '').strip()
 
-STATE_FILE = 'last_sync_state.json'
-SENT_APPTS_FILE = 'sent_appointments.json'
-APPT_CACHE_FILE = 'appointment_cache.json'
-APPT_TYPES_CACHE_FILE = 'appointment_types_cache.json'
-PATIENT_CACHE_FILE = 'patient_cache.json'
-PROVIDER_CACHE_FILE = 'provider_cache.json'
-EMPLOYEE_CACHE_FILE = 'employee_cache.json'
-OPERATORY_CACHE_FILE = 'operatory_cache.json'
-LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO')
+# GoHighLevel (LeadConnector) API
+GHL_API_BASE = os.environ.get('GHL_API_BASE', 'https://services.leadconnectorhq.com').rstrip('/')
+GHL_API_TOKEN = (
+    os.environ.get('GHL_API_KEY')
+    or os.environ.get('GHL_OAUTH_TOKEN')
+    or os.environ.get('GHL_AUTH_TOKEN')
+    or ''
+).strip()
+GHL_LOCATION_ID = os.environ.get('GHL_LOCATION_ID', '').strip()
+GHL_API_VERSION = os.environ.get('GHL_API_VERSION', '2021-07-28')
 
-# === DATABASE PERFORMANCE OPTIMIZATIONS ===
-BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '5'))
-CLINIC_DELAY_SECONDS = float(os.environ.get('CLINIC_DELAY_SECONDS', '5.0'))
-MAX_CONCURRENT_CLINICS = int(os.environ.get('MAX_CONCURRENT_CLINICS', '1'))
+# Clinic → calendarId (strict by clinic)
+# Provide as JSON, e.g. {"clinic:9034":"cal_XXXX","clinic:9035":"cal_YYYY","default":"cal_DEFAULT"}
+try:
+    GHL_CALENDAR_MAP: Dict[str, str] = json.loads(os.environ.get('GHL_CALENDAR_MAP', '{}'))
+except Exception:
+    GHL_CALENDAR_MAP = {}
+
+# Clinic → assignedUserId (strict by clinic)
+# Provide as JSON, e.g. {"clinic:9034":"usr_XXXX","clinic:9035":"usr_YYYY"}
+try:
+    GHL_ASSIGNED_USER_MAP: Dict[str, str] = json.loads(os.environ.get('GHL_ASSIGNED_USER_MAP', '{}'))
+except Exception:
+    GHL_ASSIGNED_USER_MAP = {}
+
+# Custom Field ID for "Clinic" on GHL Contacts (required to store clinic number)
+# If missing, we will WARN and fall back to tagging (clinic:9034/9035).
+GHL_CUSTOM_FIELD_CLINIC_ID = os.environ.get('GHL_CUSTOM_FIELD_CLINIC_ID', '').strip()
+
+# MEGA cloud storage (maps & state)
+MEGA_EMAIL = os.environ.get('MEGA_EMAIL', '').strip()
+MEGA_PASSWORD = os.environ.get('MEGA_PASSWORD', '').strip()
+MEGA_FOLDER = os.environ.get('MEGA_FOLDER', 'od_ghl_sync').strip()
+
+# Local state files (also mirrored to MEGA)
+STATE_FILE = 'last_sync_state.json'             # clinic → ISO timestamp
+SENT_APPTS_FILE = 'sent_appointments.json'      # AptNum → { last_sent_tstamp }
+APPT_SNAPSHOT_FILE = 'appointments_store.json'  # AptNum → last OD snapshot used
+GHL_MAP_FILE = 'ghl_appointments_map.json'      # AptNum → { contactId, eventId, calendarId, clinic }
+GHL_CONTACTS_MAP_FILE = 'ghl_contacts_map.json' # PatNum → { contactId, phone, email, updatedAt }
+
+# Performance / retry / pagination
+LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
 REQUEST_TIMEOUT = int(os.environ.get('REQUEST_TIMEOUT', '120'))
 RETRY_ATTEMPTS = int(os.environ.get('RETRY_ATTEMPTS', '5'))
 BACKOFF_FACTOR = float(os.environ.get('BACKOFF_FACTOR', '3.0'))
+ENABLE_PAGINATION = os.environ.get('ENABLE_PAGINATION', 'true').lower() == 'true'
+PAGE_SIZE = int(os.environ.get('PAGE_SIZE', '100'))
 
-# === SMART SYNC OPTIMIZATION ===
-INCREMENTAL_SYNC_MINUTES = int(os.environ.get('INCREMENTAL_SYNC_MINUTES', '20160'))
-DEEP_SYNC_HOURS = int(os.environ.get('DEEP_SYNC_HOURS', '720'))
+# Sync windows
+INCREMENTAL_SYNC_MINUTES = int(os.environ.get('INCREMENTAL_SYNC_MINUTES', '20160'))  # 14 days (lookahead)
+DEEP_SYNC_HOURS = int(os.environ.get('DEEP_SYNC_HOURS', '720'))                      # 30 days (lookahead)
 SAFETY_OVERLAP_HOURS = int(os.environ.get('SAFETY_OVERLAP_HOURS', '2'))
 
-# === SCHEDULING CONFIGURATION ===
-CLINIC_TIMEZONE = ZoneInfo('America/Chicago')  # GMT-5
+# Scheduling (used if you run in loop mode)
+CLINIC_TIMEZONE = ZoneInfo('America/Chicago')
 CLINIC_OPEN_HOUR = 8
 CLINIC_CLOSE_HOUR = 20
 DEEP_SYNC_HOUR = 2
 INCREMENTAL_INTERVAL_MINUTES = 60
+CLINIC_DELAY_SECONDS = float(os.environ.get('CLINIC_DELAY_SECONDS', '5.0'))
 
-# === CACHING AND OPTIMIZATION ===
-ENABLE_CACHING = os.environ.get('ENABLE_CACHING', 'true').lower() == 'true'
-CACHE_EXPIRY_MINUTES = int(os.environ.get('CACHE_EXPIRY_MINUTES', '5'))
-USE_SPECIFIC_FIELDS = os.environ.get('USE_SPECIFIC_FIELDS', 'true').lower() == 'true'
-ENABLE_PAGINATION = os.environ.get('ENABLE_PAGINATION', 'true').lower() == 'true'
-PAGE_SIZE = 100
-MAX_RECORDS_PER_REQUEST = int(os.environ.get('MAX_RECORDS_PER_REQUEST', '100'))
-
-CLINIC_NUMS = [int(x) for x in os.environ.get('CLINIC_NUMS', '').split(',') if x.strip().isdigit()]
-
+# Clinics & operatories (restrict which chairs to sync)
+CLINIC_NUMS = [int(x) for x in os.environ.get('CLINIC_NUMS', '9034,9035').split(',') if x.strip().isdigit()]
 CLINIC_OPERATORY_FILTERS: Dict[int, List[int]] = {
     9034: [11579, 11580, 11588],
     9035: [11574, 11576, 11577],
 }
-
 CLINIC_BROKEN_APPOINTMENT_TYPE_FILTERS: Dict[int, List[str]] = {
     9034: ["COMP EX", "COMP EX CHILD"],
     9035: ["CASH CONSULT", "INSURANCE CONSULT", "INS CONSULT"]
 }
-
 VALID_STATUSES = {'Scheduled', 'Complete', 'Broken'}
 
 REQUIRED_APPOINTMENT_FIELDS = [
     'AptNum', 'AptDateTime', 'AptStatus', 'PatNum', 'Op', 'OperatoryNum',
     'Pattern', 'AppointmentTypeNum', 'Note', 'DateTStamp', 'FName', 'LName',
-    'ProvNum', 'ProvHyg', 'Asst'
+    'ProvNum', 'ProvHyg', 'Asst', 'ClinicNum', 'Address', 'Zip', 'Email', 'WirelessPhone', 'Gender', 'Birthdate'
 ]
 
-_appointment_types_cache: Dict[str, Dict[int, str]] = {}
-_patient_cache: Dict[int, Dict[str, Any]] = {}
-_provider_cache: Dict[int, Dict[str, Any]] = {}
-_employee_cache: Dict[int, Dict[str, Any]] = {}
-_operatory_cache: Dict[int, List[Dict[str, Any]]] = {}
-_session = None
-_session_lock = threading.Lock()
-_request_cache: Dict[str, Tuple[datetime.datetime, Any]] = {}
-_cache_lock = threading.Lock()
-SHARED_CLINIC_NUM = None  # Store the clinic used for shared fetching
-
-# === LOGGING ===
+# =========================
+# ===== LOGGING ===========
+# =========================
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL),
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format='%(asctime)s  %(levelname)s  %(message)s',
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger('opendental_sync')
+logger = logging.getLogger("od_to_ghl")
 
-# === DATA STRUCTURES ===
-@dataclass
-class SyncWindow:
-    start_time: datetime.datetime
-    end_time: datetime.datetime
-    is_incremental: bool = False
-    clinic_num: Optional[int] = None
+# =========================
+# ===== UTILITIES =========
+# =========================
+_session = None
+_session_lock = threading.Lock()
 
-@dataclass
-class AppointmentFilter:
-    clinic_num: int
-    operatory_nums: List[int]
-    valid_statuses: Set[str]
-    broken_appointment_types: List[str]
-    exclude_ghl_tagged: bool = True
-
-# === SCHEDULING UTILITIES ===
-def is_clinic_open(now: datetime.datetime) -> bool:
-    now_clinic_tz = now.astimezone(CLINIC_TIMEZONE)
-    hour = now_clinic_tz.hour
-    return CLINIC_OPEN_HOUR <= hour < CLINIC_CLOSE_HOUR
-
-def is_deep_sync_time(now: datetime.datetime) -> bool:
-    now_clinic_tz = now.astimezone(CLINIC_TIMEZONE)
-    return now_clinic_tz.hour == DEEP_SYNC_HOUR and now_clinic_tz.minute == 0
-
-def get_next_run_time(now: datetime.datetime, force_deep_sync: bool = False) -> datetime.datetime:
-    now_clinic_tz = now.astimezone(CLINIC_TIMEZONE)
-    next_run = now_clinic_tz.replace(second=0, microsecond=0)
-    if force_deep_sync or is_deep_sync_time(now):
-        logger.info("Scheduling deep sync")
-        return now_clinic_tz
-    elif is_clinic_open(now):
-        minutes = (now_clinic_tz.minute // INCREMENTAL_INTERVAL_MINUTES + 1) * INCREMENTAL_INTERVAL_MINUTES
-        next_run = next_run.replace(minute=0, hour=now_clinic_tz.hour) + timedelta(minutes=minutes)
-        if next_run.hour >= CLINIC_CLOSE_HOUR:
-            next_run = next_run.replace(hour=DEEP_SYNC_HOUR, minute=0) + timedelta(days=1)
-    else:
-        next_run = next_run.replace(hour=DEEP_SYNC_HOUR, minute=0) + timedelta(days=1)
-    return next_run
-
-# === CONFIG VALIDATION ===
-def validate_configuration() -> bool:
-    errors = []
-    if not DEVELOPER_KEY or not CUSTOMER_KEY:
-        errors.append("Missing Open Dental API credentials")
-    if not KERAGON_WEBHOOK_URL:
-        errors.append("Missing Keragon webhook URL")
-    if not CLINIC_NUMS:
-        errors.append("No valid clinic numbers provided")
-    for clinic in CLINIC_NUMS:
-        if clinic not in CLINIC_OPERATORY_FILTERS:
-            errors.append(f"No operatory filters defined for clinic {clinic}")
-        if clinic not in CLINIC_BROKEN_APPOINTMENT_TYPE_FILTERS:
-            errors.append(f"No broken appointment type filters defined for clinic {clinic}")
-    if errors:
-        logger.error("Configuration validation failed:")
-        for error in errors:
-            logger.error(f"- {error}")
-        return False
-    return True
-
-# === OPTIMIZED SESSION MANAGEMENT ===
-def get_optimized_session():
+def get_session() -> requests.Session:
     global _session
     if _session is None:
         with _session_lock:
             if _session is None:
-                _session = requests.Session()
-                retry_strategy = Retry(
-                    total=RETRY_ATTEMPTS,
-                    backoff_factor=BACKOFF_FACTOR,
-                    status_forcelist=[408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524],
-                    allowed_methods=["HEAD", "GET", "POST"],
-                    raise_on_status=False
-                )
+                s = requests.Session()
                 adapter = HTTPAdapter(
-                    max_retries=retry_strategy,
-                    pool_connections=5,
-                    pool_maxsize=10,
-                    pool_block=True
+                    max_retries=Retry(
+                        total=RETRY_ATTEMPTS,
+                        backoff_factor=BACKOFF_FACTOR,
+                        status_forcelist=[408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524],
+                        allowed_methods=["HEAD", "GET", "POST", "PUT", "PATCH"],
+                        raise_on_status=False
+                    ),
+                    pool_connections=10,
+                    pool_maxsize=20,
+                    pool_block=True,
                 )
-                _session.mount("http://", adapter)
-                _session.mount("https://", adapter)
-                _session.headers.update({
-                    'User-Agent': 'OpenDental-Sync-Optimized/3.1',
+                s.mount("https://", adapter)
+                s.mount("http://", adapter)
+                s.headers.update({
+                    'User-Agent': 'OD-to-GHL/4.2',
                     'Accept': 'application/json',
                     'Accept-Encoding': 'gzip, deflate',
-                    'Connection': 'keep-alive'
+                    'Connection': 'keep-alive',
                 })
-                logger.info("Initialized optimized session")
+                _session = s
     return _session
 
-# === ADAPTIVE RATE LIMITING ===
-class AdaptiveRateLimiter:
-    def __init__(self, base_delay_seconds: float):
-        self.base_delay = base_delay_seconds
-        self.current_delay = base_delay_seconds
-        self.last_request_time = 0
-        self.response_times = []
-        self.lock = threading.Lock()
-        self.consecutive_slow_requests = 0
-        self.max_delay = base_delay_seconds * 10
+def od_headers() -> Dict[str, str]:
+    return {'Authorization': f'ODFHIR {DEVELOPER_KEY}/{CUSTOMER_KEY}', 'Content-Type': 'application/json'}
 
-    def wait_if_needed(self):
-        with self.lock:
-            current_time = time.time()
-            time_since_last = current_time - self.last_request_time
-            if time_since_last < self.current_delay:
-                sleep_time = self.current_delay - time_since_last
-                logger.debug(f"Rate limiting: sleeping {sleep_time:.2f}s (current delay: {self.current_delay:.2f}s)")
-                time.sleep(sleep_time)
-            self.last_request_time = time.time()
+def ghl_headers() -> Dict[str, str]:
+    if not GHL_API_TOKEN:
+        raise RuntimeError("Missing GHL API token. Set GHL_API_KEY or GHL_OAUTH_TOKEN or GHL_AUTH_TOKEN")
+    return {
+        'Authorization': f'Bearer {GHL_API_TOKEN}',
+        'Version': GHL_API_VERSION,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+    }
 
-    def record_response_time(self, response_time: float):
-        with self.lock:
-            self.response_times.append(response_time)
-            if len(self.response_times) > 10:
-                self.response_times.pop(0)
-            if response_time > 10:
-                self.consecutive_slow_requests += 1
-                if self.consecutive_slow_requests >= 2:
-                    self.current_delay = min(self.current_delay * 1.5, self.max_delay)
-                    logger.warning(f"Slow response ({response_time:.2f}s), increasing delay to {self.current_delay:.2f}s")
-            else:
-                self.consecutive_slow_requests = 0
-                if response_time < 3 and self.current_delay > self.base_delay:
-                    self.current_delay = max(self.current_delay * 0.9, self.base_delay)
-                    logger.debug(f"Fast response, reducing delay to {self.current_delay:.2f}s")
-
-rate_limiter = AdaptiveRateLimiter(CLINIC_DELAY_SECONDS)
-
-# === REQUEST CACHING ===
-def get_request_fingerprint(url: str, params: Dict[str, Any]) -> str:
-    content = f"{url}:{json.dumps(params, sort_keys=True)}"
-    return hashlib.md5(content.encode()).hexdigest()
-
-def get_cached_response(fingerprint: str) -> Optional[Any]:
-    if not ENABLE_CACHING:
-        return None
-    with _cache_lock:
-        if fingerprint in _request_cache:
-            timestamp, data = _request_cache[fingerprint]
-            if datetime.datetime.now() - timestamp < datetime.timedelta(minutes=CACHE_EXPIRY_MINUTES):
-                logger.debug(f"Cache hit for request {fingerprint[:8]}...")
-                return data
-            else:
-                del _request_cache[fingerprint]
-    return None
-
-def cache_response(fingerprint: str, data: Any):
-    if not ENABLE_CACHING:
-        return
-    with _cache_lock:
-        _request_cache[fingerprint] = (datetime.datetime.now(), data)
-        if len(_request_cache) > 100:
-            cutoff_time = datetime.datetime.now() - timedelta(minutes=CACHE_EXPIRY_MINUTES)
-            expired_keys = [k for k, (t, _) in _request_cache.items() if t < cutoff_time]
-            for key in expired_keys:
-                del _request_cache[key]
-
-# === APPOINTMENT TYPES CACHE ===
-def load_appointment_types_cache() -> Dict[str, Dict[int, str]]:
-    if not os.path.exists(APPT_TYPES_CACHE_FILE):
-        logger.info("No appointment types cache file found")
-        return {'shared': {}}
-    try:
-        with open(APPT_TYPES_CACHE_FILE) as f:
-            data = json.load(f)
-            logger.info(f"Loaded appointment types cache from {APPT_TYPES_CACHE_FILE} with {len(data.get('appointment_types', {}).get('shared', {}))} entries")
-            return {'shared': {int(k): v for k, v in data.get('appointment_types', {}).get('shared', {}).items()}}
-    except Exception as e:
-        logger.error(f"Failed to load appointment types cache: {e}")
-        return {'shared': {}}
-
-def save_appointment_types_cache(appointment_types: Dict[str, Dict[int, str]]):
-    temp_file = None
-    try:
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.tmp', dir=os.path.dirname(APPT_TYPES_CACHE_FILE) or '.') as f:
-            cache_data = {
-                'cache_date': datetime.datetime.now(CLINIC_TIMEZONE).isoformat(),
-                'appointment_types': {'shared': {str(k): v for k, v in appointment_types.get('shared', {}).items()}}
-            }
-            json.dump(cache_data, f, indent=2)
-            temp_file = f.name
-        shutil.move(temp_file, APPT_TYPES_CACHE_FILE)
-        logger.info(f"Saved appointment types cache to {APPT_TYPES_CACHE_FILE}")
-    except Exception as e:
-        logger.error(f"Failed to save appointment types cache: {e}")
-        if temp_file and os.path.exists(temp_file):
-            try:
-                os.unlink(temp_file)
-            except:
-                pass
-
-def get_appointment_types(clinic_num: int, force_refresh: bool = False) -> Dict[int, str]:
-    global _appointment_types_cache, SHARED_CLINIC_NUM
-    if not force_refresh and _appointment_types_cache.get('shared'):
-        logger.debug(f"Using shared in-memory appointment types cache for clinic {clinic_num}")
-        return _appointment_types_cache['shared']
-    if not force_refresh:
-        _appointment_types_cache = load_appointment_types_cache()
-        if _appointment_types_cache.get('shared'):
-            logger.debug(f"Using file-based shared appointment types cache for clinic {clinic_num}")
-            return _appointment_types_cache['shared']
-    fetch_clinic = SHARED_CLINIC_NUM if SHARED_CLINIC_NUM else clinic_num
-    if not SHARED_CLINIC_NUM:
-        SHARED_CLINIC_NUM = clinic_num
-    try:
-        logger.info(f"Fetching appointment types for clinic {fetch_clinic} (shared for all clinics)")
-        params = {
-            'ClinicNum': fetch_clinic,
-            'limit': 400,
-            'fields': 'AppointmentTypeNum,AppointmentTypeName'
-        }
-        appt_types = make_optimized_request('appointmenttypes', params)
-        if appt_types is None:
-            logger.error(f"Failed to fetch appointment types for clinic {fetch_clinic}")
-            _appointment_types_cache['shared'] = {}
-            save_appointment_types_cache(_appointment_types_cache)
-            return _appointment_types_cache['shared']
-        clinic_cache = {int(apt_type['AppointmentTypeNum']): apt_type['AppointmentTypeName']
-                        for apt_type in appt_types if 'AppointmentTypeNum' in apt_type and 'AppointmentTypeName' in apt_type}
-        logger.info(f"Loaded {len(clinic_cache)} appointment types for clinic {fetch_clinic} in single request")
-        _appointment_types_cache['shared'] = clinic_cache
-        save_appointment_types_cache(_appointment_types_cache)
-        return clinic_cache
-    except Exception as e:
-        logger.error(f"Failed to fetch appointment types for clinic {fetch_clinic}: {e}")
-        _appointment_types_cache['shared'] = {}
-        save_appointment_types_cache(_appointment_types_cache)
-        return _appointment_types_cache['shared']
-
-def get_appointment_type_name(appointment: Dict[str, Any], clinic_num: int) -> str:
-    apt_type_num = appointment.get('AppointmentTypeNum')
-    if apt_type_num is None:
-        apt_type_direct = appointment.get('AptType', '') or appointment.get('AppointmentType', '')
-        if not apt_type_direct:
-            logger.debug(f"No AppointmentTypeNum or AptType for appointment {appointment.get('AptNum')}")
-        return apt_type_direct
-    appointment_types = get_appointment_types(clinic_num)
-    apt_type_name = appointment_types.get(int(apt_type_num), '')
-    if apt_type_name:
-        return apt_type_name
-    else:
-        logger.warning(f"No AppointmentTypeName for AppointmentTypeNum {apt_type_num} in clinic {clinic_num}")
-    return apt_type_name
-
-def has_ghl_tag(appointment: Dict[str, Any]) -> bool:
-    return '[fromGHL]' in (appointment.get('Note', '') or '')
-
-# === PATIENT CACHE (LOCAL ONLY) ===
-def load_patient_cache() -> Dict[int, Dict[str, Any]]:
-    """
-    Local-only patient cache loader (MEGA removed).
-    """
-    if not os.path.exists(PATIENT_CACHE_FILE):
-        logger.info("No patient cache file found")
-        return {}
-    try:
-        with open(PATIENT_CACHE_FILE) as f:
-            data = json.load(f)
-            logger.info(
-                f"Loaded patient cache from {PATIENT_CACHE_FILE} with "
-                f"{len(data.get('patients', {}))} patients"
-            )
-            return {int(k): v for k, v in data.get('patients', {}).items()}
-    except Exception as e:
-        logger.error(f"Failed to load patient cache: {e}")
-        return {}
-
-def save_patient_cache(patient_cache: Dict[int, Dict[str, Any]]):
-    """
-    Local-only patient cache saver (MEGA removed). Atomic write.
-    """
-    temp_file = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode='w', delete=False, suffix='.tmp',
-            dir=os.path.dirname(PATIENT_CACHE_FILE) or '.'
-        ) as f:
-            cache_data = {
-                'cache_date': datetime.datetime.now(CLINIC_TIMEZONE).isoformat(),
-                'patients': {str(k): v for k, v in patient_cache.items()}
-            }
-            json.dump(cache_data, f, indent=2)
-            temp_file = f.name
-        shutil.move(temp_file, PATIENT_CACHE_FILE)
-        logger.info(
-            f"Saved patient cache to {PATIENT_CACHE_FILE} "
-            f"with {len(patient_cache)} patients"
-        )
-        logger.debug(f"Verified patient_cache.json exists at {PATIENT_CACHE_FILE}")
-    except Exception as e:
-        logger.error(f"Failed to save patient cache: {e}")
-        if not os.path.exists(PATIENT_CACHE_FILE):
-            logger.warning("Creating empty patient_cache.json due to error")
-            with open(PATIENT_CACHE_FILE, 'w') as f:
-                json.dump(
-                    {'cache_date': datetime.datetime.now(CLINIC_TIMEZONE).isoformat(),
-                     'patients': {}}, f, indent=2
-                )
-            logger.debug(f"Created empty patient_cache.json at {PATIENT_CACHE_FILE}")
-    finally:
-        if temp_file and os.path.exists(temp_file):
-            try:
-                os.unlink(temp_file)
-            except Exception as e:
-                logger.error(f"Failed to clean up temp file {temp_file}: {e}")
-
-# === PROVIDER CACHE ===
-def load_provider_cache() -> Dict[int, Dict[str, Any]]:
-    if not os.path.exists(PROVIDER_CACHE_FILE):
-        logger.info("No provider cache file found")
-        return {}
-    try:
-        with open(PROVIDER_CACHE_FILE) as f:
-            data = json.load(f)
-            logger.info(f"Loaded provider cache from {PROVIDER_CACHE_FILE} with {len(data.get('providers', {}))} providers")
-            return {int(k): v for k, v in data.get('providers', {}).items()}
-    except Exception as e:
-        logger.error(f"Failed to load provider cache: {e}")
-        return {}
-
-def save_provider_cache(provider_cache: Dict[int, Dict[str, Any]]):
-    temp_file = None
-    try:
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.tmp', dir=os.path.dirname(PROVIDER_CACHE_FILE) or '.') as f:
-            cache_data = {
-                'cache_date': datetime.datetime.now(CLINIC_TIMEZONE).isoformat(),
-                'providers': {str(k): v for k, v in provider_cache.items()}
-            }
-            json.dump(cache_data, f, indent=2)
-            temp_file = f.name
-        shutil.move(temp_file, PROVIDER_CACHE_FILE)
-        logger.info(f"Saved provider cache to {PROVIDER_CACHE_FILE} with {len(provider_cache)} providers")
-    except Exception as e:
-        logger.error(f"Failed to save provider cache: {e}")
-        if temp_file and os.path.exists(temp_file):
-            try:
-                os.unlink(temp_file)
-            except:
-                pass
-
-def get_all_providers(force_refresh: bool = False) -> Dict[int, Dict[str, Any]]:
-    global _provider_cache
-    if not force_refresh and _provider_cache:
-        return _provider_cache
-    _provider_cache = load_provider_cache()
-    if _provider_cache:
-        return _provider_cache
-    try:
-        data = make_optimized_request('providers', {'limit': 1000, 'fields': 'ProvNum,FName,LName'})
-        if data is None:
-            logger.warning("Failed to fetch providers: No data returned")
-            return {}
-        _provider_cache = {int(p['ProvNum']): p for p in data if 'ProvNum' in p}
-        save_provider_cache(_provider_cache)
-        logger.info(f"Fetched and cached {len(_provider_cache)} providers")
-        return _provider_cache
-    except Exception as e:
-        logger.warning(f"Failed to fetch providers: {e}")
-        return {}
-
-def get_provider_details(prov_num: int) -> Dict[str, Any]:
-    providers = get_all_providers()
-    return providers.get(prov_num, {})
-
-# === EMPLOYEE CACHE ===
-def load_employee_cache() -> Dict[int, Dict[str, Any]]:
-    if not os.path.exists(EMPLOYEE_CACHE_FILE):
-        logger.info("No employee cache file found")
-        return {}
-    try:
-        with open(EMPLOYEE_CACHE_FILE) as f:
-            data = json.load(f)
-            logger.info(f"Loaded employee cache from {EMPLOYEE_CACHE_FILE} with {len(data.get('employees', {}))} employees")
-            return {int(k): v for k, v in data.get('employees', {}).items()}
-    except Exception as e:
-        logger.error(f"Failed to load employee cache: {e}")
-        return {}
-
-def save_employee_cache(employee_cache: Dict[int, Dict[str, Any]]):
-    temp_file = None
-    try:
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.tmp', dir=os.path.dirname(EMPLOYEE_CACHE_FILE) or '.') as f:
-            cache_data = {
-                'cache_date': datetime.datetime.now(CLINIC_TIMEZONE).isoformat(),
-                'employees': {str(k): v for k, v in employee_cache.items()}
-            }
-            json.dump(cache_data, f, indent=2)
-            temp_file = f.name
-        shutil.move(temp_file, EMPLOYEE_CACHE_FILE)
-        logger.info(f"Saved employee cache to {EMPLOYEE_CACHE_FILE} with {len(employee_cache)} employees")
-    except Exception as e:
-        logger.error(f"Failed to save employee cache: {e}")
-        if temp_file and os.path.exists(temp_file):
-            try:
-                os.unlink(temp_file)
-            except:
-                pass
-
-def get_all_employees(force_refresh: bool = False) -> Dict[int, Dict[str, Any]]:
-    global _employee_cache
-    if not force_refresh and _employee_cache:
-        return _employee_cache
-    _employee_cache = load_employee_cache()
-    if _employee_cache:
-        return _employee_cache
-    try:
-        data = make_optimized_request('employees', {'limit': 1000, 'fields': 'EmployeeNum,FName,LName'})
-        if data is None:
-            logger.warning("Failed to fetch employees: No data returned")
-            return {}
-        _employee_cache = {int(e['EmployeeNum']): e for e in data if 'EmployeeNum' in e}
-        save_employee_cache(_employee_cache)
-        logger.info(f"Fetched and cached {len(_employee_cache)} employees")
-        return _employee_cache
-    except Exception as e:
-        logger.warning(f"Failed to fetch employees: {e}")
-        return {}
-
-def get_employee_details(emp_num: int) -> Dict[str, Any]:
-    employees = get_all_employees()
-    return employees.get(emp_num, {})
-
-# === OPERATORY CACHE ===
-def load_operatory_cache() -> Dict[int, List[Dict[str, Any]]]:
-    if not os.path.exists(OPERATORY_CACHE_FILE):
-        logger.info("No operatory cache file found")
-        return {}
-    try:
-        with open(OPERATORY_CACHE_FILE) as f:
-            data = json.load(f)
-            cache = {}
-            for clinic_str, ops in data.get('operatories', {}).items():
-                clinic = int(clinic_str)
-                cache[clinic] = ops
-            logger.info(f"Loaded operatory cache from {OPERATORY_CACHE_FILE} with {sum(len(ops) for ops in cache.values())} operatories across {len(cache)} clinics")
-            return cache
-    except Exception as e:
-        logger.error(f"Failed to load operatory cache: {e}")
-        return {}
-
-def save_operatory_cache(operatory_cache: Dict[int, List[Dict[str, Any]]]):
-    temp_file = None
-    try:
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.tmp', dir=os.path.dirname(OPERATORY_CACHE_FILE) or '.') as f:
-            cache_data = {
-                'cache_date': datetime.datetime.now(CLINIC_TIMEZONE).isoformat(),
-                'operatories': {str(k): v for k, v in operatory_cache.items()}
-            }
-            json.dump(cache_data, f, indent=2)
-            temp_file = f.name
-        shutil.move(temp_file, OPERATORY_CACHE_FILE)
-        logger.info(f"Saved operatory cache to {OPERATORY_CACHE_FILE} with {sum(len(ops) for ops in operatory_cache.values())} operatories across {len(operatory_cache)} clinics")
-    except Exception as e:
-        logger.error(f"Failed to save operatory cache: {e}")
-        if temp_file and os.path.exists(temp_file):
-            try:
-                os.unlink(temp_file)
-            except:
-                pass
-
-def get_operatories(clinic_num: int, force_refresh: bool = False) -> List[Dict[str, Any]]:
-    global _operatory_cache
-    if not _operatory_cache:
-        _operatory_cache = load_operatory_cache()
-    if not force_refresh and clinic_num in _operatory_cache:
-        logger.debug(f"Using cached operatories for clinic {clinic_num}")
-        return _operatory_cache[clinic_num]
-    try:
-        data = make_optimized_request_paginated('operatories', {'ClinicNum': clinic_num, 'limit': PAGE_SIZE})
-        if data is None:
-            logger.warning(f"Failed to fetch operatories for clinic {clinic_num}: No data returned")
-            return []
-        _operatory_cache[clinic_num] = data
-        save_operatory_cache(_operatory_cache)
-        logger.info(f"Fetched and cached {len(data)} operatories for clinic {clinic_num}")
-        return data
-    except Exception as e:
-        logger.warning(f"Failed to fetch operatories for clinic {clinic_num}: {e}")
-        return []
-
-# === STATE MANAGEMENT ===
-def load_last_sync_times() -> Dict[int, Optional[datetime.datetime]]:
-    state: Dict[int, Optional[datetime.datetime]] = {c: None for c in CLINIC_NUMS}
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE) as f:
-                data = json.load(f)
-                if not isinstance(data, dict):
-                    logger.error(f"Invalid state file format: expected dict, got {type(data)}")
-                    return state
-                for c in CLINIC_NUMS:
-                    ts = data.get(str(c))
-                    if ts:
-                        dt = parse_time(ts)
-                        if dt:
-                            state[c] = dt
-                        else:
-                            logger.warning(f"Invalid timestamp for clinic {c}: {ts}")
-        except json.JSONDecodeError as e:
-            logger.error(f"Corrupted state file: {e}")
-        except Exception as e:
-            logger.error(f"Error reading state file: {e}")
-    return state
-
-def validate_sync_time_update(clinic: int, old_time: Optional[datetime.datetime],
-                             new_time: Optional[datetime.datetime]) -> bool:
-    if not old_time:
-        return True
-    if not new_time:
-        logger.warning(f"Clinic {clinic}: Attempted to set null sync time")
-        return False
-    if old_time.tzinfo is None:
-        old_time = old_time.replace(tzinfo=CLINIC_TIMEZONE)
-    if new_time.tzinfo is None:
-        new_time = new_time.replace(tzinfo=CLINIC_TIMEZONE)
-    if new_time < old_time:
-        logger.warning(f"Clinic {clinic}: Attempted to move sync time backwards")
-        return False
-    return True
-
-def save_state_atomically(sync_times: Dict[int, Optional[datetime.datetime]],
-                         sent_appointments: Dict[str, Dict[str, str]]) -> None:
-    temp_sync_file = None
-    temp_sent_file = None
-    try:
-        sync_data = {str(c): dt.isoformat() if dt else None for c, dt in sync_times.items()}
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.tmp',
-                                        dir=os.path.dirname(STATE_FILE) or '.') as f:
-            json.dump(sync_data, f, indent=2)
-            temp_sync_file = f.name
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.tmp',
-                                        dir=os.path.dirname(SENT_APPTS_FILE) or '.') as f:
-            json.dump(sent_appointments, f, indent=2)
-            temp_sent_file = f.name
-        shutil.move(temp_sync_file, STATE_FILE)
-        shutil.move(temp_sent_file, SENT_APPTS_FILE)
-        logger.info(f"Saved state files with {len(sent_appointments)} sent appointment entries")
-    except Exception as e:
-        logger.error(f"Error in atomic save: {e}")
-        for temp_file in [temp_sync_file, temp_sent_file]:
-            if temp_file and os.path.exists(temp_file):
-                try:
-                    os.unlink(temp_file)
-                except:
-                    pass
-        raise
-
-def load_sent_appointments() -> Dict[str, Dict[str, str]]:
-    if os.path.exists(SENT_APPTS_FILE):
-        try:
-            with open(SENT_APPTS_FILE) as f:
-                data = json.load(f)
-                # New (dict) format: {"AptNum": {"last_sent_tstamp": "..."}, ...}
-                if isinstance(data, dict):
-                    out = {}
-                    for k, v in data.items():
-                        if isinstance(v, dict):
-                            ts = v.get('last_sent_tstamp', '') or ''
-                        else:
-                            ts = str(v) if v else ''
-                        out[str(k)] = {"last_sent_tstamp": ts}
-                    return out
-                # Legacy (list) format: ["AptNum1","AptNum2",...]
-                if isinstance(data, list):
-                    return {str(x): {"last_sent_tstamp": ""} for x in data}
-                logger.error(f"Invalid sent appointments file format: expected dict or list, got {type(data)}")
-                return {}
-        except json.JSONDecodeError as e:
-            logger.error(f"Corrupted sent appointments file: {e}")
-        except Exception as e:
-            logger.error(f"Error reading sent appointments file: {e}")
-    return {}
-
-# === UTILITIES ===
 def parse_time(s: Optional[str]) -> Optional[datetime.datetime]:
     if not s:
         return None
     try:
         dt = datetime.datetime.fromisoformat(s.replace('Z', '+00:00'))
-        if dt.tzinfo is None:
-            logger.debug(f"Naive datetime received: {s}, assuming {CLINIC_TIMEZONE}")
-            dt = dt.replace(tzinfo=CLINIC_TIMEZONE)
-        else:
-            dt = dt.astimezone(CLINIC_TIMEZONE)
-        return dt
-    except ValueError:
-        logger.warning(f"Unrecognized time format: {s}")
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        # Try fallback formats (e.g., YYYY-MM-DD)
+        try:
+            dt = datetime.datetime.strptime(s, "%Y-%m-%d")
+            return dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            return None
+
+def to_iso(dt: datetime.datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.isoformat()
+
+def clinic_local_date(dt: datetime.datetime) -> datetime.date:
+    return dt.astimezone(CLINIC_TIMEZONE).date()
+
+EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-']+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+def valid_email_or_unknown(email: str) -> str:
+    email = (email or '').strip()
+    return email if email and EMAIL_RE.match(email) else "unknown@gmail.com"
+
+def normalize_phone_for_search(phone: str) -> str:
+    phone = (phone or '').strip()
+    if not phone:
+        return ""
+    digits = re.sub(r"[^\d+]", "", phone)
+    if digits and digits[0] != '+':
+        pure = re.sub(r"\D", "", digits)
+        if len(pure) == 10:
+            return "+1" + pure  # default to +1; adjust per region if needed
+    return digits
+
+# =========================
+# ===== MEGA STORAGE ======
+# =========================
+class MegaStore:
+    def __init__(self, email: str, password: str, folder: str):
+        self.email = email; self.password = password; self.folder = folder
+        self._mega = None; self._folder_node = None
+        self._ready = None  # cache readiness
+
+    def _ensure(self):
+        if self._ready is not None:
+            return self._ready
+        if not self.email or not self.password:
+            self._ready = False
+            return False
+        try:
+            from mega import Mega  # pip install mega.py
+        except Exception:
+            logger.warning("MEGA module missing (pip install mega.py) - using local only.")
+            self._ready = False
+            return False
+        try:
+            m = Mega()
+            self._mega = m.login(self.email, self.password)
+            # ensure folder
+            node = None
+            files = self._mega.get_files()
+            for handle, meta in files.items():
+                if meta.get('a', {}).get('n') == self.folder and meta.get('t') == 1:
+                    node = {'h': handle}
+                    break
+            if not node:
+                node = self._mega.create_folder(self.folder)
+            self._folder_node = node
+            self._ready = True
+        except Exception as e:
+            logger.warning(f"MEGA folder ensure failed: {e}")
+            self._ready = False
+        return self._ready
+
+    def _find_file(self, name: str):
+        try:
+            files = self._mega.get_files()
+            for handle, meta in files.items():
+                if meta.get('a', {}).get('n') == name:
+                    return {'h': handle}
+        except Exception:
+            pass
         return None
 
-def make_auth_header() -> Dict[str, str]:
-    return {
-        'Authorization': f'ODFHIR {DEVELOPER_KEY}/{CUSTOMER_KEY}',
-        'Content-Type': 'application/json'
-    }
+    def pull(self, filename: str):
+        if not self._ensure(): return
+        node = self._find_file(os.path.basename(filename))
+        if not node: return
+        td = tempfile.mkdtemp()
+        try:
+            self._mega.download(node, dest_path=td)
+            src = os.path.join(td, os.path.basename(filename))
+            if os.path.exists(src):
+                shutil.move(src, filename)
+                logger.info(f"Pulled {filename} from MEGA/{self.folder}")
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    def push(self, filename: str):
+        if not self._ensure(): return
+        try:
+            # delete old if exists (simplify)
+            old = self._find_file(os.path.basename(filename))
+            if old:
+                try: self._mega.delete(old)
+                except Exception: pass
+            self._mega.upload(filename, self._folder_node)
+            logger.info(f"Pushed {filename} to MEGA/{self.folder}")
+        except Exception as e:
+            logger.warning(f"MEGA upload failed for {filename}: {e}")
+
+MEGA_STORE = MegaStore(MEGA_EMAIL, MEGA_PASSWORD, MEGA_FOLDER)
+
+def atomic_save_json(path: str, obj: Any):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile('w', delete=False, dir=os.path.dirname(path) or ".", suffix='.tmp') as f:
+            json.dump(obj, f, indent=2)
+            tmp = f.name
+        shutil.move(tmp, path)
+    finally:
+        if tmp and os.path.exists(tmp):
+            try: os.unlink(tmp)
+            except Exception: pass
+
+def load_json_or(path: str, default: Any):
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Failed to read {path}: {e}")
+    return copy.deepcopy(default)
+
+def pull_all_from_mega():
+    for f in (STATE_FILE, SENT_APPTS_FILE, APPT_SNAPSHOT_FILE, GHL_MAP_FILE, GHL_CONTACTS_MAP_FILE):
+        MEGA_STORE.pull(f)
+
+def save_state(sent_map: Dict[str, Dict[str, str]], last_sync: Dict[int, Optional[str]],
+               snapshot: Dict[str, Any], ghl_map: Dict[str, Any], contact_map: Dict[int, Any]):
+    atomic_save_json(SENT_APPTS_FILE, sent_map); MEGA_STORE.push(SENT_APPTS_FILE)
+    atomic_save_json(STATE_FILE, last_sync); MEGA_STORE.push(STATE_FILE)
+    atomic_save_json(APPT_SNAPSHOT_FILE, snapshot); MEGA_STORE.push(APPT_SNAPSHOT_FILE)
+    atomic_save_json(GHL_MAP_FILE, ghl_map); MEGA_STORE.push(GHL_MAP_FILE)
+    atomic_save_json(GHL_CONTACTS_MAP_FILE, {str(k): v for k, v in contact_map.items()}); MEGA_STORE.push(GHL_CONTACTS_MAP_FILE)
+
+# =========================
+# ===== OD FETCH ==========
+# =========================
+def od_get(endpoint: str, params: Dict[str, Any]) -> Optional[List[Any]]:
+    url = f"{API_BASE_URL}/{endpoint}"
+    try:
+        r = get_session().get(url, headers=od_headers(), params=params, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        return data if isinstance(data, list) else [data]
+    except requests.RequestException as e:
+        logger.error(f"OD GET failed {endpoint}: {e}")
+        return None
+
+def od_get_paginated(endpoint: str, params: Dict[str, Any]) -> Optional[List[Any]]:
+    if not ENABLE_PAGINATION:
+        return od_get(endpoint, params)
+    out: List[Any] = []
+    offset = 0
+    while True:
+        p = dict(params); p['limit'] = PAGE_SIZE; p['offset'] = offset
+        chunk = od_get(endpoint, p)
+        if chunk is None:
+            return None
+        out.extend(chunk)
+        if len(chunk) < PAGE_SIZE:
+            break
+        offset += PAGE_SIZE
+    return out
 
 def calculate_pattern_duration(pattern: str, minutes_per_slot: int = 5) -> int:
-    return sum(1 for ch in (pattern or '').upper() if ch in ('X', '/')) * minutes_per_slot
+    if not pattern:
+        return 60
+    slots = sum(1 for ch in pattern.upper() if ch in ('X', '/'))
+    return (slots or 12) * minutes_per_slot  # default 60 if no slots
 
-def calculate_end_time(start_dt: datetime.datetime, pattern: str) -> datetime.datetime:
-    dur = calculate_pattern_duration(pattern)
-    if dur <= 0:
-        logger.warning(f"No slots in pattern '{pattern}', defaulting to 60 minutes")
-        dur = 60
-    return start_dt + datetime.timedelta(minutes=dur)
+def calculate_end_time(start_local: datetime.datetime, pattern: str) -> datetime.datetime:
+    return start_local + timedelta(minutes=calculate_pattern_duration(pattern))
 
-# === REQUEST HANDLING ===
-def make_optimized_request_paginated(endpoint: str, params: Dict[str, Any], method: str = 'GET', use_cache: bool = True) -> Optional[List[Any]]:
-    logger.info(f"Using PAGE_SIZE={PAGE_SIZE} for endpoint {endpoint}")
-    if not ENABLE_PAGINATION:
-        return make_optimized_request(endpoint, params, method, use_cache)
-    session = get_optimized_session()
-    headers = make_auth_header()
-    url = f"{API_BASE_URL}/{endpoint}"
-    all_data = []
-    params = params.copy()
-    params['limit'] = PAGE_SIZE
-    offset = 0
-    fingerprint = get_request_fingerprint(url, params) if use_cache and method == 'GET' else None
-    if use_cache and method == 'GET':
-        cached_result = get_cached_response(fingerprint)
-        if cached_result is not None:
-            logger.info(f"Cache hit for {endpoint} with params {params}: fetched {len(cached_result)} records")
-            return cached_result
-    while True:
-        params['offset'] = offset
-        logger.debug(f"Fetching {endpoint} with params {params}")
-        rate_limiter.wait_if_needed()
-        start_time = time.time()
-        try:
-            if method == 'GET':
-                response = session.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
-            else:
-                response = session.post(url, headers=headers, json=params, timeout=REQUEST_TIMEOUT)
-            logger.debug(f"API request: {response.request.url}")
-            response.raise_for_status()
-            response_time = time.time() - start_time
-            rate_limiter.record_response_time(response_time)
-            try:
-                data = response.json()
-                logger.debug(f"Raw API response: {json.dumps(data, indent=2)}")
-            except ValueError:
-                logger.error(f"Invalid JSON response from {endpoint}: {response.text}")
-                return None
-            if isinstance(data, dict) and data.get('error'):
-                logger.error(f"API error for {endpoint}: {data.get('error')}")
-                return None
-            data_list = data if isinstance(data, list) else [data]
-            logger.debug(f"Fetched {len(data_list)} records at offset={offset}: AptNums={[str(item.get('AptNum', 'N/A')) for item in data_list if isinstance(item, dict)]}")
-            all_data.extend(data_list)
-            if endpoint == 'appointments':
-                filename = f'appointments_op_{params.get("Op", "unknown")}_{params.get("AptStatus", "unknown")}.json'
-                with open(filename, 'w') as f:
-                    json.dump(all_data, f, indent=2)
-                logger.info(f"Saved {len(all_data)} records to {filename}")
-            if len(data_list) < PAGE_SIZE:
-                break
-            offset += PAGE_SIZE
-        except requests.exceptions.RequestException as e:
-            response_time = time.time() - start_time
-            rate_limiter.record_response_time(response_time)
-            logger.error(f"Request to {endpoint} failed at offset={offset}: {e}")
-            return None
-    logger.info(f"Completed pagination for {endpoint} with params {params}: fetched {len(all_data)} records")
-    if method == 'GET' and use_cache and all_data:
-        cache_response(fingerprint, all_data)
-    return all_data
+def get_operatories(clinic: int) -> List[Dict[str, Any]]:
+    return od_get_paginated('operatories', {'ClinicNum': clinic}) or []
 
-def make_optimized_request(endpoint: str, params: Dict[str, Any], method: str = 'GET', use_cache: bool = True) -> Optional[List[Any]]:
-    session = get_optimized_session()
-    headers = make_auth_header()
-    url = f"{API_BASE_URL}/{endpoint}"
-    fingerprint = get_request_fingerprint(url, params) if use_cache and method == 'GET' else None
-    if use_cache and method == 'GET':
-        cached_result = get_cached_response(fingerprint)
-        if cached_result is not None:
-            return cached_result
-    rate_limiter.wait_if_needed()
-    start_time = time.time()
+def fetch_appointments_for_window(clinic: int, start: datetime.datetime, end: datetime.datetime) -> List[Dict[str, Any]]:
+    params_base = {
+        'ClinicNum': str(clinic),
+        'dateStart': start.astimezone(timezone.utc).date().strftime('%Y-%m-%d'),
+        'dateEnd': end.astimezone(timezone.utc).date().strftime('%Y-%m-%d'),
+        'fields': ','.join(REQUIRED_APPOINTMENT_FIELDS),
+    }
+    all_appts: List[Dict[str, Any]] = []
+    valid_ops = set(CLINIC_OPERATORY_FILTERS.get(clinic, []))
+
+    # touch operatories (logs)
+    _ = get_operatories(clinic)
+
+    for status in VALID_STATUSES:
+        for op in CLINIC_OPERATORY_FILTERS.get(clinic, []):
+            p = dict(params_base); p['AptStatus'] = status; p['Op'] = str(op)
+            chunk = od_get_paginated('appointments', p) or []
+            for a in chunk:
+                opnum = a.get('Op') or a.get('OperatoryNum')
+                if opnum in valid_ops:
+                    all_appts.append(a)
+            time.sleep(0.12)
+
+    # de-dupe by (AptNum, PatNum, AptDateTime)
+    uniq: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    for a in all_appts:
+        key = (str(a.get('AptNum', '')), str(a.get('PatNum', '')), a.get('AptDateTime', ''))
+        uniq[key] = a
+    return list(uniq.values())
+
+# =========================
+# ===== GHL CLIENT =========
+# =========================
+def ghl_search_contact_by_phone(phone: str) -> Optional[Dict[str, Any]]:
+    """
+    Search contacts by text query (phone). POST /contacts/search
+    """
+    if not phone:
+        return None
+    url = f"{GHL_API_BASE}/contacts/search"
+    body = {"query": phone, "limit": 10, "page": 1, "locationId": GHL_LOCATION_ID}
     try:
-        if method == 'GET':
-            response = session.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
-        else:
-            response = session.post(url, headers=headers, json=params, timeout=REQUEST_TIMEOUT)
-        logger.debug(f"API request: {response.request.url}")
-        response.raise_for_status()
-        response_time = time.time() - start_time
-        rate_limiter.record_response_time(response_time)
-        try:
-            data = response.json()
-            logger.debug(f"Raw API response: {json.dumps(data, indent=2)}")
-        except ValueError:
-            logger.error(f"Invalid JSON response from {endpoint}: {response.text}")
+        r = get_session().post(url, headers=ghl_headers(), json=body, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 401:
+            logger.error("GHL auth failed (401) – check token and Version header.")
             return None
-        if isinstance(data, dict) and data.get('error'):
-            logger.error(f"API error for {endpoint}: {data.get('error')}")
-            return None
-        all_data = data if isinstance(data, list) else [data]
-        if method == 'GET' and use_cache and all_data:
-            cache_response(fingerprint, all_data)
-        logger.debug(f"Request completed in {response_time:.2f}s, total records: {len(all_data)}")
-        return all_data
-    except requests.exceptions.RequestException as e:
-        response_time = time.time() - start_time
-        rate_limiter.record_response_time(response_time)
-        logger.error(f"Request to {endpoint} failed: {e}")
+        r.raise_for_status()
+        data = r.json()
+        contacts = data.get('contacts') if isinstance(data, dict) else (data if isinstance(data, list) else [])
+        return contacts[0] if contacts else None
+    except requests.RequestException as e:
+        logger.error(f"GHL contact search failed: {e}")
         return None
 
-# === PATIENT DATA ===
-def get_patient_details(pat_num: int) -> Dict[str, Any]:
-    global _patient_cache
-    if not pat_num:
-        return {}
-    if pat_num in _patient_cache:
-        logger.debug(f"Patient {pat_num}: Using in-memory cache")
-        return _patient_cache[pat_num]
-    if not _patient_cache:
-        _patient_cache = load_patient_cache()
-    if pat_num in _patient_cache:
-        logger.debug(f"Patient {pat_num}: Using persistent cache")
-        return _patient_cache[pat_num]
-    try:
-        data = make_optimized_request(f'patients/{pat_num}', {})
-        if data is None:
-            logger.warning(f"Failed to fetch patient {pat_num}: No data returned")
-            return {}
-        if isinstance(data, list) and len(data) == 1:
-            patient_data = data[0]
-        elif isinstance(data, dict):
-            patient_data = data
-        else:
-            logger.warning(f"Unexpected response format for patient {pat_num}: {type(data)}")
-            return {}
-        _patient_cache[pat_num] = patient_data
-        save_patient_cache(_patient_cache)
-        logger.info(f"Patient {pat_num}: Fetched and cached")
-        return patient_data
-    except Exception as e:
-        logger.warning(f"Failed to fetch patient {pat_num}: {e}")
-        return {}
+def ghl_build_contact_payload(patient: Dict[str, Any], clinic_num: int) -> Dict[str, Any]:
+    # Required fields you requested
+    first = (patient.get("FName") or "").strip()
+    last  = (patient.get("LName") or "").strip()
+    email = valid_email_or_unknown(patient.get("Email"))
+    phone = normalize_phone_for_search(patient.get("WirelessPhone") or patient.get("WirelessPh") or patient.get("HmPhone") or "")
+    dob   = (patient.get("Birthdate") or "").strip() or None  # prefer YYYY-MM-DD from OD
+    address1 = (patient.get("Address") or "").strip()
+    postal = (patient.get("Zip") or patient.get("PostalCode") or "").strip()
+    gender = (patient.get("Gender") or "").strip()
 
-def fetch_patients_paginated(pat_nums: List[int]) -> Dict[int, Dict[str, Any]]:
-    global _patient_cache
-    if not pat_nums:
-        logger.info("No patients to fetch")
-        return {}
-    if not _patient_cache:
-        _patient_cache = load_patient_cache()
-    patient_data = {pn: _patient_cache.get(pn, {}) for pn in pat_nums}
-    missing_pat_nums = [pn for pn in pat_nums if not patient_data[pn]]
-    if not missing_pat_nums:
-        logger.info(f"All {len(pat_nums)} patient details found in cache")
-        return patient_data
-    logger.info(f"Fetching details for {len(missing_pat_nums)} patients: {missing_pat_nums}")
-    for pn in missing_pat_nums:
+    payload: Dict[str, Any] = {
+        "locationId": GHL_LOCATION_ID,
+        "firstName": first,
+        "lastName": last,
+        "email": email,
+        "phone": phone or None,
+        "dateOfBirth": dob,          # YYYY-MM-DD
+        "address1": address1 or None,
+        "postalCode": postal or None,
+        "gender": gender or None,
+    }
+
+    # Write clinic number to the custom field (preferred)
+    if GHL_CUSTOM_FIELD_CLINIC_ID:
+        payload["customFields"] = [{"id": GHL_CUSTOM_FIELD_CLINIC_ID, "value": str(clinic_num)}]
+    else:
+        # Fallback: tag if custom field id isn't provided
+        payload["tags"] = [f"clinic:{clinic_num}"]
+
+    # Clean out null/empty list fields to keep payload tidy
+    return {k: v for k, v in payload.items() if v not in (None, [], "")}
+
+def ghl_upsert_contact(patient: Dict[str, Any], clinic_num: int) -> Optional[str]:
+    """
+    1) Try search by phone (wireless/home).
+    2) If found → return contactId.
+    3) Else /contacts/upsert (create or update) with full payload → return its id.
+    """
+    phone = normalize_phone_for_search(patient.get("WirelessPhone") or patient.get("WirelessPh") or patient.get("HmPhone") or "")
+    if phone:
+        found = ghl_search_contact_by_phone(phone)
+        if found and found.get('id'):
+            return found['id']
+
+    url = f"{GHL_API_BASE}/contacts/upsert"
+    body = ghl_build_contact_payload(patient, clinic_num)
+    try:
+        r = get_session().post(url, headers=ghl_headers(), json=body, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        j = r.json()
+        return (j.get("contact") or {}).get("id") or j.get("id")
+    except requests.RequestException as e:
+        logger.error(f"GHL upsert contact failed: {e} body={e.response.text if getattr(e,'response',None) else ''}")
+        return None
+
+def map_appt_status_to_ghl(status: str) -> str:
+    s = (status or "").strip().lower()
+    if s == "broken":
+        return "cancelled"
+    if s == "complete":
+        return "showed"
+    if s == "scheduled":
+        return "confirmed"
+    return "confirmed"
+
+def pick_calendar_id(clinic: int) -> Optional[str]:
+    return GHL_CALENDAR_MAP.get(f"clinic:{clinic}") or GHL_CALENDAR_MAP.get("default")
+
+def pick_assigned_user_id(clinic: int) -> Optional[str]:
+    return GHL_ASSIGNED_USER_MAP.get(f"clinic:{clinic}")
+
+def _event_id(a: Dict[str, Any]) -> Optional[str]:
+    return a.get('id') or a.get('eventId') or a.get('appointmentId')
+
+def _start_dt(a: Dict[str, Any]) -> Optional[datetime.datetime]:
+    for k in ("startTime", "startAt", "start", "startDate"):
+        dt = parse_time(a.get(k))
+        if dt: return dt
+    return None
+
+def _updated_dt(a: Dict[str, Any]) -> datetime.datetime:
+    for k in ("dateUpdated", "updatedAt", "updatedAtUtc", "lastUpdated", "modifiedAt"):
+        dt = parse_time(a.get(k))
+        if dt:
+            return dt
+    return _start_dt(a) or datetime.datetime.min.replace(tzinfo=timezone.utc)
+
+def _calendar_id_in_event(a: Dict[str, Any]) -> Optional[str]:
+    return a.get("calendarId") or (a.get("calendar") or {}).get("id")
+
+def ghl_get_contact_appointments(contact_id: str) -> List[Dict[str, Any]]:
+    if not contact_id:
+        return []
+    url = f"{GHL_API_BASE}/contacts/{contact_id}/appointments"
+    try:
+        r = get_session().get(url, headers=ghl_headers(), timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, list): return data
+        return data.get('appointments', []) if isinstance(data, dict) else []
+    except requests.RequestException as e:
+        logger.error(f"GHL get contact appointments failed: {e}")
+        return []
+
+def pick_latest_same_day_event(contact_events: List[Dict[str, Any]],
+                               od_start_local: datetime.datetime,
+                               calendar_id: str) -> Optional[str]:
+    """
+    Filter to events on the SAME clinic-local day AND same calendar,
+    then choose the one with the greatest 'updated' timestamp.
+    """
+    od_day = clinic_local_date(od_start_local)
+    same_day_events: List[Dict[str, Any]] = []
+    for ev in contact_events or []:
+        sdt = _start_dt(ev)
+        if not sdt:
+            continue
+        if clinic_local_date(sdt) == od_day and (_calendar_id_in_event(ev) == calendar_id):
+            same_day_events.append(ev)
+
+    if not same_day_events:
+        return None
+
+    # Sort desc by last-updated; tiebreaker = later start time
+    same_day_events.sort(
+        key=lambda e: (_updated_dt(e), _start_dt(e) or datetime.datetime.min.replace(tzinfo=timezone.utc)),
+        reverse=True
+    )
+    return _event_id(same_day_events[0])
+
+def ghl_create_appointment(calendar_id: str, contact_id: str, assigned_user_id: Optional[str],
+                           title: str, start_dt: datetime.datetime, end_dt: datetime.datetime,
+                           status: str) -> Optional[str]:
+    url = f"{GHL_API_BASE}/calendars/events/appointments"
+    body = {
+        "calendarId": calendar_id,
+        "contactId": contact_id,
+        "assignedUserId": assigned_user_id,
+        "title": title or "Dental Appointment",
+        "appointmentStatus": status,  # confirmed / cancelled / showed
+        "startTime": to_iso(start_dt.astimezone(CLINIC_TIMEZONE)),
+        "endTime": to_iso(end_dt.astimezone(CLINIC_TIMEZONE)),
+        "ignoreFreeSlotValidation": True,
+        "locationId": GHL_LOCATION_ID
+    }
+    try:
+        r = get_session().post(url, headers=ghl_headers(), json=body, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        j = r.json()
+        return j.get('id') or j.get('eventId') or j.get('appointmentId')
+    except requests.RequestException as e:
+        logger.error(f"GHL create appointment failed: {e} body={e.response.text if getattr(e,'response',None) else ''}")
+        return None
+
+def ghl_update_appointment(event_id: str, calendar_id: str, assigned_user_id: Optional[str],
+                           title: str, start_dt: datetime.datetime, end_dt: datetime.datetime,
+                           status: str) -> bool:
+    if not event_id:
+        return False
+    url = f"{GHL_API_BASE}/calendars/events/appointments/{event_id}"
+    body = {
+        "calendarId": calendar_id,
+        "assignedUserId": assigned_user_id,
+        "title": title or "Dental Appointment",
+        "appointmentStatus": status,
+        "startTime": to_iso(start_dt.astimezone(CLINIC_TIMEZONE)),
+        "endTime": to_iso(end_dt.astimezone(CLINIC_TIMEZONE)),
+        "ignoreFreeSlotValidation": True,
+        "locationId": GHL_LOCATION_ID
+    }
+    try:
+        r = get_session().put(url, headers=ghl_headers(), json=body, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        return True
+    except requests.RequestException as e:
+        logger.error(f"GHL update appointment failed: {e} body={e.response.text if getattr(e,'response',None) else ''}")
+        return False
+
+# =========================
+# ===== STATE & CACHE =====
+# =========================
+def load_last_sync() -> Dict[int, Optional[str]]:
+    raw = load_json_or(STATE_FILE, {})
+    out: Dict[int, Optional[str]] = {}
+    for k, v in raw.items():
         try:
-            patient = get_patient_details(pn)
-            if patient:
-                patient_data[pn] = patient
-                logger.info(f"Fetched patient {pn}")
-            else:
-                logger.warning(f"No data returned for patient {pn}")
-            time.sleep(0.5)
-        except Exception as e:
-            logger.error(f"Error fetching patient {pn}: {e}")
-    save_patient_cache(_patient_cache)
-    return patient_data
+            out[int(k)] = v
+        except:
+            pass
+    return out
 
-# === SMART SYNC WINDOW GENERATION ===
-def generate_sync_windows(
-    clinic_num: int,
-    last_sync: Optional[datetime.datetime],
-    force_deep_sync: bool = False
-) -> List[SyncWindow]:
-    now_utc = datetime.datetime.utcnow().replace(tzinfo=timezone.utc)
-    windows = []
-    # Force deep sync if state file doesn't exist
-    if not os.path.exists(STATE_FILE):
-        logger.info(f"Clinic {clinic_num}: No state file found, forcing deep sync")
-        force_deep_sync = True
-    if last_sync and not force_deep_sync:
-        time_since_last = now_utc - last_sync
-        if time_since_last < timedelta(hours=24):
-            logger.info(f"Clinic {clinic_num}: Incremental sync (last sync {time_since_last} ago)")
-            window_start = last_sync - timedelta(hours=SAFETY_OVERLAP_HOURS)
-            window_end = now_utc + timedelta(minutes=INCREMENTAL_SYNC_MINUTES)
-            windows.append(SyncWindow(
-                start_time=window_start,
-                end_time=window_end,
-                is_incremental=True,
-                clinic_num=clinic_num
-            ))
-        else:
-            logger.info(f"Clinic {clinic_num}: Deep sync needed (last sync {time_since_last} ago)")
-            force_deep_sync = True
-    if not last_sync or force_deep_sync:
-        logger.info(f"Clinic {clinic_num}: Deep sync with {DEEP_SYNC_HOURS}-hour window")
-        start_time = now_utc - timedelta(hours=SAFETY_OVERLAP_HOURS)  # Small overlap
-        end_time = now_utc + timedelta(hours=DEEP_SYNC_HOURS)         # Look ahead 720 hours
-        windows.append(SyncWindow(
-            start_time=start_time,
-            end_time=end_time,
-            is_incremental=False,
-            clinic_num=clinic_num
-        ))
-    logger.info(f"Clinic {clinic_num}: Generated {len(windows)} sync window(s)")
-    return windows
+def load_patient_cache() -> Dict[int, Dict[str, Any]]:
+    data = load_json_or('patient_cache.json', {"patients": {}})
+    patients = data.get("patients", {})
+    out: Dict[int, Dict[str, Any]] = {}
+    for k, v in patients.items():
+        try:
+            out[int(k)] = v
+        except:
+            pass
+    return out
 
-# === OPTIMIZED APPOINTMENT FETCHING ===
-def fetch_appointments_for_window(
-    window: SyncWindow,
-    appointment_filter: AppointmentFilter
-) -> List[Dict[str, Any]]:
-    clinic = appointment_filter.clinic_num
-    start_time_utc = window.start_time.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    end_time_utc = window.end_time.astimezone(timezone.utc).replace(hour=23, minute=59, second=59, microsecond=999999)
-    params = {
-        'ClinicNum': str(clinic),
-        'dateStart': start_time_utc.strftime('%Y-%m-%d'),
-        'dateEnd': end_time_utc.strftime('%Y-%m-%d'),
-        'limit': PAGE_SIZE,
-        'fields': ','.join(REQUIRED_APPOINTMENT_FIELDS)
-    }
-    # Bypass cache for incremental syncs or data within 30 minutes
-    use_cache = not window.is_incremental and (window.end_time - datetime.datetime.now(timezone.utc)).total_seconds() > 1800  # 30 minutes
-    try:
-        operatory_data = get_operatories(clinic)
-        if operatory_data:
-            valid_operatories = set(appointment_filter.operatory_nums)
-            operatory_info = [
-                {'OperatoryNum': op.get('OperatoryNum'), 'OperatoryName': op.get('OpName', 'Unknown')}
-                for op in operatory_data if op.get('OperatoryNum') in valid_operatories
-            ]
-            logger.info(f"Clinic {clinic}: Valid operatories - {operatory_info}")
-        else:
-            logger.warning(f"Clinic {clinic}: No operatory data retrieved")
-            return []
-    except Exception as e:
-        logger.error(f"Clinic {clinic}: Failed to fetch operatory data: {e}")
-        return []
-    all_appointments = []
-    for status in appointment_filter.valid_statuses:
-        for op_num in appointment_filter.operatory_nums:
-            single_params = params.copy()
-            single_params['AptStatus'] = status
-            single_params['Op'] = str(op_num)
-            try:
-                appointments = make_optimized_request_paginated('appointments', single_params, use_cache=use_cache)
-                logger.debug(f"Clinic {clinic}: Raw API response for AptStatus={status}, Op={op_num}: {len(appointments or [])} records")
-                if appointments:
-                    # Additional operatory validation
-                    filtered_appointments = [
-                        appt for appt in appointments
-                        if appt.get('Op') in appointment_filter.operatory_nums or appt.get('OperatoryNum') in appointment_filter.operatory_nums
-                    ]
-                    logger.debug(f"Clinic {clinic}: AptStatus={status}, Op={op_num} returned {len(appointments)} appointments, {len(filtered_appointments)} after operatory filter")
-                    for appt in filtered_appointments:
-                        logger.debug(f"Appt {appt.get('AptNum')}: Op={appt.get('Op')}, DateTStamp={appt.get('DateTStamp')}")
-                    all_appointments.extend(filtered_appointments)
-                else:
-                    logger.debug(f"Client {clinic}: AptStatus={status}, Op={op_num} returned no appointments")
-            except Exception as e:
-                logger.error(f"Clinic {clinic}: Error with AptStatus={status}, Op={op_num}: {e}")
-            time.sleep(1)
-    if not all_appointments:
-        logger.warning(f"Clinic {clinic}: No appointments found for specified operatories and statuses")
-    logger.debug(f"Clinic {clinic}: {'Incremental' if window.is_incremental else 'Full'} sync returned {len(all_appointments)} appointments")
-    return all_appointments
+def save_patient_cache(cache: Dict[int, Dict[str, Any]]):
+    atomic_save_json('patient_cache.json', {"patients": {str(k): v for k, v in cache.items()}})
 
-def apply_appointment_filters(
-    appointments: List[Dict[str, Any]],
-    appointment_filter: AppointmentFilter
-) -> List[Dict[str, Any]]:
-    clinic = appointment_filter.clinic_num
-    valid = []
-    for appt in appointments:
-        apt_num = str(appt.get('AptNum', ''))
-        status = str(appt.get('AptStatus', ''))
-        op_num = appt.get('Op') or appt.get('OperatoryNum')
-        pat_num = appt.get('PatNum')
-        logger.debug(f"Checking appointment {apt_num}: Op={op_num}, DateTStamp={appt.get('DateTStamp')}")
-        if not pat_num:
-            logger.error(f"Excluding appointment {apt_num}: missing PatNum")
-            continue
-        if not op_num:
-            logger.error(f"Excluding appointment {apt_num}: missing Op or OperatoryNum")
-            continue
-        if appointment_filter.exclude_ghl_tagged and has_ghl_tag(appt):
-            logger.debug(f"Excluding appointment {apt_num}: GHL tag")
-            continue
-        if appointment_filter.valid_statuses and status not in appointment_filter.valid_statuses:
-            logger.debug(f"Excluding appointment {apt_num}: invalid status: {status}")
-            continue
-        if appointment_filter.operatory_nums:
-            try:
-                op_num_int = int(op_num)
-                if op_num_int not in appointment_filter.operatory_nums:
-                    logger.debug(f"Excluding appointment {apt_num}: invalid operatory: {op_num}")
-                    continue
-            except (ValueError, TypeError):
-                logger.error(f"Excluding appointment {apt_num}: invalid operatory format: {op_num}")
-                continue
-        if status == 'Broken' and appointment_filter.broken_appointment_types:
-            apt_type_name = get_appointment_type_name(appt, clinic)
-            if apt_type_name not in appointment_filter.broken_appointment_types:
-                logger.debug(f"Excluding broken appointment {apt_num}: invalid type: {apt_type_name}")
-                continue
-        valid.append(appt)
-    logger.info(f"Clinic {clinic}: Filtered {len(appointments)} → {len(valid)} appointments")
-    return valid
+def load_contact_map() -> Dict[int, Any]:
+    raw = load_json_or(GHL_CONTACTS_MAP_FILE, {})
+    out: Dict[int, Any] = {}
+    for k, v in raw.items():
+        try:
+            out[int(k)] = v
+        except:
+            pass
+    return out
 
-def deduplicate_appointments(appointments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    unique_appointments = {}
-    for appt in appointments:
-        apt_num = str(appt.get('AptNum', ''))
-        pat_num = str(appt.get('PatNum', ''))
-        apt_date_time = appt.get('AptDateTime', '')
-        key = (apt_num, pat_num, apt_date_time)
-        unique_appointments[key] = appt
-    deduplicated = list(unique_appointments.values())
-    logger.info(f"Deduplicated {len(appointments)} → {len(deduplicated)} appointments")
-    return deduplicated
-
-def fetch_appointments_optimized(
-    clinic: int,
-    since: Optional[datetime.datetime],
-    force_deep_sync: bool = False
-) -> List[Dict[str, Any]]:
-    logger.info(f"Clinic {clinic}: Starting optimized fetch")
-    appointment_filter = AppointmentFilter(
-        clinic_num=clinic,
-        operatory_nums=CLINIC_OPERATORY_FILTERS.get(clinic, []),
-        valid_statuses=VALID_STATUSES,
-        broken_appointment_types=CLINIC_BROKEN_APPOINTMENT_TYPE_FILTERS.get(clinic, []),
-        exclude_ghl_tagged=True
-    )
-    windows = generate_sync_windows(clinic, since, force_deep_sync)
-    window = windows[0]
-    window_type = 'incremental' if window.is_incremental else 'full'
-    logger.info(f"Clinic {clinic}: Processing {window_type} sync from {window.start_time} to {window.end_time}")
-    all_appointments = []
-    params = {
-        'ClinicNum': str(clinic),
-        'dateStart': window.start_time.strftime('%Y-%m-%d'),
-        'dateEnd': window.end_time.strftime('%Y-%m-%d'),
-        'limit': PAGE_SIZE,
-        'fields': ','.join(REQUIRED_APPOINTMENT_FIELDS)
-    }
-    try:
-        operatory_data = get_operatories(clinic)
-        if operatory_data:
-            valid_operatories = set(appointment_filter.operatory_nums)
-            operatory_info = [
-                {'OperatoryNum': op.get('OperatoryNum'), 'OperatoryName': op.get('OpName', 'Unknown')}
-                for op in operatory_data if op.get('OperatoryNum') in valid_operatories
-            ]
-            logger.info(f"Clinic {clinic}: Valid operatories - {operatory_info}")
-        else:
-            logger.warning(f"Clinic {clinic}: No operatory data retrieved")
-            return []
-    except Exception as e:
-        logger.error(f"Clinic {clinic}: Failed to fetch operatory data: {e}")
-        return []
-    for status in appointment_filter.valid_statuses:
-        for op_num in appointment_filter.operatory_nums:
-            single_params = params.copy()
-            single_params['AptStatus'] = status
-            single_params['Op'] = str(op_num)
-            try:
-                appointments = make_optimized_request_paginated('appointments', single_params)
-                if appointments is None:
-                    logger.error(f"Clinic {clinic}: No appointments returned for AptStatus={status}, Op={op_num}")
-                    continue
-                # Additional operatory validation
-                filtered_appointments = [
-                    appt for appt in appointments
-                    if appt.get('Op') in appointment_filter.operatory_nums or appt.get('OperatoryNum') in appointment_filter.operatory_nums
-                ]
-                logger.debug(f"Clinic {clinic}: AptStatus={status}, Op={op_num} returned {len(appointments)} appointments, {len(filtered_appointments)} after operatory filter")
-                all_appointments.extend(filtered_appointments)
-            except Exception as e:
-                logger.error(f"Clinic {clinic}: Error fetching appointments for AptStatus={status}, Op={op_num}: {e}")
-            time.sleep(1)
-    if not all_appointments:
-        logger.warning(f"Clinic {clinic}: No appointments found for specified operatories and statuses")
-    time_filtered_appointments = [
-        appt for appt in all_appointments
-        if windows[0].start_time <= parse_time(appt.get('AptDateTime' if not windows[0].is_incremental else 'DateTStamp', '')) <= windows[0].end_time
-    ]
-    filtered_appointments = apply_appointment_filters(time_filtered_appointments, appointment_filter)
-    deduplicated_appointments = deduplicate_appointments(filtered_appointments)
-    logger.info(
-        f"Clinic {clinic}: {len(all_appointments)} raw → "
-        f"{len(time_filtered_appointments)} time-filtered → "
-        f"{len(filtered_appointments)} filtered → "
-        f"{len(deduplicated_appointments)} deduplicated appointments"
-    )
-    return deduplicated_appointments
-
-# === KERAGON INTEGRATION ===
-def validate_keragon_payload(payload: Dict[str, Any]) -> bool:
-    appt = payload.get('appointment', {})
-    patient = payload.get('patient', {})
-    required_appt_fields = ['AptNum', 'AptStatus', 'AptDateTime', 'ClinicNum', 'PatNum']
-    required_patient_fields = ['FName', 'LName', 'PatNum']
-    missing_appt = [f for f in required_appt_fields if not appt.get(f)]
-    missing_patient = [f for f in required_patient_fields if not patient.get(f)]
-    if missing_appt or missing_patient:
-        logger.error(f"Invalid Keragon payload: Missing appointment fields {missing_appt}, patient fields {missing_patient}")
+# =========================
+# ===== CORE: PROCESS =====
+# =========================
+def validate_configuration() -> bool:
+    errs = []
+    if not DEVELOPER_KEY or not CUSTOMER_KEY:
+        errs.append("Missing OpenDental API credentials")
+    if not GHL_API_TOKEN:
+        errs.append("Missing GHL API token (GHL_API_KEY / GHL_OAUTH_TOKEN / GHL_AUTH_TOKEN)")
+    if not GHL_LOCATION_ID:
+        errs.append("Missing GHL_LOCATION_ID")
+    for c in CLINIC_NUMS:
+        if f"clinic:{c}" not in GHL_CALENDAR_MAP and "default" not in GHL_CALENDAR_MAP:
+            errs.append(f"Missing calendarId for clinic {c} (GHL_CALENDAR_MAP)")
+        if f"clinic:{c}" not in GHL_ASSIGNED_USER_MAP:
+            errs.append(f"Missing assignedUserId for clinic {c} (GHL_ASSIGNED_USER_MAP)")
+        if c not in CLINIC_OPERATORY_FILTERS:
+            errs.append(f"Missing operatory filter for clinic {c}")
+        if c not in CLINIC_BROKEN_APPOINTMENT_TYPE_FILTERS:
+            errs.append(f"Missing broken-appointment type filter for clinic {c}")
+    if not GHL_CUSTOM_FIELD_CLINIC_ID:
+        logger.warning("GHL_CUSTOM_FIELD_CLINIC_ID not set: will fall back to tagging clinic:<num> on contact.")
+    if errs:
+        logger.error("Config validation failed:")
+        for e in errs: logger.error(" - " + e)
         return False
     return True
 
-def send_to_keragon(appointment: Dict[str, Any], clinic: int, patient_data: Dict[int, Dict[str, Any]], dry_run: bool = False) -> bool:
-    try:
-        apt_num = str(appointment.get('AptNum', ''))
-        pat_num = appointment.get('PatNum')
-        if not pat_num:
-            logger.error(f"Appointment {apt_num}: Missing PatNum")
-            return False
-        patient = patient_data.get(pat_num, {})
-        start_time_str = appointment.get('AptDateTime', '')
-        start_time = parse_time(start_time_str)
-        if start_time is None:
-            logger.error(f"Invalid AptDateTime for appointment {apt_num}: {start_time_str}")
-            return False
-        start_time = start_time.astimezone(CLINIC_TIMEZONE)
-        pattern = appointment.get('Pattern', '')
-        end_time = calculate_end_time(start_time, pattern) if start_time and pattern else start_time + timedelta(minutes=60)
-        # Build staff string
-        parts = []
-        prov_num = appointment.get('ProvNum')
-        if prov_num:
-            prov = get_provider_details(int(prov_num))
-            if prov:
-                prov_name = f"Dr.%20{prov.get('LName', '').strip()}"
-                if prov_name != "Dr.":
-                    parts.append(prov_name)
-        prov_hyg = appointment.get('ProvHyg')
-        if prov_hyg:
-            hyg = get_provider_details(int(prov_hyg))
-            if hyg:
-                hyg_name = f"{hyg.get('FName', '').strip()}%20{hyg.get('LName', '').strip()}".strip()
-                if hyg_name:
-                    parts.append(hyg_name)
-        asst = appointment.get('Asst')
-        if asst:
-            asst_emp = get_employee_details(int(asst))
-            if asst_emp:
-                asst_name = f"{asst_emp.get('FName', '').strip()}%20{asst_emp.get('LName', '').strip()}".strip()
-                if asst_name:
-                    parts.append(asst_name)
-        staff = ",".join(parts)
-        payload = {
-            'appointment': {
-                'AptNum': apt_num,
-                'AptStatus': appointment.get('AptStatus', ''),
-                'AptDateTime': start_time.isoformat(),
-                'EndTime': end_time.isoformat(),
-                'Note': appointment.get('Note', ''),
-                'AppointmentTypeNum': appointment.get('AppointmentTypeNum', ''),
-                'AppointmentTypeName': get_appointment_type_name(appointment, clinic),
-                'ClinicNum': str(clinic),
-                'PatNum': str(pat_num),
-                'OperatoryNum': str(appointment.get('Op') or appointment.get('OperatoryNum', '')),
-                'Staff': staff
-            },
-            'patient': {
-                'FName': patient.get('FName', ''),
-                'LName': patient.get('LName', ''),
-                'PatNum': str(pat_num),
-                'Email': patient.get('Email', ''),
-                'Address': patient.get('Address', ''),
-                'HmPhone': patient.get('HmPhone', ''),
-                'WkPhone': patient.get('WkPhone', ''),
-                'Birthdate': patient.get('Birthdate', ''),
-                'State': patient.get('State', ''),
-                'Zip': patient.get('Zip', ''),
-                'WirelessPh': patient.get('WirelessPhone', ''),
-                'Gender': patient.get('Gender', '')
-            }
+def ensure_contact_id(first: str, last: str, email: str, phone: str,
+                      pat_num: int,
+                      clinic_num: int,
+                      contact_map: Dict[int, Any]) -> Tuple[Optional[str], bool]:
+    """
+    Returns (contact_id, is_new_contact).
+    Path:
+      1) If PatNum is already mapped -> return that id (is_new=False)
+      2) Else search by normalized phone
+      3) Else upsert (create) and return id (is_new=True)
+    """
+    # 1) PatNum fast path
+    mapped = contact_map.get(pat_num)
+    if mapped and mapped.get('contactId'):
+        return mapped['contactId'], False
+
+    # 2) phone search
+    phone_norm = normalize_phone_for_search(phone)
+    found = ghl_search_contact_by_phone(phone_norm) if phone_norm else None
+    if found and found.get('id'):
+        cid = found['id']
+        contact_map[pat_num] = {
+            "contactId": cid,
+            "phone": phone_norm,
+            "email": valid_email_or_unknown(email),
+            "updatedAt": datetime.datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
         }
-        if not validate_keragon_payload(payload):
-            logger.error(f"Skipping appointment {apt_num} due to invalid payload")
-            return False
-        if dry_run:
-            logger.info(f"Dry run: Would send appointment {apt_num} to Keragon: {json.dumps(payload, indent=2)}")
-            return True
-        logger.info(f"Sending payload for appointment {apt_num} to Keragon: {json.dumps(payload, indent=2)}")
-        session = get_optimized_session()
-        headers = {'Content-Type': 'application/json'}
-        for attempt in range(RETRY_ATTEMPTS):
-            try:
-                response = session.post(KERAGON_WEBHOOK_URL, json=payload, headers=headers, timeout=30)
-                logger.debug(f"Keragon request for {apt_num}: {response.request.url}")
-                if response.status_code in (200, 201, 202, 204):
-                    logger.info(f"✓ Successfully sent appointment {apt_num} (HTTP {response.status_code})")
-                    return True
-                else:
-                    logger.error(f"Failed to send appointment {apt_num}: HTTP {response.status_code} - {response.text}")
-            except requests.exceptions.RequestException as e:
-                logger.error(f"Attempt {attempt + 1} failed for appointment {apt_num}: {e}")
-            time.sleep(BACKOFF_FACTOR * (2 ** attempt))
-        logger.error(f"Failed to send appointment {apt_num} after {RETRY_ATTEMPTS} attempts")
-        return False
-    except Exception as e:
-        logger.error(f"Failed to send appointment {apt_num} to Keragon: {e}")
-        return False
+        return cid, False
 
-def send_batch_to_keragon(appointments: List[Dict[str, Any]], clinic: int, patient_data: Dict[int, Dict[str, Any]], dry_run: bool = False) -> Tuple[int, List[str]]:
-    if not appointments:
-        logger.info("No appointments to send to Keragon")
-        return 0, []
-    batch_size = BATCH_SIZE
-    successful_sends = 0
-    sent_appointment_ids = []
-    for i in range(0, len(appointments), batch_size):
-        batch = appointments[i:i + batch_size]
-        for appt in batch:
-            if send_to_keragon(appt, clinic, patient_data, dry_run):
-                successful_sends += 1
-                sent_appointment_ids.append(str(appt.get('AptNum', '')))
-            time.sleep(0.5)
-        if i + batch_size < len(appointments):
-            time.sleep(2)
-    return successful_sends, sent_appointment_ids
+    # 3) create with full payload
+    patient_like = {
+        "FName": first,
+        "LName": last,
+        "Email": email,
+        "WirelessPhone": phone,
+    }
+    cid = ghl_upsert_contact(patient_like, clinic_num)
+    if cid:
+        contact_map[pat_num] = {
+            "contactId": cid,
+            "phone": phone_norm,
+            "email": valid_email_or_unknown(email),
+            "updatedAt": datetime.datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+        }
+        return cid, True
 
-# === MAIN SYNC LOGIC ===
-def process_clinic_optimized(
-    clinic: int,
-    last_syncs: Dict[int, Optional[datetime.datetime]],
-    sent_appointments: Dict[str, Dict[str, str]],
-    dry_run: bool = False,
-    force_deep_sync: bool = False
-) -> Tuple[int, List[str], datetime.datetime]:
-    logger.info(f"Processing clinic {clinic}")
-    since = last_syncs.get(clinic)
-    appointment_types = get_appointment_types(clinic, force_refresh=force_deep_sync)
-    appointments = fetch_appointments_optimized(clinic, since, force_deep_sync)
-    new_appointments = []
-    pat_nums = set()
-    apt_map: Dict[str, Dict[str, Any]] = {}
-    for appt in appointments:
-        apt_num = str(appt.get('AptNum', ''))
-        pat_num = appt.get('PatNum')
-        if not pat_num:
-            logger.warning(f"Skipping appointment {apt_num} with missing PatNum")
-            continue
-        # Must have valid DateTStamp to avoid duplicates
-        date_tstamp = parse_time(appt.get('DateTStamp'))
-        if not date_tstamp:
-            logger.warning(f"Skipping appointment {apt_num} with invalid or missing DateTStamp")
-            continue
-        sent_entry = sent_appointments.get(apt_num)
-        if sent_entry is not None:
-            last_sent_raw = (sent_entry.get('last_sent_tstamp') or '').strip()
-            # Presence-only rule: if in file but empty timestamp, treat as already sent.
-            # Backfill to current DateTStamp and skip sending now.
-            if not last_sent_raw:
-                sent_entry['last_sent_tstamp'] = appt.get('DateTStamp') or ''
-                logger.debug(
-                    f"Presence-only record for {apt_num}; backfilled last_sent_tstamp "
-                    f"to '{sent_entry['last_sent_tstamp']}' and skipping send"
-                )
-                continue
-            # Normal rule: only send if changed since last_sent_tstamp
-            last_sent = parse_time(last_sent_raw)
-            if last_sent and date_tstamp <= last_sent:
-                logger.debug(
-                    f"Skipping already-sent appointment {apt_num}: "
-                    f"DateTStamp {date_tstamp} <= last_sent_tstamp {last_sent}"
-                )
-                continue
-        # Not in file (never sent) OR updated (DateTStamp > last_sent_tstamp)
-        pat_nums.add(pat_num)
-        new_appointments.append(appt)
-        apt_map[apt_num] = appt
-    logger.info(f"Clinic {clinic}: Found {len(new_appointments)} new or updated appointments for {len(pat_nums)} patients")
-    patient_data = fetch_patients_paginated(list(pat_nums))
-    sent_count, sent_ids = send_batch_to_keragon(new_appointments, clinic, patient_data, dry_run)
-    logger.info(f"Clinic {clinic}: Successfully sent {sent_count} appointments")
-    # Mark only the ones that truly succeeded
-    for apt_id in sent_ids:
-        appt = apt_map.get(str(apt_id))
-        if appt:
-            ts = appt.get('DateTStamp') or ''
-            entry = sent_appointments.setdefault(str(apt_id), {})
-            entry['last_sent_tstamp'] = ts
-    sync_time = datetime.datetime.utcnow().replace(tzinfo=timezone.utc)
-    return sent_count, sent_ids, sync_time
+    return None, False
 
-def main_loop(dry_run: bool = False, force_deep_sync: bool = False, once: bool = False):
-    if not validate_configuration():
-        logger.error("Configuration validation failed, exiting")
-        sys.exit(1)
-    get_all_providers()
-    get_all_employees()
-    last_syncs = load_last_sync_times()
-    sent_appointments = load_sent_appointments()
-    while True:
-        now = datetime.datetime.now(tz=timezone.utc)
-        next_run = get_next_run_time(now, force_deep_sync)
-        time_to_next = (next_run.astimezone(timezone.utc) - now).total_seconds()
-        if time_to_next > 0 and not once:
-            logger.info(f"Next run at {next_run.astimezone(CLINIC_TIMEZONE)} ({time_to_next/60:.1f} minutes from now)")
-            time.sleep(time_to_next)
-        total_sent = 0
-        new_sent_ids = []
-        sync_type = 'deep' if force_deep_sync or is_deep_sync_time(now) else 'incremental'
-        logger.info(f"Starting {sync_type} sync for {len(CLINIC_NUMS)} clinics")
-        for i, clinic in enumerate(CLINIC_NUMS):
-            if i > 0:
-                time.sleep(CLINIC_DELAY_SECONDS)
-            sent_count, sent_ids, sync_time = process_clinic_optimized(
-                clinic, last_syncs, sent_appointments, dry_run, force_deep_sync or is_deep_sync_time(now)
-            )
-            total_sent += sent_count
-            new_sent_ids.extend(sent_ids)
-            # Only advance last_sync when we actually sent something
-            if sent_count > 0:
-                if validate_sync_time_update(clinic, last_syncs.get(clinic), sync_time):
-                    last_syncs[clinic] = sync_time
-                else:
-                    logger.warning(f"Clinic {clinic}: Skipping sync time update due to invalid timestamp")
-            else:
-                logger.info(f"Clinic {clinic}: No appointments sent — leaving last_sync unchanged")
-        # Persist state unconditionally to capture backfills and sent timestamps
-        try:
-            save_state_atomically(last_syncs, sent_appointments)
-            logger.info("Committed state and sent appointments")
-        except Exception as e:
-            logger.error(f"Failed to save state: {e}")
-        logger.info(f"Sync complete: sent {total_sent} appointments across {len(CLINIC_NUMS)} clinics")
-        # === Final safety: ensure cache exists even if no appointments were sent ===
-        if not os.path.exists(PATIENT_CACHE_FILE):
-            logger.warning("No appointments sent and no patient cache found — creating empty persistent patient_cache.json")
-            save_patient_cache({})
+def process_one_appt(appt: Dict[str, Any],
+                     patients: Dict[int, Dict[str, Any]],
+                     clinic: int,
+                     ghl_map: Dict[str, Any],
+                     contact_map: Dict[int, Any]) -> Optional[str]:
+    """
+    Rules:
+      - If AptNum is already mapped → UPDATE that specific GHL eventId (even if day/time changed).
+      - If AptNum not mapped:
+          * ensure contact by phone (create if needed) and record contactId in contact_map.
+          * If it's a NEW contact → CREATE appointment immediately (no need to fetch appointments).
+          * If not new:
+              - fetch the contact's appointments; pick the LATEST same-day event (by dateUpdated/updatedAt) on the SAME calendar → UPDATE.
+              - if none → CREATE new event.
+          * store AptNum -> eventId mapping for future updates.
+    """
+    apt_num = str(appt.get('AptNum', ''))
+    pat_num = int(appt.get('PatNum', 0) or 0)
+    if not apt_num or not pat_num:
+        logger.warning("Skipping appt without AptNum/PatNum")
+        return None
+
+    # times
+    start = parse_time(appt.get('AptDateTime', ''))
+    if not start:
+        logger.warning(f"Apt {apt_num}: invalid AptDateTime")
+        return None
+    start_local = start.astimezone(CLINIC_TIMEZONE)
+    end_local = calculate_end_time(start_local, appt.get('Pattern', ''))
+
+    # patient fields (for contact payload/title)
+    p = patients.get(pat_num, {}) or {}
+    first = (p.get('FName') or appt.get('FName') or '').strip()
+    last  = (p.get('LName') or appt.get('LName') or '').strip()
+    email = valid_email_or_unknown(p.get('Email', ''))
+    phone = p.get('WirelessPhone') or p.get('HmPhone') or ''
+
+    # clinic routing
+    calendar_id = pick_calendar_id(clinic)
+    assigned_user_id = pick_assigned_user_id(clinic)
+    if not calendar_id:
+        logger.error(f"Clinic {clinic}: missing calendar mapping")
+        return None
+
+    # Ensure / create contact, capture whether it's new
+    contact_id, is_new_contact = ensure_contact_id(first, last, email, phone, pat_num, clinic, contact_map)
+    if not contact_id:
+        logger.error(f"Apt {apt_num}: failed to ensure contact")
+        return None
+
+    title = f"{first} {last}".strip() or "Dental Appointment"
+    status = map_appt_status_to_ghl(appt.get('AptStatus', ''))
+
+    # ===== If AptNum already mapped → update exact event =====
+    mapped = ghl_map.get(apt_num)
+    if mapped and mapped.get('eventId'):
+        event_id = mapped['eventId']
+        ok = ghl_update_appointment(event_id, calendar_id, assigned_user_id, title, start_local, end_local, status)
+        if ok:
+            mapped.update({"contactId": contact_id, "calendarId": calendar_id, "clinic": clinic})
+            ghl_map[apt_num] = mapped
+            logger.info(f"✓ Updated mapped event {event_id} for AptNum {apt_num}")
+            return event_id
         else:
-            logger.info("Patient cache exists — no fallback needed")
-        if once:
-            break
-        # Ensure the sync is fully complete before calculating the next run time
-        now = datetime.datetime.now(tz=timezone.utc)
-        next_run = get_next_run_time(now, force_deep_sync)
-        time_to_next = (next_run.astimezone(timezone.utc) - now).total_seconds()
-        if time_to_next > 0:
-            logger.info(f"Sync completed, waiting for next run at {next_run.astimezone(CLINIC_TIMEZONE)}")
-            time.sleep(time_to_next)
+            logger.warning(f"Apt {apt_num}: mapped update failed — creating fresh and remapping")
+            new_id = ghl_create_appointment(calendar_id, contact_id, assigned_user_id, title, start_local, end_local, status)
+            if new_id:
+                ghl_map[apt_num] = {"contactId": contact_id, "eventId": new_id, "calendarId": calendar_id, "clinic": clinic}
+                return new_id
+            return None
 
+    # ===== Not mapped =====
+    if is_new_contact:
+        # brand-new contact → no need to fetch appointments; just create
+        new_event_id = ghl_create_appointment(calendar_id, contact_id, assigned_user_id, title, start_local, end_local, status)
+        if new_event_id:
+            ghl_map[apt_num] = {"contactId": contact_id, "eventId": new_event_id, "calendarId": calendar_id, "clinic": clinic}
+            logger.info(f"＋ Created event {new_event_id} for NEW contact, AptNum {apt_num}")
+            return new_event_id
+        logger.error(f"Apt {apt_num}: failed to create event for new contact")
+        return None
+
+    # Existing contact (but AptNum not mapped) → pick latest same-day event by updatedAt, same calendar only
+    contact_events = ghl_get_contact_appointments(contact_id)
+    candidate_event_id = pick_latest_same_day_event(contact_events, start_local, calendar_id)
+    if candidate_event_id:
+        ok = ghl_update_appointment(candidate_event_id, calendar_id, assigned_user_id, title, start_local, end_local, status)
+        if ok:
+            ghl_map[apt_num] = {"contactId": contact_id, "eventId": candidate_event_id, "calendarId": calendar_id, "clinic": clinic}
+            logger.info(f"✓ Reconciled via latest same-day event {candidate_event_id} for AptNum {apt_num}")
+            return candidate_event_id
+        else:
+            logger.warning(f"Apt {apt_num}: same-day update failed — creating fresh")
+
+    # No same-day match → create new
+    new_event_id = ghl_create_appointment(calendar_id, contact_id, assigned_user_id, title, start_local, end_local, status)
+    if new_event_id:
+        ghl_map[apt_num] = {"contactId": contact_id, "eventId": new_event_id, "calendarId": calendar_id, "clinic": clinic}
+        logger.info(f"＋ Created event {new_event_id} for AptNum {apt_num}")
+        return new_event_id
+
+    logger.error(f"Apt {apt_num}: failed to create appointment")
+    return None
+
+# =========================
+# ===== SYNC WINDOWS ======
+# =========================
+def generate_window(last_sync_iso: Optional[str], force_deep: bool) -> Tuple[datetime.datetime, datetime.datetime, bool]:
+    now_utc = datetime.datetime.utcnow().replace(tzinfo=timezone.utc)
+    if force_deep or not last_sync_iso:
+        return (now_utc - timedelta(hours=SAFETY_OVERLAP_HOURS), now_utc + timedelta(hours=DEEP_SYNC_HOURS), False)
+    last_dt = parse_time(last_sync_iso)
+    if last_dt and (now_utc - last_dt) < timedelta(hours=24):
+        return (last_dt - timedelta(hours=SAFETY_OVERLAP_HOURS), now_utc + timedelta(minutes=INCREMENTAL_SYNC_MINUTES), True)
+    return (now_utc - timedelta(hours=SAFETY_OVERLAP_HOURS), now_utc + timedelta(hours=DEEP_SYNC_HOURS), False)
+
+def get_next_run_time(now: datetime.datetime, force_deep: bool) -> datetime.datetime:
+    now_c = now.astimezone(CLINIC_TIMEZONE)
+    if force_deep or (now_c.hour == DEEP_SYNC_HOUR and now_c.minute == 0):
+        return now_c
+    if CLINIC_OPEN_HOUR <= now_c.hour < CLINIC_CLOSE_HOUR:
+        minutes = (now_c.minute // INCREMENTAL_INTERVAL_MINUTES + 1) * INCREMENTAL_INTERVAL_MINUTES
+        nxt = now_c.replace(second=0, microsecond=0, minute=0, hour=now_c.hour) + timedelta(minutes=minutes)
+        if nxt.hour >= CLINIC_CLOSE_HOUR:
+            nxt = nxt.replace(hour=DEEP_SYNC_HOUR, minute=0) + timedelta(days=1)
+        return nxt
+    return now_c.replace(hour=DEEP_SYNC_HOUR, minute=0, second=0, microsecond=0) + timedelta(days=1)
+
+# =========================
+# ===== MAIN SYNC =========
+# =========================
+def main_once(dry_run: bool = False, force_deep_sync: bool = False):
+    if not validate_configuration():
+        sys.exit(1)
+
+    # Pull latest state from MEGA (best-effort)
+    pull_all_from_mega()
+
+    last_sync = load_last_sync()                  # clinic → iso str
+    sent_map = load_json_or(SENT_APPTS_FILE, {})  # AptNum → {last_sent_tstamp}
+    snapshot = load_json_or(APPT_SNAPSHOT_FILE, {})
+    ghl_map = load_json_or(GHL_MAP_FILE, {})
+    contact_map = load_contact_map()
+
+    patient_cache = load_patient_cache()
+    total = 0
+
+    for idx, clinic in enumerate(CLINIC_NUMS):
+        if idx > 0:
+            time.sleep(CLINIC_DELAY_SECONDS)
+
+        start, end, is_incr = generate_window(last_sync.get(clinic), force_deep_sync)
+        logger.info(f"Clinic {clinic}: window {start} → {end} ({'incremental' if is_incr else 'deep'})")
+
+        appts = fetch_appointments_for_window(clinic, start, end)
+        if not appts:
+            logger.info(f"Clinic {clinic}: no appointments in window.")
+            continue
+
+        # Filter to new/updated by DateTStamp vs SENT_APPTS_FILE
+        to_process: List[Dict[str, Any]] = []
+        pat_nums: Set[int] = set()
+        for a in appts:
+            aptnum = str(a.get('AptNum', ''))
+            tstamp = parse_time(a.get('DateTStamp', ''))
+            if not aptnum or not tstamp:
+                continue
+            prev = sent_map.get(aptnum, {}).get('last_sent_tstamp')
+            prev_dt = parse_time(prev) if prev else None
+            if prev_dt and tstamp <= prev_dt:
+                continue
+            to_process.append(a)
+            if a.get('PatNum'):
+                try: pat_nums.add(int(a['PatNum']))
+                except: pass
+
+        if not to_process:
+            logger.info(f"Clinic {clinic}: nothing new/updated to send.")
+            continue
+
+        # Pull minimal patient info (prefer cache; if missing, fetch)
+        patients: Dict[int, Dict[str, Any]] = {}
+        for pn in sorted(pat_nums):
+            if pn in patient_cache:
+                patients[pn] = patient_cache[pn]
+                continue
+            data = od_get(f"patients/{pn}", {}) or []
+            pat = (data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else {}))
+            if pat:
+                patients[pn] = pat
+                patient_cache[pn] = pat
+            time.sleep(0.12)
+
+        # Process each
+        for a in to_process:
+            aptnum = str(a.get('AptNum', ''))
+            if dry_run:
+                logger.info(f"[DRY-RUN] Would process AptNum {aptnum}")
+                continue
+
+            event_id = process_one_appt(a, patients, clinic, ghl_map, contact_map)
+            if event_id:
+                total += 1
+                sent_map.setdefault(aptnum, {})['last_sent_tstamp'] = a.get('DateTStamp', '')
+                snapshot[aptnum] = a
+
+        # advance last_sync only if we processed items
+        if to_process:
+            last_sync[clinic] = datetime.datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+
+    # Persist state + MEGA push
+    save_patient_cache(patient_cache)
+    save_state(sent_map, last_sync, snapshot, ghl_map, contact_map)
+    logger.info(f"Done. Created/updated {total} appointments.")
+
+def main_loop(dry_run: bool = False, force_deep_sync: bool = False):
+    if not validate_configuration():
+        sys.exit(1)
+    while True:
+        main_once(dry_run=dry_run, force_deep_sync=force_deep_sync)
+        now = datetime.datetime.now(tz=timezone.utc)
+        nxt = get_next_run_time(now, force_deep_sync)
+        sleep_s = max(0, (nxt.astimezone(timezone.utc) - now).total_seconds())
+        logger.info(f"Next run at {nxt.astimezone(CLINIC_TIMEZONE)} (in {sleep_s/60:.1f} min)")
+        time.sleep(sleep_s)
+
+# =========================
+# ======== CLI ============
+# =========================
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Open Dental API Sync Script")
-    parser.add_argument('--dry-run', action='store_true', help="Run without sending to Keragon")
-    parser.add_argument('--force-deep-sync', action='store_true', help="Force a deep sync")
-    parser.add_argument('--once', action='store_true', help="Run once and exit")
-    parser.add_argument('--verbose', action='store_true', help="Enable verbose logging")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="OpenDental → GHL sync (AptNum-first, latest same-day reconciliation, Clinic custom field)")
+    p.add_argument("--dry-run", action="store_true", help="Log actions without calling GHL")
+    p.add_argument("--force-deep-sync", action="store_true", help="Use deep sync window this cycle")
+    p.add_argument("--once", action="store_true", help="Run once and exit")
+    p.add_argument("--verbose", action="store_true", help="Enable DEBUG logs")
+    args = p.parse_args()
     if args.verbose:
         logger.setLevel(logging.DEBUG)
-    main_loop(dry_run=args.dry_run, force_deep_sync=args.force_deep_sync, once=args.once)
+    if args.once:
+        main_once(dry_run=args.dry_run, force_deep_sync=args.force_deep_sync)
+    else:
+        main_loop(dry_run=args.dry_run, force_deep_sync=args.force_deep_sync)
