@@ -20,6 +20,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      PYTHONUNBUFFERED: "1"  # flush logs immediately
 
     steps:
       - name: Check out repository code
@@ -44,8 +46,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # mega.py is optional; install only if you use MEGA for state replication
-          pip install requests python-dateutil jq mega.py
+          pip install requests python-dateutil jq mega.py pycryptodome
 
       - name: Determine sync type
         id: sync_type
@@ -68,14 +69,17 @@ jobs:
       - name: Ensure .gitignore excludes state/PII files
         run: |
           if [ -f .gitignore ]; then
-            # State / mapping files (never commit patient data; we also ignore these for safety)
+            # NEVER commit state / PII
             grep -q "^patient_cache\.json$" .gitignore || echo "patient_cache.json" >> .gitignore
             grep -q "^appointments_store\.json$" .gitignore || echo "appointments_store.json" >> .gitignore
             grep -q "^ghl_appointments_map\.json$" .gitignore || echo "ghl_appointments_map.json" >> .gitignore
             grep -q "^ghl_contacts_map\.json$" .gitignore || echo "ghl_contacts_map.json" >> .gitignore
             grep -q "^sent_appointments\.json$" .gitignore || echo "sent_appointments.json" >> .gitignore
             grep -q "^last_sync_state\.json$" .gitignore || echo "last_sync_state.json" >> .gitignore
+            grep -q "^appointment_types_cache\.json$" .gitignore || echo "appointment_types_cache.json" >> .gitignore
             grep -q "^appointments_op_.*\.json$" .gitignore || echo "appointments_op_*.json" >> .gitignore
+            grep -q "^__pycache__/$" .gitignore || echo "__pycache__/" >> .gitignore
+            grep -q "^\.(venv|env)/$" .gitignore || echo ".venv/" >> .gitignore
           else
             cat > .gitignore << 'EOF'
           # OD→GHL sync: NEVER commit patient/state locally
@@ -85,6 +89,7 @@ jobs:
           ghl_contacts_map.json
           sent_appointments.json
           last_sync_state.json
+          appointment_types_cache.json
           # Debug artifacts
           appointments_op_*.json
           __pycache__/
@@ -119,21 +124,20 @@ jobs:
           # OPEN_DENTAL_API_URL:    ${{ secrets.OPEN_DENTAL_API_URL }}   # optional override
 
           # ---- GoHighLevel / LeadConnector ----
-          # Provide either/both:
           GHL_LOCATION_ID:           ${{ secrets.GHL_LOCATION_ID }}
-          GHL_AUTH_TOKEN:            ${{ secrets.GHL_AUTH_TOKEN }}  # Location OAuth token (JWT)
-          GHL_LOCATION_API_KEY:      ${{ secrets.GHL_LOCATION_API_KEY }}        # Location API Key (static)
+          # The script will accept any of these. We wire your Location API Key into GHL_API_KEY too:
+          GHL_AUTH_TOKEN:            ${{ secrets.GHL_AUTH_TOKEN }}          # OAuth access token (JWT)
+          GHL_OAUTH_TOKEN:           ${{ secrets.GHL_OAUTH_TOKEN }}         # (optional alt)
+          GHL_API_KEY:               ${{ secrets.GHL_LOCATION_API_KEY }}    # Location API Key (static) → used if tokens above empty
 
           # Mappings (JSON strings)
-          # {"clinic:9034":"cal_XXXXX","clinic:9035":"cal_YYYYY","default":"cal_FALLBACK"}
-          GHL_CALENDAR_MAP:          ${{ secrets.GHL_CALENDAR_MAP }}
-          # {"clinic:9034":"user_AAAAA","clinic:9035":"user_BBBBB"}
-          GHL_ASSIGNED_USER_MAP:     ${{ secrets.GHL_ASSIGNED_USER_MAP }}
+          GHL_CALENDAR_MAP:          ${{ secrets.GHL_CALENDAR_MAP }}        # {"clinic:9034":"cal_x","clinic:9035":"cal_y","default":"cal_fallback"}
+          GHL_ASSIGNED_USER_MAP:     ${{ secrets.GHL_ASSIGNED_USER_MAP }}   # {"clinic:9034":"user_a","clinic:9035":"user_b"}
 
-          # Optional: Contacts custom field for Clinic (if you fetched it)
+          # Optional: Contacts custom field for Clinic (CONTACT object)
           GHL_CUSTOM_FIELD_CLINIC_ID: ${{ secrets.GHL_CUSTOM_FIELD_CLINIC_ID }}
 
-          # Tag to add on appointment create/update (your requirement)
+          # Tag to add on appointment create/update
           GHL_TAG_FROM_OD:           "fromopendental"
 
           # ---- Clinics & behavior ----
@@ -149,29 +153,28 @@ jobs:
           RETRY_ATTEMPTS:            "5"
           BACKOFF_FACTOR:            "3.0"
 
-          # ---- MEGA (optional, for state replication) ----
+          # ---- MEGA (state replication) ----
           MEGA_EMAIL:                ${{ secrets.MEGA_EMAIL }}
           MEGA_PASSWORD:             ${{ secrets.MEGA_PASSWORD }}
           MEGA_FOLDER:               ${{ secrets.MEGA_FOLDER }}   # defaults to "od_ghl_sync" if unset
         run: |
-          SCRIPT="${{ steps.pickscript.outputs.script }}"
+          echo "Incremental sync: ${{ steps.pickscript.outputs.script }}"
           if [ "${{ steps.sync_type.outputs.force_deep_sync }}" = "true" ]; then
-            echo "Deep sync: $SCRIPT"
-            python3 "$SCRIPT" --force-deep-sync --verbose --once
+            echo "Deep sync: ${{ steps.pickscript.outputs.script }}"
+            python3 "${{ steps.pickscript.outputs.script }}" --force-deep-sync --verbose --once
           else
-            echo "Incremental sync: $SCRIPT"
-            python3 "$SCRIPT" --verbose --once
+            python3 "${{ steps.pickscript.outputs.script }}" --verbose --once
           fi
 
       - name: Validate state files (non-PHI only)
         run: |
-          echo "## Checking non-PHI state artifacts (may be empty on first run)"
-          for f in last_sync_state.json sent_appointments.json appointments_store.json ghl_appointments_map.json ghl_contacts_map.json; do
+          echo "## Checking non-PHI state artifacts (may be absent—MEGA-first run uses temp dir)"
+          for f in last_sync_state.json sent_appointments.json appointments_store.json ghl_appointments_map.json ghl_contacts_map.json appointment_types_cache.json; do
             if [ -f "$f" ]; then
               echo "Found $f (size: $(stat -c%s "$f" 2>/dev/null || stat -f%z "$f"))"
               jq empty "$f" || { echo "Invalid JSON in $f"; exit 1; }
             else
-              echo "$f not present (ok on first run if nothing changed)."
+              echo "$f not present locally (expected when MEGA push succeeded)."
             fi
           done
 
@@ -190,5 +193,4 @@ jobs:
           git pull --rebase origin "${GITHUB_REF_NAME:-main}"
           git stash pop || true
 
-      # By design, we don't commit state files back to the repo (MEGA holds state).
-      # If you want to commit a NON-PII timestamp file, add a commit step limited to last_sync_state.json.
+      # We don't commit state back to the repo; MEGA holds state.
