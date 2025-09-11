@@ -1,9 +1,9 @@
-name: Open Dental to Keragon Sync
+name: Open Dental to GHL Sync
 
 on:
   schedule:
-    - cron: '0 7 * * *'  # Deep sync at 2 AM CDT (7 AM UTC)
-    - cron: '0,40 13-23,0-10 * * *'  # Hourly at :00 from 8 AM–8 PM CDT (in UTC)
+    - cron: '0 7 * * *'            # Deep sync at 2 AM CDT (7 AM UTC)
+    - cron: '0,40 13-23,0-10 * * *' # Hourly at :00 from 8 AM–8 PM CDT (in UTC)
   workflow_dispatch:
     inputs:
       force_deep_sync:
@@ -12,7 +12,7 @@ on:
         default: 'false'
 
 concurrency:
-  group: sync-open-dental-to-keragon-${{ github.run_id }}
+  group: sync-open-dental-to-ghl-${{ github.run_id }}
   cancel-in-progress: true
 
 jobs:
@@ -30,8 +30,8 @@ jobs:
       - name: Show script version and mtime
         run: |
           echo "## Script file information"
-          ls -l sync_script.py || true
-          stat sync_script.py || true
+          ls -l sync_od_to_ghl.py || true
+          stat sync_od_to_ghl.py || true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -41,9 +41,10 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests python-dateutil jq
+          pip install requests python-dateutil jq mega.py
 
-      - name: Restore cache
+      # (Optional) Cache the patient cache to speed up first-mile lookups even without MEGA
+      - name: Restore cache (patient_cache.json)
         id: restore-cache
         uses: actions/cache@v4
         with:
@@ -59,24 +60,16 @@ jobs:
           echo "## Cache restore status"
           if [ "${{ steps.restore-cache.outputs.cache-hit }}" == "true" ]; then
             echo "Cache hit: Successfully restored cache"
-            ls -l patient_cache.json || echo "Patient cache file not found after restore"
+            ls -l patient_cache.json || echo "patient_cache.json not found after restore"
           else
-            echo "Cache miss or partial restore: Will use deep sync to rebuild cache"
+            echo "Cache miss or partial restore: Will rebuild if needed"
           fi
-          
-          # Show what cache files exist (only check patient cache for restore)
+
           if [ -f patient_cache.json ]; then
-            echo "patient_cache.json found, size: $(stat -f%z patient_cache.json 2>/dev/null || stat -c%s patient_cache.json)"
-            echo "Number of patients: $(jq '.patients | length' patient_cache.json 2>/dev/null || echo 'Failed to count patients')"
+            echo "patient_cache.json size: $(stat -c%s patient_cache.json 2>/dev/null || stat -f%z patient_cache.json)"
+            echo "Patients: $(jq '.patients | length' patient_cache.json 2>/dev/null || echo 'unknown')"
           else
             echo "patient_cache.json not found"
-          fi
-          
-          # appointment_types_cache.json will be restored from git if it exists
-          if [ -f appointment_types_cache.json ]; then
-            echo "appointment_types_cache.json found in repository"
-          else
-            echo "appointment_types_cache.json not found - will be created by sync"
           fi
 
       - name: Check for last_sync_state.json
@@ -95,114 +88,126 @@ jobs:
         run: |
           FORCE_DEEP_SYNC="false"
           SYNC_REASON="incremental"
-          
-          # Check if manual deep sync requested
+
+          # Manual deep sync?
           if [ "${{ github.event.inputs.force_deep_sync }}" == "true" ]; then
             FORCE_DEEP_SYNC="true"
             SYNC_REASON="manual_deep_sync"
-          # Check if scheduled deep sync (2 AM CDT)
+          # Scheduled deep sync (2 AM CDT)
           elif [[ "${{ github.event_name }}" == "schedule" && "${{ github.event.schedule }}" == "0 7 * * *" ]]; then
             FORCE_DEEP_SYNC="true"
             SYNC_REASON="scheduled_deep_sync"
-          # Check if no state file exists (first run)
+          # First run / no state
           elif [ "${{ steps.check_state.outputs.state_file_exists }}" == "false" ]; then
             FORCE_DEEP_SYNC="true"
             SYNC_REASON="first_run_no_state"
-          # Check if cache is completely missing
+          # No patient cache locally (MEGA will still seed it, but do deep proactively)
           elif [ ! -f patient_cache.json ]; then
             FORCE_DEEP_SYNC="true"
             SYNC_REASON="cache_missing"
           fi
-          
+
           echo "force_deep_sync=$FORCE_DEEP_SYNC" >> $GITHUB_OUTPUT
           echo "sync_reason=$SYNC_REASON" >> $GITHUB_OUTPUT
-          echo "Sync type determined: $SYNC_REASON (deep_sync=$FORCE_DEEP_SYNC)"
+          echo "Sync type: $SYNC_REASON (deep_sync=$FORCE_DEEP_SYNC)"
 
-      - name: Ensure .gitignore includes sensitive files
+      - name: Ensure .gitignore excludes state/PII files
         run: |
-          echo "Ensuring .gitignore excludes ONLY patient data files"
+          echo "Ensuring .gitignore excludes state/PII files used by OD→GHL sync"
           if [ -f .gitignore ]; then
-            grep -q "patient_cache.json" .gitignore || echo "patient_cache.json" >> .gitignore
-            grep -q "appointments_op_*.json" .gitignore || echo "appointments_op_*.json" >> .gitignore
-            sed -i '/^appointment_types_cache\.json$/d' .gitignore 2>/dev/null || true
-            sed -i '/^sent_appointments\.json$/d' .gitignore 2>/dev/null || true
-            sed -i '/^appointment_cache\.json$/d' .gitignore 2>/dev/null || true
-            sed -i '/^last_sync_state\.json$/d' .gitignore 2>/dev/null || true
+            # Patient data and state (never commit)
+            grep -q "^patient_cache\.json$" .gitignore || echo "patient_cache.json" >> .gitignore
+            grep -q "^appointments_store\.json$" .gitignore || echo "appointments_store.json" >> .gitignore
+            grep -q "^ghl_appointments_map\.json$" .gitignore || echo "ghl_appointments_map.json" >> .gitignore
+            grep -q "^ghl_contacts_map\.json$" .gitignore || echo "ghl_contacts_map.json" >> .gitignore
+            grep -q "^sent_appointments\.json$" .gitignore || echo "sent_appointments.json" >> .gitignore
+            grep -q "^last_sync_state\.json$" .gitignore || echo "last_sync_state.json" >> .gitignore
+            # Old debug artifacts (safe to ignore if they appear)
+            grep -q "^appointments_op_.*\.json$" .gitignore || echo "appointments_op_*.json" >> .gitignore
           else
             cat > .gitignore << 'EOF'
-          # Sensitive patient data files - NEVER COMMIT
+          # OD→GHL sync: NEVER commit these
           patient_cache.json
+          appointments_store.json
+          ghl_appointments_map.json
+          ghl_contacts_map.json
+          sent_appointments.json
+          last_sync_state.json
+          # Debug artifacts
           appointments_op_*.json
-          
-          # Non-sensitive files are committed:
-          # - appointment_types_cache.json (appointment types, no patient data)
-          # - sent_appointments.json (tracking state, no patient details)
-          # - last_sync_state.json (sync timestamps)
-          # - appointment_cache.json (if it contains no patient data)
           EOF
           fi
-          
-          echo "Updated .gitignore to protect only patient data"
+          echo "Updated .gitignore"
 
       - name: Run sync
         id: sync
         env:
+          # ---- OpenDental ----
           OPEN_DENTAL_DEVELOPER_KEY: ${{ secrets.OPEN_DENTAL_DEVELOPER_KEY }}
+          OPEN_DENTAL_CUSTOMER_KEY: ${{ secrets.OPEN_DENTAL_CUSTOMER_KEY }}
+          # OPEN_DENTAL_API_URL: ${{ secrets.OPEN_DENTAL_API_URL }}   # (optional override)
+
+          # ---- GoHighLevel / LeadConnector ----
+          GHL_AUTH_TOKEN: ${{ secrets.GHL_AUTH_TOKEN }}               # or set GHL_API_KEY / GHL_OAUTH_TOKEN
+          GHL_LOCATION_ID: ${{ secrets.GHL_LOCATION_ID }}
+          GHL_CALENDAR_MAP: ${{ secrets.GHL_CALENDAR_MAP }}           # e.g. {"clinic:9034":"cal_XXX","clinic:9035":"cal_YYY"}
+          GHL_ASSIGNED_USER_MAP: ${{ secrets.GHL_ASSIGNED_USER_MAP }} # e.g. {"clinic:9034":"usr_XXX","clinic:9035":"usr_YYY"}
+          GHL_CUSTOM_FIELD_CLINIC_ID: ${{ secrets.GHL_CUSTOM_FIELD_CLINIC_ID }}
+
+          # ---- MEGA (state replication) ----
           MEGA_EMAIL: ${{ secrets.MEGA_EMAIL }}
           MEGA_PASSWORD: ${{ secrets.MEGA_PASSWORD }}
-          OPEN_DENTAL_CUSTOMER_KEY: ${{ secrets.OPEN_DENTAL_CUSTOMER_KEY }}
-          KERAGON_WEBHOOK_URL: ${{ secrets.KERAGON_WEBHOOK_URL }}
+          MEGA_FOLDER: ${{ secrets.MEGA_FOLDER }}                     # optional; defaults to od_ghl_sync
+
+          # ---- Clinics & behavior ----
           CLINIC_NUMS: "${{ secrets.CLINIC_NUM_1 }},${{ secrets.CLINIC_NUM_2 }}"
           LOG_LEVEL: "DEBUG"
           CLINIC_DELAY_SECONDS: "5.0"
           INCREMENTAL_SYNC_MINUTES: "20160"
           DEEP_SYNC_HOURS: "720"
           SAFETY_OVERLAP_HOURS: "2"
-          ENABLE_CACHING: "true"
-          CACHE_EXPIRY_MINUTES: "30"
-          USE_SPECIFIC_FIELDS: "false"
           ENABLE_PAGINATION: "true"
           PAGE_SIZE: "100"
-          MAX_RECORDS_PER_REQUEST: "100"
+          REQUEST_TIMEOUT: "120"
+          RETRY_ATTEMPTS: "5"
+          BACKOFF_FACTOR: "3.0"
         run: |
-          echo "Starting sync for run_id=${{ github.run_id }}, run_number=${{ github.run_number }}, run_attempt=${{ github.run_attempt }}"
-          echo "Sync reason: ${{ steps.sync_type.outputs.sync_reason }}"
-          
+          echo "Starting sync run_id=${{ github.run_id }} reason=${{ steps.sync_type.outputs.sync_reason }}"
           if [ "${{ steps.sync_type.outputs.force_deep_sync }}" == "true" ]; then
-            echo "Running deep sync (reason: ${{ steps.sync_type.outputs.sync_reason }})"
-            python3 sync_script.py --force-deep-sync --verbose --once
+            echo "Deep sync"
+            python3 sync_od_to_ghl.py --force-deep-sync --verbose --once
           else
-            echo "Running incremental sync"
-            python3 sync_script.py --verbose --once
+            echo "Incremental sync"
+            python3 sync_od_to_ghl.py --verbose --once
           fi
 
-      - name: Validate sync results
+      - name: Validate sync outputs (local)
         run: |
-          echo "## Validating sync results"
+          echo "## Validating local artifacts (created even if MEGA replication is primary)"
           if [ ! -f patient_cache.json ]; then
-            echo "ERROR: patient_cache.json was not created by sync"
+            echo "ERROR: patient_cache.json missing"
             exit 1
           fi
           if ! jq empty patient_cache.json 2>/dev/null; then
-            echo "ERROR: patient_cache.json contains invalid JSON"
+            echo "ERROR: patient_cache.json invalid JSON"
             exit 1
           fi
-          PATIENT_COUNT=$(jq '.patients | length' patient_cache.json 2>/dev/null || echo "0")
-          echo "Sync completed successfully. Patient cache contains $PATIENT_COUNT patients"
-          if [ -f appointment_types_cache.json ]; then
-            if jq empty appointment_types_cache.json 2>/dev/null; then
-              echo "appointment_types_cache.json is valid"
+          echo "Patients count: $(jq '.patients | length' patient_cache.json 2>/dev/null || echo 'unknown')"
+
+          # Optional sanity (existence only; content may be empty on very first run)
+          for f in last_sync_state.json sent_appointments.json ghl_contacts_map.json ghl_appointments_map.json appointments_store.json; do
+            if [ -f "$f" ]; then
+              echo "Found $f (size: $(stat -c%s "$f" 2>/dev/null || stat -f%z "$f"))"
             else
-              echo "WARNING: appointment_types_cache.json contains invalid JSON"
+              echo "$f not present locally (may still be created on first run or pushed to MEGA)."
             fi
-          fi
+          done
 
       - name: Clean up debug appointment files
         if: always()
         run: |
-          echo "Cleaning up debug appointment files"
-          rm -f appointments_op_*.json
-          echo "Removed appointments_op_*.json files"
+          rm -f appointments_op_*.json || true
+          echo "Cleaned debug files"
 
       - name: Save cache with retry
         id: save-cache
@@ -221,49 +226,16 @@ jobs:
           key: sync-cache-patients-latest
         continue-on-error: true
 
-      - name: Handle cache save failure
-        if: steps.save-cache.outcome != 'success' && steps.sync.outcome == 'success'
-        run: |
-          echo "## Cache save failed - will rebuild from scratch on next run"
-          echo "Next run will automatically detect missing cache and perform deep sync"
-
-      - name: Debug cache operation
-        if: always()
-        run: |
-          echo "## Final cache status"
-          echo "Cache save outcome: ${{ steps.save-cache.outcome }}"
-          if [ -f patient_cache.json ]; then
-            PATIENT_COUNT=$(jq '.patients | length' patient_cache.json 2>/dev/null || echo "unknown")
-            FILE_SIZE=$(stat -c%s patient_cache.json 2>/dev/null || stat -f%z patient_cache.json 2>/dev/null || echo "unknown")
-            echo "patient_cache.json: $PATIENT_COUNT patients, $FILE_SIZE bytes"
-          else
-            echo "patient_cache.json: missing"
-          fi
-          if [ -f appointment_types_cache.json ]; then
-            FILE_SIZE=$(stat -c%s appointment_types_cache.json 2>/dev/null || stat -f%z appointment_types_cache.json 2>/dev/null || echo "unknown")
-            echo "appointment_types_cache.json: $FILE_SIZE bytes"
-          else
-            echo "appointment_types_cache.json: missing"
-          fi
-
-      # === MODIFIED: Rebase on latest with stash to handle unstaged changes ===
       - name: Rebase on latest main (stash working tree)
         run: |
           git config user.name "GitHub Actions Bot"
           git config user.email "actions@github.com"
-          # Stash all changes (tracked + untracked) so rebase can proceed
           git stash push --include-untracked --all -m "pre-rebase-$(date +%s)" || true
           git fetch origin "${GITHUB_REF_NAME:-main}"
           git pull --rebase origin "${GITHUB_REF_NAME:-main}"
-          # Re-apply your changes
           git stash pop || true
 
-      - name: Commit and push state files (excluding patient data)
-        if: steps.sync.outcome == 'success'
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: 'chore(sync): update sync state and cache files [skip ci]'
-          file_pattern: 'last_sync_state.json sent_appointments.json appointment_types_cache.json operatory_cache.json .gitignore'
-          commit_user_name: 'GitHub Actions Bot'
-          commit_user_email: 'actions@github.com'
-          branch: ${{ github.ref_name }}
+      # Safety: we no longer commit any state files into the repo,
+      # because all sync state lives in MEGA (and local cache). This avoids leaking PII/IDs.
+      # If you *do* want to commit non-PII timestamps, add a step below that includes ONLY
+      # last_sync_state.json (but prefer MEGA-only).
