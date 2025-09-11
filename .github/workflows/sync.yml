@@ -30,8 +30,8 @@ jobs:
       - name: Show script version and mtime
         run: |
           echo "## Script file information"
-          ls -l sync_od_to_ghl.py || true
-          stat sync_od_to_ghl.py || true
+          ls -l sync_script.py || true
+          stat sync_script.py || true
 
       - name: Set up Python
         uses: actions/setup-python@v5
