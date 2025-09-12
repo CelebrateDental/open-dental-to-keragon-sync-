@@ -123,13 +123,6 @@ jobs:
           echo "script=$SCRIPT" >> $GITHUB_OUTPUT
           echo "Using $SCRIPT"
 
-      # If you use MEGA 2FA, store the Base32 secret as MEGA_TOTP_SECRET and we’ll derive MEGA_AUTH_CODE here.
-      - name: Generate MEGA 2FA code (optional)
-        if: ${{ secrets.MEGA_TOTP_SECRET != '' }}
-        run: |
-          sudo apt-get update -y && sudo apt-get install -y oathtool
-          echo "MEGA_AUTH_CODE=$(oathtool --totp -b '${{ secrets.MEGA_TOTP_SECRET }}')" >> $GITHUB_ENV
-
       - name: Run sync
         id: sync
         env:
@@ -165,7 +158,6 @@ jobs:
           MEGA_EMAIL:                ${{ secrets.MEGA_EMAIL }}
           MEGA_PASSWORD:             ${{ secrets.MEGA_PASSWORD }}
           MEGA_FOLDER:               ${{ secrets.MEGA_FOLDER }}    # e.g. od_ghl_sync
-          MEGA_AUTH_CODE:            ${{ env.MEGA_AUTH_CODE }}     # set only if 2FA step ran
         run: |
           if [ "${{ steps.sync_type.outputs.force_deep_sync }}" = "true" ]; then
             echo "Deep sync: ${{ steps.pickscript.outputs.script }}"
