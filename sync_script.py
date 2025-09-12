@@ -508,7 +508,16 @@ def calculate_end_time(start_local: datetime.datetime, pattern: str) -> datetime
     return start_local + timedelta(minutes=calculate_pattern_duration(pattern))
 
 def get_operatories(clinic: int) -> List[Dict[str, Any]]:
-    return od_get_paginated('operatories', {'ClinicNum': clinic}) or []
+    ops = od_get_paginated('operatories', {'ClinicNum': clinic}) or []
+    logger.debug(f"Clinic {clinic}: operatories found: {len(ops)}")
+    if ops:
+        try:
+            sample = [str(o.get('OperatoryNum') or o.get('Op')) for o in ops][:10]
+            logger.debug(f"Clinic {clinic}: operatory ids (sample): {', '.join(sample)}")
+        except Exception:
+            pass
+    return ops
+
 
 def fetch_appointments_for_window(clinic: int, start: datetime.datetime, end: datetime.datetime) -> List[Dict[str, Any]]:
     params_base = {
@@ -520,27 +529,40 @@ def fetch_appointments_for_window(clinic: int, start: datetime.datetime, end: da
     all_appts: List[Dict[str, Any]] = []
     valid_ops = set(CLINIC_OPERATORY_FILTERS.get(clinic, []))
 
-    # touch operatories (logs)
     _ = get_operatories(clinic)
+
+    # ➕ NEW: show the window, ops & statuses we’re about to pull
+    logger.debug(
+        f"Clinic {clinic}: fetching appointments {params_base['dateStart']}..{params_base['dateEnd']} "
+        f"ops={sorted(valid_ops)} statuses={sorted(VALID_STATUSES)}"
+    )
 
     for status in VALID_STATUSES:
         for op in CLINIC_OPERATORY_FILTERS.get(clinic, []):
             p = dict(params_base); p['AptStatus'] = status; p['Op'] = str(op)
             chunk = od_get_paginated('appointments', p) or []
+
+            # ➕ NEW: show the row-count per status/op query
+            logger.debug(f"Clinic {clinic}: AptStatus={status} Op={op} -> {len(chunk)} returned")
+
             for a in chunk:
                 opnum = a.get('Op') or a.get('OperatoryNum')
                 if opnum in valid_ops:
                     all_appts.append(a)
             time.sleep(0.12)
 
-    # de-dupe by (AptNum, PatNum, AptDateTime)
+    # de-dupe…
     uniq: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
     for a in all_appts:
         key = (str(a.get('AptNum', '')), str(a.get('PatNum', '')), a.get('AptDateTime', ''))
         uniq[key] = a
     result = list(uniq.values())
+
+    # ➕ NEW: final count summary for the clinic
+    logger.info(f"Clinic {clinic}: appointments raw={len(all_appts)} after-de-dupe={len(result)}")
     _debug_write(f"od_appts_clinic_{clinic}.json", {"start": start.isoformat(), "end": end.isoformat(), "appointments": result})
     return result
+
 
 # =========================
 # ===== GHL CLIENT ========
