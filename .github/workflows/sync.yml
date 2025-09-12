@@ -132,7 +132,7 @@ jobs:
       - name: MEGAcmd pre-login & folder ensure
         env:
           MEGA_EMAIL:   ${{ secrets.MEGA_EMAIL }}
-          MEGA_PASSWORD:${{ secrets.MEGA_PASSWORD }}
+          MEGA_PASSWORD: ${{ secrets.MEGA_PASSWORD }}   # <-- space after colon fixed
           MEGA_FOLDER:  ${{ secrets.MEGA_FOLDER }}
         run: |
           set -e
