@@ -21,7 +21,7 @@ What this does:
     Scheduled → confirmed
 - Both CREATE and UPDATE set `ignoreFreeSlotValidation = true`.
 - On **every appointment CREATE or UPDATE**, tag the contact with **fromopendental**.
-- Persist mappings/state in MEGA (with Python 3.11 shim for mega.py):
+- Persist mappings/state in MEGA **via MEGAcmd**:
     - `ghl_contacts_map.json`: PatNum → contactId (plus phone/email snapshot)
     - `ghl_appointments_map.json`: AptNum → { eventId, contactId, calendarId, clinic }
     - plus `last_sync_state.json`, `sent_appointments.json`, `appointments_store.json`
@@ -30,7 +30,8 @@ What this does:
 
 Requirements:
 - Python 3.11+
-- pip install: requests, mega.py
+- pip install: requests
+- System requirement: MEGAcmd installed and available in PATH (mega-cmd-server, mega-login, mega-get, mega-put, mega-rm, mega-mkdir, mega-whoami)
 - Environment variables (see bottom).
 """
 
@@ -45,6 +46,7 @@ import tempfile
 import logging
 import threading
 import datetime
+import subprocess
 from typing import Any, Dict, List, Optional, Set, Tuple
 from dataclasses import dataclass
 from datetime import timezone, timedelta
@@ -92,10 +94,11 @@ except Exception:
 # If missing, we will WARN and fall back to tagging (clinic:<num>).
 GHL_CUSTOM_FIELD_CLINIC_ID = os.environ.get('GHL_CUSTOM_FIELD_CLINIC_ID', '').strip()
 
-# MEGA cloud storage (maps & state)
+# MEGA cloud storage (maps & state) — using MEGAcmd
 MEGA_EMAIL = os.environ.get('MEGA_EMAIL', '').strip()
 MEGA_PASSWORD = os.environ.get('MEGA_PASSWORD', '').strip()
 MEGA_FOLDER = os.environ.get('MEGA_FOLDER', 'od_ghl_sync').strip()
+MEGA_AUTH_CODE = os.environ.get('MEGA_AUTH_CODE', '').strip()  # optional (2FA TOTP code if needed at runtime)
 
 # Local state files (also mirrored to MEGA)
 STATE_FILE = 'last_sync_state.json'             # clinic → ISO timestamp
@@ -266,101 +269,131 @@ def normalize_phone_for_search(phone: str) -> str:
 # ===== MEGA STORAGE ======
 # =========================
 class MegaStore:
+    """
+    MEGA storage adapter using MEGAcmd CLI tools.
+    Requires MEGAcmd installed and available in PATH.
+
+    Uses env:
+      MEGA_EMAIL, MEGA_PASSWORD, MEGA_FOLDER, (optional) MEGA_AUTH_CODE
+    """
     def __init__(self, email: str, password: str, folder: str):
-        self.email = email; self.password = password; self.folder = folder
-        self._mega = None; self._folder_node = None
-        self._ready = None  # cache readiness
+        self.email = email
+        self.password = password
+        self.folder = folder
+        self._ready: Optional[bool] = None
 
-    def _import_mega(self):
-        """
-        Import mega.py with a Python 3.11+ compatibility shim.
-        If the import fails due to asyncio.coroutine removal,
-        we alias it to types.coroutine and retry.
-        """
-        try:
-            from mega import Mega  # package: mega.py
-            return Mega
-        except Exception as e:
-            msg = str(e)
-            if "asyncio" in msg and "coroutine" in msg:
-                try:
-                    import types, asyncio as _aio
-                    if not hasattr(_aio, "coroutine"):
-                        _aio.coroutine = types.coroutine  # shim for 3.11+
-                    from mega import Mega
-                    logger.info("Applied asyncio.coroutine shim for Python 3.11+; MEGA import OK.")
-                    return Mega
-                except Exception as e2:
-                    logger.warning(f"MEGA import failed after shim: {e2}. Using local-only state.")
-                    return None
-            logger.warning(f"MEGA import failed (unexpected): {e}. Using local-only state.")
-            return None
+    def _run(self, args: List[str], check: bool = False) -> subprocess.CompletedProcess:
+        return subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=check)
 
-    def _ensure(self):
+    def _remote_dir(self) -> str:
+        # MEGA root paths start at "/"
+        return f"/{self.folder}"
+
+    def _remote_file(self, basename: str) -> str:
+        return f"/{self.folder}/{basename}"
+
+    def _ensure(self) -> bool:
         if self._ready is not None:
             return self._ready
-        if not self.email or not self.password:
-            self._ready = False
-            return False
-        Mega = self._import_mega()
-        if Mega is None:
-            self._ready = False
-            return False
-        try:
-            m = Mega()
-            self._mega = m.login(self.email, self.password)
-            # ensure folder
-            node = None
-            files = self._mega.get_files()
-            for handle, meta in files.items():
-                if meta.get('a', {}).get('n') == self.folder and meta.get('t') == 1:
-                    node = {'h': handle}
-                    break
-            if not node:
-                node = self._mega.create_folder(self.folder)
-            self._folder_node = node
-            self._ready = True
-        except Exception as e:
-            logger.warning(f"MEGA folder ensure failed: {e}")
-            self._ready = False
-        return self._ready
 
-    def _find_file(self, name: str):
+        if not self.email or not self.password or not self.folder:
+            logging.warning("MEGA not configured (email/password/folder missing); running local-only.")
+            self._ready = False
+            return False
+
+        # Try to ensure the background server (best-effort; it usually auto-spawns)
         try:
-            files = self._mega.get_files()
-            for handle, meta in files.items():
-                if meta.get('a', {}).get('n') == name:
-                    return {'h': handle}
+            self._run(["mega-cmd-server"])
         except Exception:
             pass
-        return None
+
+        # Are we logged in?
+        try:
+            who = self._run(["mega-whoami"])
+            if "Not logged in" in who.stdout + who.stderr:
+                # Login (with optional 2FA code if provided)
+                if MEGA_AUTH_CODE:
+                    login = self._run(["mega-login", self.email, self.password, f"--auth-code={MEGA_AUTH_CODE}"])
+                else:
+                    login = self._run(["mega-login", self.email, self.password])
+                if login.returncode != 0:
+                    logging.warning(f"MEGA login failed: {login.stderr.strip()}")
+                    self._ready = False
+                    return False
+        except FileNotFoundError:
+            logging.warning("MEGAcmd not found in PATH. Install MEGAcmd to enable cloud state. Running local-only.")
+            self._ready = False
+            return False
+        except Exception as e:
+            logging.warning(f"MEGA whoami failed: {e}")
+            self._ready = False
+            return False
+
+        # Ensure remote folder exists
+        try:
+            mk = self._run(["mega-mkdir", "-p", self._remote_dir()])
+            if mk.returncode not in (0,):
+                logging.warning(f"MEGA mkdir failed: {mk.stderr.strip()}")
+        except Exception as e:
+            logging.warning(f"MEGA mkdir exception: {e}")
+
+        self._ready = True
+        return True
 
     def pull(self, filename: str):
-        if not self._ensure(): return
-        node = self._find_file(os.path.basename(filename))
-        if not node: return
+        """
+        Download remote file into local path IF it does not exist locally.
+        """
+        if not self._ensure():
+            return
+        basename = os.path.basename(filename)
+        remote = self._remote_file(basename)
+
         td = tempfile.mkdtemp()
         try:
-            self._mega.download(node, dest_path=td)
-            src = os.path.join(td, os.path.basename(filename))
-            if os.path.exists(src):
-                shutil.move(src, filename)
-                logger.info(f"Pulled {filename} from MEGA/{self.folder}")
+            # Try to fetch the single file
+            res = self._run(["mega-get", remote, td])
+            if res.returncode != 0:
+                # Likely missing remotely — that's okay
+                return
+
+            # Find the downloaded file (could be placed directly or under a subdir)
+            found_path = None
+            for root, _, files in os.walk(td):
+                if basename in files:
+                    found_path = os.path.join(root, basename)
+                    break
+            if found_path:
+                shutil.move(found_path, filename)
+                logging.info(f"Pulled {filename} from MEGA/{self.folder}")
         finally:
             shutil.rmtree(td, ignore_errors=True)
 
     def push(self, filename: str):
-        if not self._ensure(): return
+        """
+        Upload local file to remote folder, replacing any previous version by name.
+        """
+        if not os.path.exists(filename):
+            return
+        if not self._ensure():
+            return
+
+        basename = os.path.basename(filename)
+        remote_dir = self._remote_dir()
+        remote_file = self._remote_file(basename)
+
+        # Remove old copy if present (best-effort)
         try:
-            # delete old if exists (simplify)
-            old = self._find_file(os.path.basename(filename))
-            if old:
-                try: self._mega.delete(old)
-                except Exception: pass
-            self._mega.upload(filename, self._folder_node)
-            logger.info(f"Pushed {filename} to MEGA/{self.folder}")
-        except Exception as e:
-            logger.warning(f"MEGA upload failed for {filename}: {e}")
+            self._run(["mega-rm", "-f", remote_file])
+        except Exception:
+            pass
+
+        # Upload the new file
+        up = self._run(["mega-put", filename, remote_dir])
+        if up.returncode == 0:
+            logging.info(f"Pushed {filename} to MEGA/{self.folder}")
+        else:
+            logging.warning(f"MEGA upload failed for {filename}: {up.stderr.strip()}")
 
 MEGA_STORE = MegaStore(MEGA_EMAIL, MEGA_PASSWORD, MEGA_FOLDER)
 
