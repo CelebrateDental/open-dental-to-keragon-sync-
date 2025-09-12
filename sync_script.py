@@ -364,27 +364,55 @@ class DriveAdapter:
             shutil.rmtree(td, ignore_errors=True)
 
     def push(self, filename: str):
+        """
+        Upload a new version of an EXISTING user-owned file.
+        - No delete
+        - No create
+        This avoids both 'insufficientFilePermissions' and 'storageQuotaExceeded'
+        when the SA has editor access but no quota.
+        """
         if not os.path.exists(filename):
+            logging.warning(f"Drive push skipped (local file missing): {filename}")
             return
-        if not self.service or not self.folder_id:
-            logger.warning("Drive push skipped (local-only): %s", filename)
+        if not self._ensure():
+            logging.warning(f"Drive push skipped (Drive unavailable): {filename}")
             return
-        # delete older duplicate by name (best-effort)
+
+        basename = os.path.basename(filename)
+
+        # Find the existing file by name within the target folder
+        existing = self._find_file_id(basename)
+        if not existing:
+            logging.error(
+                f"Drive push aborted: '{basename}' not found in folder. "
+                f"Create the empty file in Drive (owned by you), share with SA as Editor, then rerun."
+            )
+            return
+
+        file_id = existing
         try:
-            fid = self._find_file(filename)
-            if fid:
-                try: self.service.files().delete(fileId=fid).execute()
-                except Exception: pass
-        except Exception:
-            pass
-        from googleapiclient.http import MediaFileUpload
-        media = MediaFileUpload(filename, mimetype='application/json', resumable=False)
-        body = {'name': os.path.basename(filename), 'parents': [self.folder_id]}
-        try:
-            self.service.files().create(body=body, media_body=media, fields='id').execute()
-            logger.info("Drive push OK: %s", filename)
-        except Exception as e:
-            logger.warning("Drive push error for %s: %s", filename, e)
+            media = googleapiclient.http.MediaFileUpload(
+                filename, mimetype="application/json", resumable=False
+            )
+            updated = (
+                self._svc.files()
+                .update(fileId=file_id, media_body=media)
+                .execute()
+            )
+            logging.info(f"Drive push (version update) → {basename} (id {updated.get('id')})")
+        except googleapiclient.errors.HttpError as e:
+            # Log the specific reason if available
+            reason = ""
+            try:
+                reason = e.error_details[0]["reason"]  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            logging.warning(f"Drive push error for {basename}: {e}")
+            if "storageQuotaExceeded" in str(e) or reason == "storageQuotaExceeded":
+                logging.error(
+                    "Drive refused due to SA quota. Ensure you are UPDATING an existing file you own. "
+                    "Do not delete/create files in My Drive with the service account."
+                )
 
 DRIVE = DriveAdapter()
 
