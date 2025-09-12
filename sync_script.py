@@ -3,14 +3,35 @@
 """
 OpenDental → GoHighLevel (LeadConnector) sync
 
-Key behaviors:
-- First-ever run per clinic = DEEP: send ALL appts in 30-day window (ignore DateTStamp).
-- Subsequent runs (deep or incremental): only send if not sent before OR DateTStamp increased; skip if previously sent and DateTStamp missing.
-- America/Chicago clinic timezone; send start/end in UTC "Z" and include "timeZone".
-- assignedUserId is REQUIRED per clinic (skip event if missing).
-- WirelessPhone-only: validate; if unusable → skip search, omit phone in upsert, log warning.
-- Guard GHL /contacts/search to avoid 422 on short/invalid queries.
-- Robust CLINIC_NUMS parser (CSV or JSON) + config report.
+What this does:
+- Pull appointments from OpenDental for selected clinics & operatories.
+- Ensure a GHL Contact with your required fields (phone-first lookup; if not found, create).
+  Fields sent to GHL Contacts: firstName, lastName, dateOfBirth, email (validated/normalized),
+  phone (normalized), address1, postalCode, gender, locationId, and a custom field "Clinic".
+- Map clinic → calendarId and assignedUserId (9034/9035 strict routing).
+- If AptNum already mapped to a GHL event → UPDATE that exact event (even if date/time changed).
+- If AptNum not mapped:
+    * If contact is NEW → CREATE new appointment immediately (no prior fetch).
+    * If existing contact → fetch that contact’s appointments, filter to same clinic-local day
+      **and** same calendar, pick the **latest by `dateUpdated`/`updatedAt`**, then UPDATE it;
+      if none match, CREATE a new one.
+- Appointment status mapping:
+    Broken → cancelled
+    Complete → showed
+    Scheduled → confirmed
+- Both CREATE and UPDATE set `ignoreFreeSlotValidation = true`.
+- On **every appointment CREATE or UPDATE**, tag the contact with **fromopendental**.
+- Persist mappings/state in **Google Drive (Service Account)**:
+    - `ghl_contacts_map.json`: PatNum → contactId (plus phone/email snapshot)
+    - `ghl_appointments_map.json`: AptNum → { eventId, contactId, calendarId, clinic }
+    - plus `last_sync_state.json`, `sent_appointments.json`, `appointments_store.json`
+- Drive is **local-first**: if a local state file exists, it is kept; Drive is used to
+  seed missing files and to push updates after each run.
+
+Requirements:
+- Python 3.11+
+- pip install: requests, google-api-python-client, google-auth, google-auth-httplib2, google-auth-oauthlib
+- Environment variables (see bottom).
 """
 
 import os
@@ -27,6 +48,7 @@ import threading
 import datetime
 import base64
 from typing import Any, Dict, List, Optional, Set, Tuple
+from dataclasses import dataclass
 from datetime import timezone, timedelta
 from zoneinfo import ZoneInfo
 
@@ -54,10 +76,6 @@ GHL_API_TOKEN = (
 GHL_LOCATION_ID = os.environ.get('GHL_LOCATION_ID', '').strip()
 GHL_API_VERSION = os.environ.get('GHL_API_VERSION', '2021-07-28')
 
-# Timezone (IANA zone). Your case: America/Chicago.
-CLINIC_TZ = os.environ.get('CLINIC_TZ', 'America/Chicago')
-CLINIC_TIMEZONE = ZoneInfo(CLINIC_TZ)
-
 # Clinic → calendarId (strict by clinic)
 # Provide as JSON, e.g. {"clinic:9034":"cal_XXXX","clinic:9035":"cal_YYYY","default":"cal_DEFAULT"}
 try:
@@ -65,14 +83,15 @@ try:
 except Exception:
     GHL_CALENDAR_MAP = {}
 
-# Clinic → assignedUserId (strict by clinic) — REQUIRED per clinic
+# Clinic → assignedUserId (strict by clinic)
 # Provide as JSON, e.g. {"clinic:9034":"usr_XXXX","clinic:9035":"usr_YYYY"}
 try:
     GHL_ASSIGNED_USER_MAP: Dict[str, str] = json.loads(os.environ.get('GHL_ASSIGNED_USER_MAP', '{}'))
 except Exception:
     GHL_ASSIGNED_USER_MAP = {}
 
-# Custom Field ID for "Clinic" on GHL Contacts (optional; else we tag clinic:<num>)
+# Custom Field ID for "Clinic" on GHL Contacts (required to store clinic number)
+# If missing, we will WARN and fall back to tagging (clinic:<num>).
 GHL_CUSTOM_FIELD_CLINIC_ID = os.environ.get('GHL_CUSTOM_FIELD_CLINIC_ID', '').strip()
 
 # Google Drive (Service Account) for state
@@ -101,11 +120,12 @@ PAGE_SIZE = int(os.environ.get('PAGE_SIZE', '100'))
 TRACE = os.environ.get('OD_GHL_TRACE', '0') == '1'
 
 # Sync windows
-INCREMENTAL_SYNC_MINUTES = int(os.environ.get('INCREMENTAL_SYNC_MINUTES', '20160'))  # 14 days lookahead by default
-DEEP_SYNC_HOURS = int(os.environ.get('DEEP_SYNC_HOURS', '720'))                      # 30 days lookahead
+INCREMENTAL_SYNC_MINUTES = int(os.environ.get('INCREMENTAL_SYNC_MINUTES', '20160'))  # 14 days (lookahead)
+DEEP_SYNC_HOURS = int(os.environ.get('DEEP_SYNC_HOURS', '720'))                      # 30 days (lookahead)
 SAFETY_OVERLAP_HOURS = int(os.environ.get('SAFETY_OVERLAP_HOURS', '2'))
 
 # Scheduling (used if you run in loop mode)
+CLINIC_TIMEZONE = ZoneInfo('America/Chicago')
 CLINIC_OPEN_HOUR = 8
 CLINIC_CLOSE_HOUR = 20
 DEEP_SYNC_HOUR = 2
@@ -113,25 +133,7 @@ INCREMENTAL_INTERVAL_MINUTES = 60
 CLINIC_DELAY_SECONDS = float(os.environ.get('CLINIC_DELAY_SECONDS', '5.0'))
 
 # Clinics & operatories (restrict which chairs to sync)
-def parse_clinic_nums(val: str) -> List[int]:
-    if not val:
-        return []
-    try:
-        s = val.strip()
-        if s.startswith('['):
-            arr = json.loads(s)
-            return [int(x) for x in arr if str(x).strip().isdigit()]
-    except Exception:
-        pass
-    parts = re.split(r'[,\s|;]+', val.strip())
-    out = []
-    for p in parts:
-        if p.strip().isdigit():
-            out.append(int(p.strip()))
-    return out
-
-CLINIC_NUMS = parse_clinic_nums(os.environ.get('CLINIC_NUMS', '9034,9035'))
-
+CLINIC_NUMS = [int(x) for x in os.environ.get('CLINIC_NUMS', '9034,9035').split(',') if x.strip().isdigit()]
 CLINIC_OPERATORY_FILTERS: Dict[int, List[int]] = {
     9034: [11579, 11580, 11588],
     9035: [11574, 11576, 11577],
@@ -149,10 +151,6 @@ REQUIRED_APPOINTMENT_FIELDS = [
     'WirelessPhone', 'Gender', 'Birthdate'
 ]
 
-# Wireless phone normalization/search rules
-PHONE_MIN_DIGITS = int(os.environ.get("PHONE_MIN_DIGITS", "7"))
-DEFAULT_COUNTRY_CODE = os.environ.get("DEFAULT_COUNTRY_CODE", "+1")  # applied only if number lacks '+'
-
 # =========================
 # ===== LOGGING ===========
 # =========================
@@ -166,25 +164,10 @@ if TRACE:
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format='%(asctime)s  %(levelname)s  %(message)s',
+    format='%(timestamp)s  %(levelname)s  %(message)s'.replace('timestamp', 'asctime'),
     handlers=handlers
 )
 logger = logging.getLogger("od_to_ghl")
-
-def log_config_report():
-    def _yes(v): return "yes" if v else "no"
-    logger.info(
-        "CONFIG → clinics=%s | tz=%s | GHL location set=%s | token set=%s | calendars=%s | assignedUsers=%s",
-        CLINIC_NUMS,
-        CLINIC_TZ,
-        _yes(bool(GHL_LOCATION_ID)),
-        _yes(bool(GHL_API_TOKEN)),
-        sorted(list(GHL_CALENDAR_MAP.keys())),
-        sorted(list(GHL_ASSIGNED_USER_MAP.keys())),
-    )
-    if not CLINIC_NUMS:
-        logger.error("CLINIC_NUMS resolved EMPTY → nothing to sync. Set CLINIC_NUMS like '9034,9035' or '[9034,9035]'.")
-        sys.exit(1)
 
 def _debug_write(name: str, obj: Any):
     if not TRACE:
@@ -225,7 +208,7 @@ def get_session() -> requests.Session:
                 s.mount("https://", adapter)
                 s.mount("http://", adapter)
                 s.headers.update({
-                    'User-Agent': 'OD-to-GHL/4.5',
+                    'User-Agent': 'OD-to-GHL/4.3',
                     'Accept': 'application/json',
                     'Accept-Encoding': 'gzip, deflate',
                     'Connection': 'keep-alive',
@@ -259,11 +242,10 @@ def parse_time(s: Optional[str]) -> Optional[datetime.datetime]:
         except Exception:
             return None
 
-def to_utc_z(dt: datetime.datetime) -> str:
-    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-
-def clinic_tz_name() -> str:
-    return CLINIC_TZ
+def to_iso(dt: datetime.datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.isoformat()
 
 def clinic_local_date(dt: datetime.datetime) -> datetime.date:
     return dt.astimezone(CLINIC_TIMEZONE).date()
@@ -273,31 +255,20 @@ def valid_email_or_unknown(email: str) -> str:
     email = (email or '').strip()
     return email if email and EMAIL_RE.match(email) else "unknown@gmail.com"
 
-def normalize_wireless_for_search(raw: str) -> tuple[str, bool]:
-    """
-    Normalize WirelessPhone to a search candidate. Returns (normalized_value, ok_for_search).
-    - Keep leading '+' if present, strip other non-digits.
-    - If no '+', prepend DEFAULT_COUNTRY_CODE.
-    - ok_for_search: at least PHONE_MIN_DIGITS digits.
-    """
-    raw = (raw or "").strip()
-    if not raw:
-        return "", False
-    if raw.startswith('+'):
-        digits = re.sub(r"\D", "", raw)
-        return ("+" + digits, len(digits) >= PHONE_MIN_DIGITS)
-    digits = re.sub(r"\D", "", raw)
-    if not digits:
-        return "", False
-    e164 = (DEFAULT_COUNTRY_CODE + digits) if DEFAULT_COUNTRY_CODE else digits
-    return (e164, len(digits) >= PHONE_MIN_DIGITS)
+def normalize_phone_for_search(phone: str) -> str:
+    phone = (phone or '').strip()
+    if not phone:
+        return ""
+    digits = re.sub(r"[^\d+]", "", phone)
+    if digits and digits[0] != '+':
+        pure = re.sub(r"\D", "", digits)
+        if len(pure) == 10:
+            return "+1" + pure  # default to +1; adjust per region if needed
+    return digits
 
-def ok_for_ghl_search(norm: str) -> bool:
-    if not norm:
-        return False
-    digits = re.sub(r"\D", "", norm)
-    return len(digits) >= PHONE_MIN_DIGITS
-
+# =========================
+# === GOOGLE DRIVE STATE ==
+# =========================
 # =========================
 # === GOOGLE DRIVE STATE ==
 # =========================
@@ -356,6 +327,7 @@ class DriveAdapter:
         self.service = build('drive', 'v3', credentials=creds, cache_discovery=False)
 
         if not self.folder_id:
+            # find folder by name or create it
             q = (
                 f"name = '{GDRIVE_FOLDER_NAME}' and "
                 f"mimeType = 'application/vnd.google-apps.folder' and trashed = false"
@@ -384,6 +356,10 @@ class DriveAdapter:
         return files[0]['id'] if files else None
 
     def pull(self, filename: str):
+        """
+        Download the current contents of an existing file into the local path,
+        but only if the local file does not already exist.
+        """
         if os.path.exists(filename):
             return
         if not self.service or not self.folder_id:
@@ -396,6 +372,8 @@ class DriveAdapter:
 
         try:
             from googleapiclient.http import MediaIoBaseDownload
+            import io
+
             req = self.service.files().get_media(fileId=file_id)
             fh = io.BytesIO()
             downloader = MediaIoBaseDownload(fh, req)
@@ -409,6 +387,13 @@ class DriveAdapter:
             logger.warning("Drive pull error for %s: %s", os.path.basename(filename), e)
 
     def push(self, filename: str):
+        """
+        Upload a new version of an EXISTING user-owned file.
+        - No delete
+        - No create
+        This avoids both 'insufficientFilePermissions' and 'storageQuotaExceeded'
+        when the SA has editor access but no quota.
+        """
         if not os.path.exists(filename):
             logger.warning("Drive push skipped (local file missing): %s", filename)
             return
@@ -441,6 +426,7 @@ class DriveAdapter:
 
 DRIVE = DriveAdapter()
 
+
 def atomic_save_json(path: str, obj: Any):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp = None
@@ -464,6 +450,9 @@ def load_json_or(path: str, default: Any):
     return copy.deepcopy(default)
 
 def pull_all_from_drive():
+    """
+    Local-first: only pull a file from Drive if it does NOT exist locally.
+    """
     for f in (STATE_FILE, SENT_APPTS_FILE, APPT_SNAPSHOT_FILE, GHL_MAP_FILE, GHL_CONTACTS_MAP_FILE):
         if not os.path.exists(f):
             DRIVE.pull(f)
@@ -484,15 +473,13 @@ def od_get(endpoint: str, params: Dict[str, Any]) -> Optional[List[Any]]:
     try:
         r = get_session().get(url, headers=od_headers(), params=params, timeout=REQUEST_TIMEOUT)
         _debug_write(f"od_{endpoint}_req.json", {"url": url, "params": params})
-        if not r.ok:
-            logger.error("OD GET failed %s %s: %s", endpoint, r.status_code, r.text)
-            return None
+        r.raise_for_status()
         data = r.json()
         _debug_write(f"od_{endpoint}_resp.json", data)
         return data if isinstance(data, list) else [data]
     except requests.RequestException as e:
         body = e.response.text if getattr(e, 'response', None) else ''
-        logger.error(f"OD GET exception {endpoint}: {e} {body}")
+        logger.error(f"OD GET failed {endpoint}: {e} {body}")
         return None
 
 def od_get_paginated(endpoint: str, params: Dict[str, Any]) -> Optional[List[Any]]:
@@ -531,6 +518,7 @@ def get_operatories(clinic: int) -> List[Dict[str, Any]]:
             pass
     return ops
 
+
 def fetch_appointments_for_window(clinic: int, start: datetime.datetime, end: datetime.datetime) -> List[Dict[str, Any]]:
     params_base = {
         'ClinicNum': str(clinic),
@@ -543,6 +531,7 @@ def fetch_appointments_for_window(clinic: int, start: datetime.datetime, end: da
 
     _ = get_operatories(clinic)
 
+    # ➕ NEW: show the window, ops & statuses we’re about to pull
     logger.debug(
         f"Clinic {clinic}: fetching appointments {params_base['dateStart']}..{params_base['dateEnd']} "
         f"ops={sorted(valid_ops)} statuses={sorted(VALID_STATUSES)}"
@@ -552,23 +541,28 @@ def fetch_appointments_for_window(clinic: int, start: datetime.datetime, end: da
         for op in CLINIC_OPERATORY_FILTERS.get(clinic, []):
             p = dict(params_base); p['AptStatus'] = status; p['Op'] = str(op)
             chunk = od_get_paginated('appointments', p) or []
+
+            # ➕ NEW: show the row-count per status/op query
             logger.debug(f"Clinic {clinic}: AptStatus={status} Op={op} -> {len(chunk)} returned")
+
             for a in chunk:
                 opnum = a.get('Op') or a.get('OperatoryNum')
                 if opnum in valid_ops:
                     all_appts.append(a)
             time.sleep(0.12)
 
-    # de-dupe by (AptNum, PatNum, AptDateTime)
+    # de-dupe…
     uniq: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
     for a in all_appts:
         key = (str(a.get('AptNum', '')), str(a.get('PatNum', '')), a.get('AptDateTime', ''))
         uniq[key] = a
     result = list(uniq.values())
 
+    # ➕ NEW: final count summary for the clinic
     logger.info(f"Clinic {clinic}: appointments raw={len(all_appts)} after-de-dupe={len(result)}")
     _debug_write(f"od_appts_clinic_{clinic}.json", {"start": start.isoformat(), "end": end.isoformat(), "appointments": result})
     return result
+
 
 # =========================
 # ===== GHL CLIENT ========
@@ -576,34 +570,33 @@ def fetch_appointments_for_window(clinic: int, start: datetime.datetime, end: da
 def ghl_search_contact_by_phone(phone: str) -> Optional[Dict[str, Any]]:
     """
     Search contacts by text query (phone). POST /contacts/search
-    Caller must guard with ok_for_ghl_search() to avoid 422s.
     """
-    if not ok_for_ghl_search(phone):
+    if not phone:
         return None
     url = f"{GHL_API_BASE}/contacts/search"
     body = {"query": phone, "limit": 10, "page": 1, "locationId": GHL_LOCATION_ID}
     try:
         r = get_session().post(url, headers=ghl_headers(), json=body, timeout=REQUEST_TIMEOUT)
         _debug_write("ghl_contacts_search_req.json", {"url": url, "body": body})
-        if not r.ok:
-            logger.error("GHL contact search failed %s: %s", r.status_code, r.text)
+        if r.status_code == 401:
+            logger.error("GHL auth failed (401) – check token and Version header.")
             return None
+        r.raise_for_status()
         data = r.json()
         _debug_write("ghl_contacts_search_resp.json", data)
         contacts = data.get('contacts') if isinstance(data, dict) else (data if isinstance(data, list) else [])
         return contacts[0] if contacts else None
     except requests.RequestException as e:
-        logger.error(f"GHL contact search exception: {e}")
+        logger.error(f"GHL contact search failed: {e}")
         return None
 
 def ghl_build_contact_payload(patient: Dict[str, Any], clinic_num: int) -> Dict[str, Any]:
-    # Required/known fields
+    # Required fields
     first = (patient.get("FName") or "").strip()
     last  = (patient.get("LName") or "").strip()
     email = valid_email_or_unknown(patient.get("Email"))
-    # Wireless-only; upstream passes "" if invalid
-    phone = (patient.get("WirelessPhone") or "").strip()
-    dob   = (patient.get("Birthdate") or "").strip() or None
+    phone = normalize_phone_for_search(patient.get("WirelessPhone") or patient.get("WirelessPh") or patient.get("HmPhone") or "")
+    dob   = (patient.get("Birthdate") or "").strip() or None  # prefer YYYY-MM-DD from OD
     address1 = (patient.get("Address") or "").strip()
     postal = (patient.get("Zip") or patient.get("PostalCode") or "").strip()
     gender = (patient.get("Gender") or "").strip()
@@ -613,19 +606,21 @@ def ghl_build_contact_payload(patient: Dict[str, Any], clinic_num: int) -> Dict[
         "firstName": first,
         "lastName": last,
         "email": email,
-        **({"phone": phone} if phone else {}),  # only include if non-empty
-        "dateOfBirth": dob or None,
+        "phone": phone or None,
+        "dateOfBirth": dob,          # YYYY-MM-DD
         "address1": address1 or None,
         "postalCode": postal or None,
         "gender": gender or None,
     }
 
-    # Clinic custom field or fallback tag
+    # Preferred: custom field for clinic
     if GHL_CUSTOM_FIELD_CLINIC_ID:
         payload["customFields"] = [{"id": GHL_CUSTOM_FIELD_CLINIC_ID, "value": str(clinic_num)}]
     else:
+        # Fallback: tag the contact with clinic:<num>
         payload["tags"] = [f"clinic:{clinic_num}"]
 
+    # Clean out null/empty list fields
     return {k: v for k, v in payload.items() if v not in (None, [], "")}
 
 def ghl_upsert_contact(patient: Dict[str, Any], clinic_num: int) -> Optional[str]:
@@ -637,19 +632,22 @@ def ghl_upsert_contact(patient: Dict[str, Any], clinic_num: int) -> Optional[str
     try:
         r = get_session().post(url, headers=ghl_headers(), json=body, timeout=REQUEST_TIMEOUT)
         _debug_write("ghl_contact_upsert_req.json", {"url": url, "body": body})
-        if not r.ok:
-            logger.error("GHL upsert contact failed %s: %s", r.status_code, r.text)
-            return None
+        r.raise_for_status()
         j = r.json()
         _debug_write("ghl_contact_upsert_resp.json", j)
         return (j.get("contact") or {}).get("id") or j.get("id")
     except requests.RequestException as e:
-        logger.error(f"GHL upsert contact exception: {e}")
+        logger.error(f"GHL upsert contact failed: {e} body={e.response.text if getattr(e,'response',None) else ''}")
         return None
 
 def ghl_tag_contact(contact_id: str, tag: str = "fromopendental") -> bool:
+    """
+    Tag the contact. Primary: POST /contacts/{id}/tags {"tags": ["fromopendental"]}
+    Fallback: PATCH /contacts/{id} {"tags":["fromopendental"]}
+    """
     if not contact_id:
         return False
+    # Primary attempt
     url = f"{GHL_API_BASE}/contacts/{contact_id}/tags"
     body = {"tags": [tag]}
     try:
@@ -657,21 +655,25 @@ def ghl_tag_contact(contact_id: str, tag: str = "fromopendental") -> bool:
         _debug_write("ghl_contact_tag_req.json", {"url": url, "body": body, "contactId": contact_id})
         if r.status_code in (200, 201, 204):
             return True
+        # Try fallback if API variation
         if r.status_code in (404, 405, 400):
-            # Fallback: PATCH-style tags
+            raise requests.RequestException(f"Unsupported tag endpoint ({r.status_code})")
+        r.raise_for_status()
+        return True
+    except Exception:
+        # Fallback: PATCH contact with tags
+        try:
             url2 = f"{GHL_API_BASE}/contacts/{contact_id}"
             body2 = {"tags": [tag]}
             r2 = get_session().patch(url2, headers=ghl_headers(), json=body2, timeout=REQUEST_TIMEOUT)
             _debug_write("ghl_contact_tag_fallback_req.json", {"url": url2, "body": body2, "contactId": contact_id})
             if r2.status_code in (200, 204):
                 return True
-            logger.warning("GHL tag contact fallback failed %s: %s", r2.status_code, r2.text)
+            r2.raise_for_status()
+            return True
+        except requests.RequestException as e2:
+            logger.warning(f"GHL tag contact failed for {contact_id}: {e2}")
             return False
-        logger.warning("GHL tag contact failed %s: %s", r.status_code, r.text)
-        return False
-    except requests.RequestException as e:
-        logger.warning(f"GHL tag contact exception for {contact_id}: {e}")
-        return False
 
 def map_appt_status_to_ghl(status: str) -> str:
     s = (status or "").strip().lower()
@@ -715,20 +717,22 @@ def ghl_get_contact_appointments(contact_id: str) -> List[Dict[str, Any]]:
     try:
         r = get_session().get(url, headers=ghl_headers(), timeout=REQUEST_TIMEOUT)
         _debug_write("ghl_contact_appts_req.json", {"url": url, "contactId": contact_id})
-        if not r.ok:
-            logger.error("GHL get contact appointments failed %s: %s", r.status_code, r.text)
-            return []
+        r.raise_for_status()
         data = r.json()
         _debug_write("ghl_contact_appts_resp.json", data)
         if isinstance(data, list): return data
         return data.get('appointments', []) if isinstance(data, dict) else []
     except requests.RequestException as e:
-        logger.error(f"GHL get contact appointments exception: {e}")
+        logger.error(f"GHL get contact appointments failed: {e}")
         return []
 
 def pick_latest_same_day_event(contact_events: List[Dict[str, Any]],
                                od_start_local: datetime.datetime,
                                calendar_id: str) -> Optional[str]:
+    """
+    Filter to events on the SAME clinic-local day AND same calendar,
+    then choose the one with the greatest 'updated' timestamp.
+    """
     od_day = clinic_local_date(od_start_local)
     same_day_events: List[Dict[str, Any]] = []
     for ev in contact_events or []:
@@ -737,8 +741,10 @@ def pick_latest_same_day_event(contact_events: List[Dict[str, Any]],
             continue
         if clinic_local_date(sdt) == od_day and (_calendar_id_in_event(ev) == calendar_id):
             same_day_events.append(ev)
+
     if not same_day_events:
         return None
+
     same_day_events.sort(
         key=lambda e: (_updated_dt(e), _start_dt(e) or datetime.datetime.min.replace(tzinfo=timezone.utc)),
         reverse=True
@@ -747,61 +753,55 @@ def pick_latest_same_day_event(contact_events: List[Dict[str, Any]],
     _debug_write("ghl_same_day_pick.json", {"picked": chosen, "candidates": same_day_events[:25]})
     return _event_id(chosen)
 
-def ghl_create_appointment(calendar_id: str, contact_id: str, assigned_user_id: str,
-                           title: str, start_dt_local: datetime.datetime, end_dt_local: datetime.datetime,
+def ghl_create_appointment(calendar_id: str, contact_id: str, assigned_user_id: Optional[str],
+                           title: str, start_dt: datetime.datetime, end_dt: datetime.datetime,
                            status: str) -> Optional[str]:
     url = f"{GHL_API_BASE}/calendars/events/appointments"
     body = {
         "calendarId": calendar_id,
         "contactId": contact_id,
-        "assignedUserId": assigned_user_id,  # REQUIRED
+        "assignedUserId": assigned_user_id,
         "title": title or "Dental Appointment",
-        "appointmentStatus": status,          # confirmed / cancelled / showed
-        "startTime": to_utc_z(start_dt_local),
-        "endTime": to_utc_z(end_dt_local),
-        "timeZone": clinic_tz_name(),
+        "appointmentStatus": status,  # confirmed / cancelled / showed
+        "startTime": to_iso(start_dt.astimezone(CLINIC_TIMEZONE)),
+        "endTime": to_iso(end_dt.astimezone(CLINIC_TIMEZONE)),
         "ignoreFreeSlotValidation": True,
         "locationId": GHL_LOCATION_ID
     }
     try:
         r = get_session().post(url, headers=ghl_headers(), json=body, timeout=REQUEST_TIMEOUT)
         _debug_write("ghl_create_event_req.json", {"url": url, "body": body})
-        if not r.ok:
-            logger.error("GHL create appointment failed %s: %s", r.status_code, r.text)
-            return None
+        r.raise_for_status()
         j = r.json()
         _debug_write("ghl_create_event_resp.json", j)
         return j.get('id') or j.get('eventId') or j.get('appointmentId')
     except requests.RequestException as e:
-        logger.error(f"GHL create appointment exception: {e}")
+        logger.error(f"GHL create appointment failed: {e} body={e.response.text if getattr(e,'response',None) else ''}")
         return None
 
-def ghl_update_appointment(event_id: str, calendar_id: str, assigned_user_id: str,
-                           title: str, start_dt_local: datetime.datetime, end_dt_local: datetime.datetime,
+def ghl_update_appointment(event_id: str, calendar_id: str, assigned_user_id: Optional[str],
+                           title: str, start_dt: datetime.datetime, end_dt: datetime.datetime,
                            status: str) -> bool:
     if not event_id:
         return False
     url = f"{GHL_API_BASE}/calendars/events/appointments/{event_id}"
     body = {
         "calendarId": calendar_id,
-        "assignedUserId": assigned_user_id,  # REQUIRED
+        "assignedUserId": assigned_user_id,
         "title": title or "Dental Appointment",
         "appointmentStatus": status,
-        "startTime": to_utc_z(start_dt_local),
-        "endTime": to_utc_z(end_dt_local),
-        "timeZone": clinic_tz_name(),
+        "startTime": to_iso(start_dt.astimezone(CLINIC_TIMEZONE)),
+        "endTime": to_iso(end_dt.astimezone(CLINIC_TIMEZONE)),
         "ignoreFreeSlotValidation": True,
         "locationId": GHL_LOCATION_ID
     }
     try:
         r = get_session().put(url, headers=ghl_headers(), json=body, timeout=REQUEST_TIMEOUT)
         _debug_write("ghl_update_event_req.json", {"url": url, "body": body, "eventId": event_id})
-        if not r.ok:
-            logger.error("GHL update appointment failed %s: %s", r.status_code, r.text)
-            return False
+        r.raise_for_status()
         return True
     except requests.RequestException as e:
-        logger.error(f"GHL update appointment exception: {e}")
+        logger.error(f"GHL update appointment failed: {e} body={e.response.text if getattr(e,'response',None) else ''}")
         return False
 
 # =========================
@@ -829,6 +829,7 @@ def load_patient_cache() -> Dict[int, Dict[str, Any]]:
     return out
 
 def save_patient_cache(cache: Dict[int, Dict[str, Any]]):
+    # Local only (you already stopped caching in GitHub Actions)
     atomic_save_json('patient_cache.json', {"patients": {str(k): v for k, v in cache.items()}})
 
 def load_contact_map() -> Dict[int, Any]:
@@ -840,62 +841,6 @@ def load_contact_map() -> Dict[int, Any]:
         except:
             pass
     return out
-
-# =========================
-# === FILTERING RULES =====
-# =========================
-def filter_appointments_for_processing(
-    appts: List[Dict[str, Any]],
-    *,
-    is_deep_run: bool,
-    is_first_run_for_clinic: bool,
-    sent_map: Dict[str, Dict[str, str]]
-) -> Tuple[List[Dict[str, Any]], Set[int]]:
-    """
-    Returns (to_process, pat_nums) based on the rules:
-      - First-ever deep run: include ALL appts in window (ignore DateTStamp).
-      - Later runs (deep or incremental):
-          * If not previously sent → include.
-          * If previously sent:
-                - include only if DateTStamp > last_sent_tstamp
-                - if DateTStamp missing → skip (can't prove change)
-    """
-    to_process: List[Dict[str, Any]] = []
-    pat_nums: Set[int] = set()
-
-    if is_deep_run and is_first_run_for_clinic:
-        for a in appts:
-            to_process.append(a)
-            if a.get('PatNum'):
-                try: pat_nums.add(int(a['PatNum']))
-                except: pass
-        return to_process, pat_nums
-
-    for a in appts:
-        aptnum = str(a.get('AptNum', ''))
-        if not aptnum:
-            continue
-
-        prev_iso = (sent_map.get(aptnum, {}) or {}).get('last_sent_tstamp')
-        prev_dt = parse_time(prev_iso) if prev_iso else None
-
-        curr_dt = parse_time(a.get('DateTStamp', ''))  # may be None
-
-        if prev_dt is None:
-            # not sent before → include (even if DateTStamp missing)
-            to_process.append(a)
-        else:
-            # was sent before → include ONLY if DateTStamp increased
-            if curr_dt and curr_dt > prev_dt:
-                to_process.append(a)
-            else:
-                continue
-
-        if a.get('PatNum'):
-            try: pat_nums.add(int(a['PatNum']))
-            except: pass
-
-    return to_process, pat_nums
 
 # =========================
 # ===== CORE: PROCESS =====
@@ -925,53 +870,45 @@ def validate_configuration() -> bool:
         return False
     return True
 
-def ghl_contact_payload_from_patient_like(first: str, last: str, email: str, phone_norm: str) -> Dict[str, Any]:
-    return {
-        "FName": first,
-        "LName": last,
-        "Email": email,
-        "WirelessPhone": phone_norm  # empty string means "omit" later
-    }
+def ghl_contact_payload_from_patient_like(first: str, last: str, email: str, phone: str) -> Dict[str, Any]:
+    return {"FName": first, "LName": last, "Email": email, "WirelessPhone": phone}
 
-def ensure_contact_id(first: str, last: str, email: str, phone_raw: str,
+def ensure_contact_id(first: str, last: str, email: str, phone: str,
                       pat_num: int,
                       clinic_num: int,
                       contact_map: Dict[int, Any]) -> Tuple[Optional[str], bool]:
     """
     Returns (contact_id, is_new_contact).
-    - Map fast path by PatNum if present.
-    - Use ONLY WirelessPhone; if invalid/short: skip search, omit in upsert, log warning.
-    - Upsert (create/update) and record mapping.
+    Path:
+      1) If PatNum is already mapped -> return that id (is_new=False)
+      2) Else search by normalized phone
+      3) Else upsert (create) and return id (is_new=True)
     """
+    # 1) PatNum fast path
     mapped = contact_map.get(pat_num)
     if mapped and mapped.get('contactId'):
         return mapped['contactId'], False
 
-    phone_norm, phone_ok = normalize_wireless_for_search(phone_raw)
-
-    found = None
-    if phone_ok and ok_for_ghl_search(phone_norm):
-        found = ghl_search_contact_by_phone(phone_norm)
-    else:
-        logger.warning(f"Pat {pat_num}: invalid or missing WirelessPhone '{phone_raw}' → skipping phone search and omitting phone in upsert")
-
+    # 2) phone search
+    phone_norm = normalize_phone_for_search(phone)
+    found = ghl_search_contact_by_phone(phone_norm) if phone_norm else None
     if found and found.get('id'):
         cid = found['id']
         contact_map[pat_num] = {
             "contactId": cid,
-            "phone": phone_norm if phone_ok else "",
+            "phone": phone_norm,
             "email": valid_email_or_unknown(email),
             "updatedAt": datetime.datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
         }
         return cid, False
 
-    # Build minimal payload for upsert (omit phone if invalid)
-    patient_like = ghl_contact_payload_from_patient_like(first, last, email, phone_norm if phone_ok else "")
+    # 3) create with full payload
+    patient_like = ghl_contact_payload_from_patient_like(first, last, email, phone)
     cid = ghl_upsert_contact(patient_like, clinic_num)
     if cid:
         contact_map[pat_num] = {
             "contactId": cid,
-            "phone": phone_norm if phone_ok else "",
+            "phone": phone_norm,
             "email": valid_email_or_unknown(email),
             "updatedAt": datetime.datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
         }
@@ -984,6 +921,18 @@ def process_one_appt(appt: Dict[str, Any],
                      clinic: int,
                      ghl_map: Dict[str, Any],
                      contact_map: Dict[int, Any]) -> Optional[str]:
+    """
+    Rules:
+      - If AptNum is already mapped → UPDATE that specific GHL eventId (even if day/time changed).
+      - If AptNum not mapped:
+          * ensure contact by phone (create if needed) and record contactId in contact_map.
+          * If it's a NEW contact → CREATE appointment immediately (no need to fetch appointments).
+          * If not new:
+              - fetch the contact's appointments; pick the LATEST same-day event (by dateUpdated/updatedAt) on the SAME calendar → UPDATE.
+              - if none → CREATE new event.
+          * store AptNum -> eventId mapping for future updates.
+      - After **every successful CREATE or UPDATE**, tag the contact with **fromopendental**.
+    """
     apt_num = str(appt.get('AptNum', ''))
     pat_num = int(appt.get('PatNum', 0) or 0)
     if not apt_num or not pat_num:
@@ -998,12 +947,12 @@ def process_one_appt(appt: Dict[str, Any],
     start_local = start.astimezone(CLINIC_TIMEZONE)
     end_local = calculate_end_time(start_local, appt.get('Pattern', ''))
 
-    # patient fields (WirelessPhone only)
+    # patient fields (for contact payload/title)
     p = patients.get(pat_num, {}) or {}
     first = (p.get('FName') or appt.get('FName') or '').strip()
     last  = (p.get('LName') or appt.get('LName') or '').strip()
     email = valid_email_or_unknown(p.get('Email', ''))
-    phone_raw = (p.get('WirelessPhone') or '').strip()
+    phone = p.get('WirelessPhone') or p.get('HmPhone') or ''
 
     # clinic routing
     calendar_id = pick_calendar_id(clinic)
@@ -1011,12 +960,9 @@ def process_one_appt(appt: Dict[str, Any],
     if not calendar_id:
         logger.error(f"Clinic {clinic}: missing calendar mapping")
         return None
-    if not assigned_user_id:
-        logger.error(f"Clinic {clinic}: assignedUserId is REQUIRED; skipping AptNum {apt_num}")
-        return None
 
-    # Ensure / create contact
-    contact_id, is_new_contact = ensure_contact_id(first, last, email, phone_raw, pat_num, clinic, contact_map)
+    # Ensure / create contact, capture whether it's new
+    contact_id, is_new_contact = ensure_contact_id(first, last, email, phone, pat_num, clinic, contact_map)
     if not contact_id:
         logger.error(f"Apt {apt_num}: failed to ensure contact")
         return None
@@ -1024,7 +970,7 @@ def process_one_appt(appt: Dict[str, Any],
     title = f"{first} {last}".strip() or "Dental Appointment"
     status = map_appt_status_to_ghl(appt.get('AptStatus', ''))
 
-    # If AptNum already mapped → update exact event
+    # ===== If AptNum already mapped → update exact event =====
     mapped = ghl_map.get(apt_num)
     if mapped and mapped.get('eventId'):
         event_id = mapped['eventId']
@@ -1033,6 +979,7 @@ def process_one_appt(appt: Dict[str, Any],
             mapped.update({"contactId": contact_id, "calendarId": calendar_id, "clinic": clinic})
             ghl_map[apt_num] = mapped
             logger.info(f"✓ Updated mapped event {event_id} for AptNum {apt_num}")
+            # Tag the contact on update
             ghl_tag_contact(contact_id, "fromopendental")
             return event_id
         else:
@@ -1040,22 +987,25 @@ def process_one_appt(appt: Dict[str, Any],
             new_id = ghl_create_appointment(calendar_id, contact_id, assigned_user_id, title, start_local, end_local, status)
             if new_id:
                 ghl_map[apt_num] = {"contactId": contact_id, "eventId": new_id, "calendarId": calendar_id, "clinic": clinic}
+                # Tag the contact on create
                 ghl_tag_contact(contact_id, "fromopendental")
                 return new_id
             return None
 
-    # Not mapped
+    # ===== Not mapped =====
     if is_new_contact:
+        # brand-new contact → no need to fetch appointments; just create
         new_event_id = ghl_create_appointment(calendar_id, contact_id, assigned_user_id, title, start_local, end_local, status)
         if new_event_id:
             ghl_map[apt_num] = {"contactId": contact_id, "eventId": new_event_id, "calendarId": calendar_id, "clinic": clinic}
             logger.info(f"＋ Created event {new_event_id} for NEW contact, AptNum {apt_num}")
+            # Tag the contact on create
             ghl_tag_contact(contact_id, "fromopendental")
             return new_event_id
         logger.error(f"Apt {apt_num}: failed to create event for new contact")
         return None
 
-    # Existing contact (but AptNum not mapped) → try reconcile latest same-day event
+    # Existing contact (but AptNum not mapped) → pick latest same-day event by updatedAt, same calendar only
     contact_events = ghl_get_contact_appointments(contact_id)
     candidate_event_id = pick_latest_same_day_event(contact_events, start_local, calendar_id)
     if candidate_event_id:
@@ -1063,6 +1013,7 @@ def process_one_appt(appt: Dict[str, Any],
         if ok:
             ghl_map[apt_num] = {"contactId": contact_id, "eventId": candidate_event_id, "calendarId": calendar_id, "clinic": clinic}
             logger.info(f"✓ Reconciled via latest same-day event {candidate_event_id} for AptNum {apt_num}")
+            # Tag the contact on update
             ghl_tag_contact(contact_id, "fromopendental")
             return candidate_event_id
         else:
@@ -1071,8 +1022,9 @@ def process_one_appt(appt: Dict[str, Any],
     # No same-day match → create new
     new_event_id = ghl_create_appointment(calendar_id, contact_id, assigned_user_id, title, start_local, end_local, status)
     if new_event_id:
-        ghl_map[aptnum] = {"contactId": contact_id, "eventId": new_event_id, "calendarId": calendar_id, "clinic": clinic}
+        ghl_map[apt_num] = {"contactId": contact_id, "eventId": new_event_id, "calendarId": calendar_id, "clinic": clinic}
         logger.info(f"＋ Created event {new_event_id} for AptNum {apt_num}")
+        # Tag the contact on create
         ghl_tag_contact(contact_id, "fromopendental")
         return new_event_id
 
@@ -1110,8 +1062,6 @@ def main_once(dry_run: bool = False, force_deep_sync: bool = False):
     if not validate_configuration():
         sys.exit(1)
 
-    log_config_report()
-
     # Connect Drive and seed state locally if needed
     DRIVE.connect()
     pull_all_from_drive()
@@ -1137,31 +1087,25 @@ def main_once(dry_run: bool = False, force_deep_sync: bool = False):
             logger.info(f"Clinic {clinic}: no appointments in window.")
             continue
 
-        # Decide mode flags
-        is_deep_run = not is_incr
-        is_first_run_for_clinic = (last_sync.get(clinic) is None)
-        if is_deep_run and is_first_run_for_clinic:
-            logger.info("Clinic %s: FIRST-EVER deep sync → sending all appts in the window (ignoring DateTStamp).", clinic)
-
-        # Apply filtering rules
-        to_process, pat_nums = filter_appointments_for_processing(
-            appts,
-            is_deep_run=is_deep_run,
-            is_first_run_for_clinic=is_first_run_for_clinic,
-            sent_map=sent_map,
-        )
-
-        logger.info(
-            "Clinic %s: selected %d of %d appointments for processing (%s%s)",
-            clinic, len(to_process), len(appts),
-            "deep" if is_deep_run else "incremental",
-            " / first-run" if is_first_run_for_clinic else ""
-        )
+        # Filter to new/updated by DateTStamp vs SENT_APPTS_FILE
+        to_process: List[Dict[str, Any]] = []
+        pat_nums: Set[int] = set()
+        for a in appts:
+            aptnum = str(a.get('AptNum', ''))
+            tstamp = parse_time(a.get('DateTStamp', ''))
+            if not aptnum or not tstamp:
+                continue
+            prev = sent_map.get(aptnum, {}).get('last_sent_tstamp')
+            prev_dt = parse_time(prev) if prev else None
+            if prev_dt and tstamp <= prev_dt:
+                continue
+            to_process.append(a)
+            if a.get('PatNum'):
+                try: pat_nums.add(int(a['PatNum']))
+                except: pass
 
         if not to_process:
-            logger.info(f"Clinic {clinic}: nothing to send after filtering.")
-            # Still advance last_sync so next incremental window narrows
-            last_sync[clinic] = datetime.datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+            logger.info(f"Clinic {clinic}: nothing new/updated to send.")
             continue
 
         # Pull minimal patient info (prefer cache; if missing, fetch)
@@ -1190,11 +1134,12 @@ def main_once(dry_run: bool = False, force_deep_sync: bool = False):
                 sent_map.setdefault(aptnum, {})['last_sent_tstamp'] = a.get('DateTStamp', '')
                 snapshot[aptnum] = a
 
-        # advance last_sync after processing
-        last_sync[clinic] = datetime.datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+        # advance last_sync only if we processed items
+        if to_process:
+            last_sync[clinic] = datetime.datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
 
     # Persist state + Drive push
-    save_patient_cache(patient_cache)
+    save_patient_cache(patient_cache)  # local only; you’re not caching this in Actions
     save_state(sent_map, last_sync, snapshot, ghl_map, contact_map)
     logger.info(f"Done. Created/updated {total} appointments.")
 
