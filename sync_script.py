@@ -363,7 +363,7 @@ class DriveAdapter:
             except Exception: pass
             shutil.rmtree(td, ignore_errors=True)
 
-  def push(self, filename: str):
+   def push(self, filename: str):
     """
     Upload a new version of an EXISTING user-owned file.
     - No delete
