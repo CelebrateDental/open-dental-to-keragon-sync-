@@ -128,6 +128,27 @@ jobs:
           echo "script=$SCRIPT" >> $GITHUB_OUTPUT
           echo "Using $SCRIPT"
 
+      # NEW: pre-login + folder ensure with timeouts so Python won't hang on MEGA init
+      - name: MEGAcmd pre-login & folder ensure
+        env:
+          MEGA_EMAIL:   ${{ secrets.MEGA_EMAIL }}
+          MEGA_PASSWORD:${{ secrets.MEGA_PASSWORD }}
+          MEGA_FOLDER:  ${{ secrets.MEGA_FOLDER }}
+        run: |
+          set -e
+          mega-cmd-server --daemon || true
+
+          # If not logged in, do a bounded non-interactive login
+          if ! mega-whoami >/dev/null 2>&1; then
+            echo "Logging in to MEGA…"
+            timeout 40s mega-login "${MEGA_EMAIL}" "${MEGA_PASSWORD}" || { echo "::error::MEGA login failed or timed out"; exit 1; }
+          fi
+
+          # Ensure folder exists (bounded) and list it
+          timeout 20s mega-mkdir -p "/${MEGA_FOLDER}" || true
+          timeout 20s mega-ls "/${MEGA_FOLDER}" || true
+          echo "MEGAcmd ready."
+
       - name: Run sync
         id: sync
         env:
