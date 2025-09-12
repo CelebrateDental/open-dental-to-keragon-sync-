@@ -363,14 +363,14 @@ class DriveAdapter:
             except Exception: pass
             shutil.rmtree(td, ignore_errors=True)
 
-   def push(self, filename: str):
-    """
+    def push(self, filename: str):
+     """
     Upload a new version of an EXISTING user-owned file.
     - No delete
     - No create
     This avoids both 'insufficientFilePermissions' and 'storageQuotaExceeded'
     when the SA has editor access but no quota.
-    """
+     """
     if not os.path.exists(filename):
         logging.warning(f"Drive push skipped (local file missing): {filename}")
         return
