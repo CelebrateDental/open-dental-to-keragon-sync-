@@ -21,23 +21,23 @@ What this does:
     Scheduled → confirmed
 - Both CREATE and UPDATE set `ignoreFreeSlotValidation = true`.
 - On **every appointment CREATE or UPDATE**, tag the contact with **fromopendental**.
-- Persist mappings/state in MEGA **via MEGAcmd**:
+- Persist mappings/state in **Google Drive (Service Account)**:
     - `ghl_contacts_map.json`: PatNum → contactId (plus phone/email snapshot)
     - `ghl_appointments_map.json`: AptNum → { eventId, contactId, calendarId, clinic }
     - plus `last_sync_state.json`, `sent_appointments.json`, `appointments_store.json`
-- MEGA is read as **local-first**: if a local state file exists, it is kept; MEGA is used to
+- Drive is **local-first**: if a local state file exists, it is kept; Drive is used to
   seed missing files and to push updates after each run.
 
 Requirements:
 - Python 3.11+
-- pip install: requests
-- System requirement: MEGAcmd installed and available in PATH (mega-cmd-server, mega-login, mega-get, mega-put, mega-rm, mega-mkdir, mega-whoami)
+- pip install: requests, google-api-python-client, google-auth, google-auth-httplib2, google-auth-oauthlib
 - Environment variables (see bottom).
 """
 
 import os
 import re
 import sys
+import io
 import json
 import time
 import copy
@@ -46,7 +46,7 @@ import tempfile
 import logging
 import threading
 import datetime
-import subprocess
+import base64
 from typing import Any, Dict, List, Optional, Set, Tuple
 from dataclasses import dataclass
 from datetime import timezone, timedelta
@@ -94,13 +94,14 @@ except Exception:
 # If missing, we will WARN and fall back to tagging (clinic:<num>).
 GHL_CUSTOM_FIELD_CLINIC_ID = os.environ.get('GHL_CUSTOM_FIELD_CLINIC_ID', '').strip()
 
-# MEGA cloud storage (maps & state) — using MEGAcmd
-MEGA_EMAIL = os.environ.get('MEGA_EMAIL', '').strip()
-MEGA_PASSWORD = os.environ.get('MEGA_PASSWORD', '').strip()
-MEGA_FOLDER = os.environ.get('MEGA_FOLDER', 'od_ghl_sync').strip()
-MEGA_AUTH_CODE = os.environ.get('MEGA_AUTH_CODE', '').strip()  # optional (2FA TOTP code if needed at runtime)
+# Google Drive (Service Account) for state
+GDRIVE_SA_JSON        = os.environ.get('GDRIVE_SERVICE_ACCOUNT_JSON', '').strip()
+GDRIVE_SA_JSON_B64    = os.environ.get('GDRIVE_SERVICE_ACCOUNT_JSON_B64', '').strip()
+GDRIVE_SUBJECT        = os.environ.get('GDRIVE_SUBJECT', '').strip()         # optional (domain-wide delegation)
+GDRIVE_FOLDER_ID      = os.environ.get('GDRIVE_FOLDER_ID', '').strip()
+GDRIVE_FOLDER_NAME    = os.environ.get('GDRIVE_FOLDER_NAME', 'od_ghl_sync').strip()  # used if no folder id
 
-# Local state files (also mirrored to MEGA)
+# Local state files (also mirrored to Drive)
 STATE_FILE = 'last_sync_state.json'             # clinic → ISO timestamp
 SENT_APPTS_FILE = 'sent_appointments.json'      # AptNum → { last_sent_tstamp }
 APPT_SNAPSHOT_FILE = 'appointments_store.json'  # AptNum → last OD snapshot used
@@ -163,7 +164,7 @@ if TRACE:
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format='%(asctime)s  %(levelname)s  %(message)s',
+    format='%(timestamp)s  %(levelname)s  %(message)s'.replace('timestamp', 'asctime'),
     handlers=handlers
 )
 logger = logging.getLogger("od_to_ghl")
@@ -266,136 +267,126 @@ def normalize_phone_for_search(phone: str) -> str:
     return digits
 
 # =========================
-# ===== MEGA STORAGE ======
+# === GOOGLE DRIVE STATE ==
 # =========================
-class MegaStore:
+class DriveAdapter:
     """
-    MEGA storage adapter using MEGAcmd CLI tools.
-    Requires MEGAcmd installed and available in PATH.
-
-    Uses env:
-      MEGA_EMAIL, MEGA_PASSWORD, MEGA_FOLDER, (optional) MEGA_AUTH_CODE
+    Google Drive storage for state files (Service Account).
+    Env:
+      GDRIVE_SERVICE_ACCOUNT_JSON (raw JSON) OR GDRIVE_SERVICE_ACCOUNT_JSON_B64 (base64)
+      Optional: GDRIVE_SUBJECT for domain-wide delegation
+      One of: GDRIVE_FOLDER_ID or GDRIVE_FOLDER_NAME (folder auto-created if missing)
     """
-    def __init__(self, email: str, password: str, folder: str):
-        self.email = email
-        self.password = password
-        self.folder = folder
-        self._ready: Optional[bool] = None
+    def __init__(self):
+        self.service = None
+        self.folder_id = GDRIVE_FOLDER_ID
 
-    def _run(self, args: List[str], check: bool = False) -> subprocess.CompletedProcess:
-        return subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=check)
-
-    def _remote_dir(self) -> str:
-        # MEGA root paths start at "/"
-        return f"/{self.folder}"
-
-    def _remote_file(self, basename: str) -> str:
-        return f"/{self.folder}/{basename}"
-
-    def _ensure(self) -> bool:
-        if self._ready is not None:
-            return self._ready
-
-        if not self.email or not self.password or not self.folder:
-            logging.warning("MEGA not configured (email/password/folder missing); running local-only.")
-            self._ready = False
-            return False
-
-        # Try to ensure the background server (best-effort; it usually auto-spawns)
+    def _creds(self):
         try:
-            self._run(["mega-cmd-server"])
-        except Exception:
-            pass
-
-        # Are we logged in?
-        try:
-            who = self._run(["mega-whoami"])
-            if "Not logged in" in who.stdout + who.stderr:
-                # Login (with optional 2FA code if provided)
-                if MEGA_AUTH_CODE:
-                    login = self._run(["mega-login", self.email, self.password, f"--auth-code={MEGA_AUTH_CODE}"])
-                else:
-                    login = self._run(["mega-login", self.email, self.password])
-                if login.returncode != 0:
-                    logging.warning(f"MEGA login failed: {login.stderr.strip()}")
-                    self._ready = False
-                    return False
-        except FileNotFoundError:
-            logging.warning("MEGAcmd not found in PATH. Install MEGAcmd to enable cloud state. Running local-only.")
-            self._ready = False
-            return False
+            from google.oauth2 import service_account
         except Exception as e:
-            logging.warning(f"MEGA whoami failed: {e}")
-            self._ready = False
-            return False
+            logger.error("Google auth libs not installed. pip install google-auth google-api-python-client. %s", e)
+            return None
 
-        # Ensure remote folder exists
+        sa_info = None
+        if GDRIVE_SA_JSON:
+            try:
+                sa_info = json.loads(GDRIVE_SA_JSON)
+            except Exception as e:
+                logger.error("Invalid GDRIVE_SERVICE_ACCOUNT_JSON: %s", e)
+                return None
+        elif GDRIVE_SA_JSON_B64:
+            try:
+                sa_info = json.loads(base64.b64decode(GDRIVE_SA_JSON_B64).decode('utf-8'))
+            except Exception as e:
+                logger.error("Invalid GDRIVE_SERVICE_ACCOUNT_JSON_B64: %s", e)
+                return None
+        else:
+            logger.warning("No service account JSON provided; Drive will be unavailable.")
+            return None
+
+        scopes = ['https://www.googleapis.com/auth/drive']
+        if GDRIVE_SUBJECT:
+            return service_account.Credentials.from_service_account_info(sa_info, scopes=scopes).with_subject(GDRIVE_SUBJECT)
+        return service_account.Credentials.from_service_account_info(sa_info, scopes=scopes)
+
+    def connect(self):
+        creds = self._creds()
+        if not creds:
+            logger.warning("Drive unavailable; running in local-only mode.")
+            return
         try:
-            mk = self._run(["mega-mkdir", "-p", self._remote_dir()])
-            if mk.returncode not in (0,):
-                logging.warning(f"MEGA mkdir failed: {mk.stderr.strip()}")
+            from googleapiclient.discovery import build
         except Exception as e:
-            logging.warning(f"MEGA mkdir exception: {e}")
+            logger.error("google-api-python-client not installed. pip install google-api-python-client. %s", e)
+            return
+        self.service = build('drive', 'v3', credentials=creds, cache_discovery=False)
+        if not self.folder_id:
+            # find by name or create
+            q = f"name = '{GDRIVE_FOLDER_NAME}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+            res = self.service.files().list(q=q, fields="files(id,name)").execute()
+            files = res.get('files', [])
+            if files:
+                self.folder_id = files[0]['id']
+            else:
+                body = {'name': GDRIVE_FOLDER_NAME, 'mimeType': 'application/vnd.google-apps.folder'}
+                f = self.service.files().create(body=body, fields='id').execute()
+                self.folder_id = f['id']
+        logger.info("Drive connected. Folder id: %s", self.folder_id)
 
-        self._ready = True
-        return True
+    def _find_file(self, name: str) -> Optional[str]:
+        if not self.service or not self.folder_id: return None
+        q = f"name = '{os.path.basename(name)}' and '{self.folder_id}' in parents and trashed = false"
+        res = self.service.files().list(q=q, fields="files(id,name,modifiedTime)", orderBy="modifiedTime desc").execute()
+        files = res.get('files', [])
+        return files[0]['id'] if files else None
 
     def pull(self, filename: str):
-        """
-        Download remote file into local path IF it does not exist locally.
-        """
-        if not self._ensure():
-            return
-        basename = os.path.basename(filename)
-        remote = self._remote_file(basename)
-
+        if not self.service or not self.folder_id: return
+        file_id = self._find_file(filename)
+        if not file_id: return
+        from googleapiclient.http import MediaIoBaseDownload
+        req = self.service.files().get_media(fileId=file_id)
         td = tempfile.mkdtemp()
+        dest = os.path.join(td, os.path.basename(filename))
+        fh = io.FileIO(dest, 'wb')
+        downloader = MediaIoBaseDownload(fh, req)
+        done = False
         try:
-            # Try to fetch the single file
-            res = self._run(["mega-get", remote, td])
-            if res.returncode != 0:
-                # Likely missing remotely — that's okay
-                return
-
-            # Find the downloaded file (could be placed directly or under a subdir)
-            found_path = None
-            for root, _, files in os.walk(td):
-                if basename in files:
-                    found_path = os.path.join(root, basename)
-                    break
-            if found_path:
-                shutil.move(found_path, filename)
-                logging.info(f"Pulled {filename} from MEGA/{self.folder}")
+            while not done:
+                status, done = downloader.next_chunk()
+            fh.close()
+            shutil.move(dest, filename)
+            logger.info("Drive pull → %s", filename)
         finally:
+            try: fh.close()
+            except Exception: pass
             shutil.rmtree(td, ignore_errors=True)
 
     def push(self, filename: str):
-        """
-        Upload local file to remote folder, replacing any previous version by name.
-        """
         if not os.path.exists(filename):
             return
-        if not self._ensure():
+        if not self.service or not self.folder_id:
+            logger.warning("Drive push skipped (local-only): %s", filename)
             return
-
-        basename = os.path.basename(filename)
-        remote_dir = self._remote_dir()
-        remote_file = self._remote_file(basename)
-
-        # Remove old copy if present (best-effort)
+        # delete older duplicate by name (best-effort)
         try:
-            self._run(["mega-rm", "-f", remote_file])
+            fid = self._find_file(filename)
+            if fid:
+                try: self.service.files().delete(fileId=fid).execute()
+                except Exception: pass
         except Exception:
             pass
+        from googleapiclient.http import MediaFileUpload
+        media = MediaFileUpload(filename, mimetype='application/json', resumable=False)
+        body = {'name': os.path.basename(filename), 'parents': [self.folder_id]}
+        try:
+            self.service.files().create(body=body, media_body=media, fields='id').execute()
+            logger.info("Drive push OK: %s", filename)
+        except Exception as e:
+            logger.warning("Drive push error for %s: %s", filename, e)
 
-        # Upload the new file
-        up = self._run(["mega-put", filename, remote_dir])
-        if up.returncode == 0:
-            logging.info(f"Pushed {filename} to MEGA/{self.folder}")
-        else:
-            logging.warning(f"MEGA upload failed for {filename}: {up.stderr.strip()}")
-
-MEGA_STORE = MegaStore(MEGA_EMAIL, MEGA_PASSWORD, MEGA_FOLDER)
+DRIVE = DriveAdapter()
 
 def atomic_save_json(path: str, obj: Any):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -419,21 +410,21 @@ def load_json_or(path: str, default: Any):
             logger.warning(f"Failed to read {path}: {e}")
     return copy.deepcopy(default)
 
-def pull_all_from_mega():
+def pull_all_from_drive():
     """
-    Local-first: only pull a file from MEGA if it does NOT exist locally.
+    Local-first: only pull a file from Drive if it does NOT exist locally.
     """
     for f in (STATE_FILE, SENT_APPTS_FILE, APPT_SNAPSHOT_FILE, GHL_MAP_FILE, GHL_CONTACTS_MAP_FILE):
         if not os.path.exists(f):
-            MEGA_STORE.pull(f)
+            DRIVE.pull(f)
 
 def save_state(sent_map: Dict[str, Dict[str, str]], last_sync: Dict[int, Optional[str]],
                snapshot: Dict[str, Any], ghl_map: Dict[str, Any], contact_map: Dict[int, Any]):
-    atomic_save_json(SENT_APPTS_FILE, sent_map); MEGA_STORE.push(SENT_APPTS_FILE)
-    atomic_save_json(STATE_FILE, last_sync); MEGA_STORE.push(STATE_FILE)
-    atomic_save_json(APPT_SNAPSHOT_FILE, snapshot); MEGA_STORE.push(APPT_SNAPSHOT_FILE)
-    atomic_save_json(GHL_MAP_FILE, ghl_map); MEGA_STORE.push(GHL_MAP_FILE)
-    atomic_save_json(GHL_CONTACTS_MAP_FILE, {str(k): v for k, v in contact_map.items()}); MEGA_STORE.push(GHL_CONTACTS_MAP_FILE)
+    atomic_save_json(SENT_APPTS_FILE, sent_map); DRIVE.push(SENT_APPTS_FILE)
+    atomic_save_json(STATE_FILE, last_sync); DRIVE.push(STATE_FILE)
+    atomic_save_json(APPT_SNAPSHOT_FILE, snapshot); DRIVE.push(APPT_SNAPSHOT_FILE)
+    atomic_save_json(GHL_MAP_FILE, ghl_map); DRIVE.push(GHL_MAP_FILE)
+    atomic_save_json(GHL_CONTACTS_MAP_FILE, {str(k): v for k, v in contact_map.items()}); DRIVE.push(GHL_CONTACTS_MAP_FILE)
 
 # =========================
 # ===== OD FETCH ==========
@@ -1010,8 +1001,9 @@ def main_once(dry_run: bool = False, force_deep_sync: bool = False):
     if not validate_configuration():
         sys.exit(1)
 
-    # Pull latest state from MEGA (best-effort; local-first)
-    pull_all_from_mega()
+    # Connect Drive and seed state locally if needed
+    DRIVE.connect()
+    pull_all_from_drive()
 
     last_sync = load_last_sync()                  # clinic → iso str
     sent_map = load_json_or(SENT_APPTS_FILE, {})  # AptNum → {last_sent_tstamp}
@@ -1085,7 +1077,7 @@ def main_once(dry_run: bool = False, force_deep_sync: bool = False):
         if to_process:
             last_sync[clinic] = datetime.datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
 
-    # Persist state + MEGA push
+    # Persist state + Drive push
     save_patient_cache(patient_cache)  # local only; you’re not caching this in Actions
     save_state(sent_map, last_sync, snapshot, ghl_map, contact_map)
     logger.info(f"Done. Created/updated {total} appointments.")
