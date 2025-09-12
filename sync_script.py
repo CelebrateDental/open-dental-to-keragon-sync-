@@ -269,6 +269,9 @@ def normalize_phone_for_search(phone: str) -> str:
 # =========================
 # === GOOGLE DRIVE STATE ==
 # =========================
+# =========================
+# === GOOGLE DRIVE STATE ==
+# =========================
 class DriveAdapter:
     """
     Google Drive storage for state files (Service Account).
@@ -320,10 +323,15 @@ class DriveAdapter:
         except Exception as e:
             logger.error("google-api-python-client not installed. pip install google-api-python-client. %s", e)
             return
+
         self.service = build('drive', 'v3', credentials=creds, cache_discovery=False)
+
         if not self.folder_id:
-            # find by name or create
-            q = f"name = '{GDRIVE_FOLDER_NAME}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+            # find folder by name or create it
+            q = (
+                f"name = '{GDRIVE_FOLDER_NAME}' and "
+                f"mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+            )
             res = self.service.files().list(q=q, fields="files(id,name)").execute()
             files = res.get('files', [])
             if files:
@@ -332,82 +340,92 @@ class DriveAdapter:
                 body = {'name': GDRIVE_FOLDER_NAME, 'mimeType': 'application/vnd.google-apps.folder'}
                 f = self.service.files().create(body=body, fields='id').execute()
                 self.folder_id = f['id']
+
         logger.info("Drive connected. Folder id: %s", self.folder_id)
 
     def _find_file(self, name: str) -> Optional[str]:
-        if not self.service or not self.folder_id: return None
+        if not self.service or not self.folder_id:
+            return None
         q = f"name = '{os.path.basename(name)}' and '{self.folder_id}' in parents and trashed = false"
-        res = self.service.files().list(q=q, fields="files(id,name,modifiedTime)", orderBy="modifiedTime desc").execute()
+        res = self.service.files().list(
+            q=q,
+            fields="files(id,name,modifiedTime)",
+            orderBy="modifiedTime desc"
+        ).execute()
         files = res.get('files', [])
         return files[0]['id'] if files else None
 
     def pull(self, filename: str):
-        if not self.service or not self.folder_id: return
+        """
+        Download the current contents of an existing file into the local path,
+        but only if the local file does not already exist.
+        """
+        if os.path.exists(filename):
+            return
+        if not self.service or not self.folder_id:
+            logger.warning("Drive unavailable; running in local-only mode.")
+            return
+
         file_id = self._find_file(filename)
-        if not file_id: return
-        from googleapiclient.http import MediaIoBaseDownload
-        req = self.service.files().get_media(fileId=file_id)
-        td = tempfile.mkdtemp()
-        dest = os.path.join(td, os.path.basename(filename))
-        fh = io.FileIO(dest, 'wb')
-        downloader = MediaIoBaseDownload(fh, req)
-        done = False
+        if not file_id:
+            return
+
         try:
+            from googleapiclient.http import MediaIoBaseDownload
+            import io
+
+            req = self.service.files().get_media(fileId=file_id)
+            fh = io.BytesIO()
+            downloader = MediaIoBaseDownload(fh, req)
+            done = False
             while not done:
-                status, done = downloader.next_chunk()
-            fh.close()
-            shutil.move(dest, filename)
-            logger.info("Drive pull → %s", filename)
-        finally:
-            try: fh.close()
-            except Exception: pass
-            shutil.rmtree(td, ignore_errors=True)
+                _, done = downloader.next_chunk()
+            with open(filename, "wb") as f:
+                f.write(fh.getvalue())
+            logger.info("Drive pull → %s", os.path.basename(filename))
+        except Exception as e:
+            logger.warning("Drive pull error for %s: %s", os.path.basename(filename), e)
 
     def push(self, filename: str):
-     """
-    Upload a new version of an EXISTING user-owned file.
-    - No delete
-    - No create
-    This avoids both 'insufficientFilePermissions' and 'storageQuotaExceeded'
-    when the SA has editor access but no quota.
-     """
-    if not os.path.exists(filename):
-        logging.warning(f"Drive push skipped (local file missing): {filename}")
-        return
-    if not self.ensure():
-        logging.warning(f"Drive push skipped (Drive unavailable): {filename}")
-        return
+        """
+        Upload a new version of an EXISTING user-owned file.
+        - No delete
+        - No create
+        This avoids both 'insufficientFilePermissions' and 'storageQuotaExceeded'
+        when the SA has editor access but no quota.
+        """
+        if not os.path.exists(filename):
+            logger.warning("Drive push skipped (local file missing): %s", filename)
+            return
+        if not self.service or not self.folder_id:
+            logger.warning("Drive push skipped (Drive unavailable): %s", filename)
+            return
 
-    basename = os.path.basename(filename)
-
-    # Find the existing file by name within the target folder
-    existing = self._find_file_id(basename)
-    if not existing:
-        logging.error(
-            f"Drive push aborted: '{basename}' not found in folder. "
-            f"Create the empty file in Drive (owned by you), share with SA as Editor, then rerun."
-        )
-        return
-
-    file_id = existing
-    try:
-        from googleapiclient.http import MediaFileUpload  # local import to be safe
-        media = MediaFileUpload(filename, mimetype="application/json", resumable=False)
-        updated = (
-            self._svc.files()
-            .update(fileId=file_id, media_body=media)
-            .execute()
-        )
-        logging.info(f"Drive push (version update) → {basename} (id {updated.get('id')})")
-    except Exception as e:
-        logging.warning(f"Drive push error for {basename}: {e}")
-        if "storageQuotaExceeded" in str(e):
-            logging.error(
-                "Drive refused due to SA quota. Ensure you are UPDATING an existing file you own. "
-                "Do not delete/create files in My Drive with the service account."
+        basename = os.path.basename(filename)
+        file_id = self._find_file(basename)
+        if not file_id:
+            logger.error(
+                "Drive push aborted: '%s' not found in folder. "
+                "Create the empty file in Drive (owned by you), share with the SA as Editor, then rerun.",
+                basename,
             )
+            return
+
+        try:
+            from googleapiclient.http import MediaFileUpload
+            media = MediaFileUpload(filename, mimetype="application/json", resumable=False)
+            updated = self.service.files().update(fileId=file_id, media_body=media).execute()
+            logger.info("Drive push (version update) → %s (id %s)", basename, updated.get('id'))
+        except Exception as e:
+            logger.warning("Drive push error for %s: %s", basename, e)
+            if "storageQuotaExceeded" in str(e):
+                logger.error(
+                    "Drive refused due to SA quota. Ensure you are UPDATING an existing file you own. "
+                    "Do not delete/create files in My Drive with the service account."
+                )
 
 DRIVE = DriveAdapter()
+
 
 def atomic_save_json(path: str, obj: Any):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
