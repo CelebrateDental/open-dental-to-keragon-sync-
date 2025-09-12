@@ -128,25 +128,48 @@ jobs:
           echo "script=$SCRIPT" >> $GITHUB_OUTPUT
           echo "Using $SCRIPT"
 
-      # NEW: pre-login + folder ensure with timeouts so Python won't hang on MEGA init
+      # Pre-login & folder ensure with timeouts so Python won't hang on MEGA init
       - name: MEGAcmd pre-login & folder ensure
         env:
           MEGA_EMAIL:   ${{ secrets.MEGA_EMAIL }}
-          MEGA_PASSWORD: ${{ secrets.MEGA_PASSWORD }}   # <-- space after colon fixed
+          MEGA_PASSWORD: ${{ secrets.MEGA_PASSWORD }}
           MEGA_FOLDER:  ${{ secrets.MEGA_FOLDER }}
         run: |
-          set -e
+          set -euo pipefail
+          echo "Starting MEGAcmd server…"
           mega-cmd-server --daemon || true
 
-          # If not logged in, do a bounded non-interactive login
-          if ! mega-whoami >/dev/null 2>&1; then
-            echo "Logging in to MEGA…"
-            timeout 40s mega-login "${MEGA_EMAIL}" "${MEGA_PASSWORD}" || { echo "::error::MEGA login failed or timed out"; exit 1; }
+          echo "MEGAcmd version:"
+          mega-version || true
+
+          echo "Checking login state…"
+          if mega-whoami >/dev/null 2>&1; then
+            echo "Already logged in."
+          else
+            echo "Logging in to MEGA (timeout 40s)…"
+            set +e
+            LOGIN_OUT="$(timeout 40s mega-login "${MEGA_EMAIL}" "${MEGA_PASSWORD}" 2>&1)"
+            LOGIN_RC=$?
+            set -e
+
+            echo "${LOGIN_OUT}"
+
+            if [ $LOGIN_RC -ne 0 ]; then
+              echo "::error::MEGA login failed or timed out (rc=${LOGIN_RC})."
+              if echo "${LOGIN_OUT}" | grep -iqE 'confirm|verification|email'; then
+                echo "::error::MEGA requires device/email confirmation for this login."
+                echo "Open the confirmation link MEGA sent to ${MEGA_EMAIL}, approve the new device,"
+                echo "then re-run the workflow. The session will be cached in ~/.megaCmd."
+              fi
+              exit 1
+            fi
           fi
 
-          # Ensure folder exists (bounded) and list it
+          echo "Ensuring folder: /${MEGA_FOLDER}"
           timeout 20s mega-mkdir -p "/${MEGA_FOLDER}" || true
+          echo "Listing folder:"
           timeout 20s mega-ls "/${MEGA_FOLDER}" || true
+
           echo "MEGAcmd ready."
 
       - name: Run sync
