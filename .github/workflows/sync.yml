@@ -1,15 +1,15 @@
-name: Open Dental → GHL Sync
+name: "Open Dental → GHL Sync"
 
 on:
   schedule:
-    - cron: '0 7 * * *'           # Deep sync at 2 AM CDT (07:00 UTC) during DST
-    - cron: '0 13-23,0-1 * * *'   # Hourly at :00 from 8 AM–8 PM CDT (13:00–01:00 UTC)
+    - cron: "0 7 * * *"            # Deep sync at 2 AM CDT (07:00 UTC) during DST
+    - cron: "0 13-23,0-1 * * *"    # Hourly at :00 from 8 AM–8 PM CDT (13:00–01:00 UTC)
   workflow_dispatch:
     inputs:
       force_deep_sync:
-        description: 'Force a deep sync to repopulate mapping state'
+        description: "Force a deep sync to repopulate mapping state"
         required: false
-        default: 'false'
+        default: "false"
 
 concurrency:
   group: sync-open-dental-to-ghl-${{ github.run_id }}
@@ -41,30 +41,12 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-
-      # Install system tools needed by the workflow & script
-      - name: Install MEGAcmd and tools
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y gnupg curl jq
-          sudo install -m 0755 -d /usr/share/keyrings
-          curl -fsSL https://mega.nz/keys/MEGA_signing.key | sudo gpg --dearmor -o /usr/share/keyrings/mega.gpg
-          echo "deb [signed-by=/usr/share/keyrings/mega.gpg] https://mega.nz/linux/repo/xUbuntu_24.04/ ./" | sudo tee /etc/apt/sources.list.d/meganz.list
-          sudo apt-get update -y
-          sudo apt-get install -y megacmd
+          python-version: "3.11"
 
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests
-
-      # (Optional) Cache MEGAcmd session so subsequent runs don't have to re-login
-      - name: Cache MEGAcmd session
-        uses: actions/cache@v4
-        with:
-          path: ~/.megaCmd
-          key: megacmd-${{ runner.os }}-v1
+          pip install requests google-api-python-client google-auth google-auth-httplib2 google-auth-oauthlib
 
       - name: Determine sync type
         id: sync_type
@@ -128,72 +110,6 @@ jobs:
           echo "script=$SCRIPT" >> $GITHUB_OUTPUT
           echo "Using $SCRIPT"
 
-      # Pre-login & folder ensure with background server, socket poll, and timeouts
-      - name: MEGAcmd pre-login & folder ensure
-        env:
-          MEGA_EMAIL:   ${{ secrets.MEGA_EMAIL }}
-          MEGA_PASSWORD: ${{ secrets.MEGA_PASSWORD }}
-          MEGA_FOLDER:  ${{ secrets.MEGA_FOLDER }}
-        run: |
-          set -euo pipefail
-
-          # Clean up any stale server/socket (bounded)
-          timeout 5s mega-quit || true
-          rm -f "$HOME/.megaCmd/megacmd.socket" || true
-          mkdir -p "$HOME/.megaCmd"
-
-          echo "Starting MEGAcmd server in background…"
-          nohup mega-cmd-server --daemon >"$HOME/.megaCmd/server.log" 2>&1 &
-
-          # Wait up to 20s for the UNIX socket to appear
-          for i in $(seq 1 20); do
-            if [ -S "$HOME/.megaCmd/megacmd.socket" ]; then
-              echo "megacmd.socket is ready."
-              break
-            fi
-            sleep 1
-          done
-          if [ ! -S "$HOME/.megaCmd/megacmd.socket" ]; then
-            echo "::error::MEGAcmd socket did not appear. Server log follows:"
-            tail -n 200 "$HOME/.megaCmd/server.log" || true
-            exit 1
-          fi
-
-          echo "MEGAcmd version:"
-          timeout 5s mega-version || true
-
-          echo "Checking login state…"
-          if timeout 5s mega-whoami >/dev/null 2>&1; then
-            echo "Already logged in."
-          else
-            echo "Logging in to MEGA (timeout 40s)…"
-            set +e
-            LOGIN_OUT="$(timeout 40s mega-login "${MEGA_EMAIL}" "${MEGA_PASSWORD}" 2>&1)"
-            LOGIN_RC=$?
-            set -e
-
-            echo "${LOGIN_OUT}"
-
-            if [ $LOGIN_RC -ne 0 ]; then
-              echo "::error::MEGA login failed or timed out (rc=${LOGIN_RC})."
-              if echo "${LOGIN_OUT}" | grep -iqE 'confirm|verification|email|approve'; then
-                echo "::error::MEGA requires device/email confirmation for this login."
-                echo "Open the confirmation link MEGA sent to ${MEGA_EMAIL}, approve the new device,"
-                echo "then re-run the workflow. The session will be cached in ~/.megaCmd."
-              fi
-              echo "Server log tail:"
-              tail -n 200 "$HOME/.megaCmd/server.log" || true
-              exit 1
-            fi
-          fi
-
-          echo "Ensuring folder: /${MEGA_FOLDER}"
-          timeout 20s mega-mkdir -p "/${MEGA_FOLDER}" || true
-          echo "Listing folder:"
-          timeout 20s mega-ls "/${MEGA_FOLDER}" || true
-
-          echo "MEGAcmd ready."
-
       - name: Run sync
         id: sync
         env:
@@ -225,10 +141,20 @@ jobs:
           RETRY_ATTEMPTS:            "5"
           BACKOFF_FACTOR:            "3.0"
 
-          # ---- MEGA (MEGAcmd) ----
-          MEGA_EMAIL:                ${{ secrets.MEGA_EMAIL }}
-          MEGA_PASSWORD:             ${{ secrets.MEGA_PASSWORD }}
-          MEGA_FOLDER:               ${{ secrets.MEGA_FOLDER }}    # e.g. od_ghl_sync
+          # ---- Google Drive (Service Account) ----
+          # Use exactly one of these for the key material:
+          #   - GDRIVE_SERVICE_ACCOUNT_JSON_B64  (recommended)
+          #   - GDRIVE_SERVICE_ACCOUNT_JSON      (raw JSON)
+          GDRIVE_SERVICE_ACCOUNT_JSON_B64: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON_B64 }}
+          # GDRIVE_SERVICE_ACCOUNT_JSON:      ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+
+          # Point to the Drive folder where state files are mirrored
+          # Use either the Folder ID or (if you prefer) the Name:
+          GDRIVE_FOLDER_ID:          ${{ secrets.GDRIVE_FOLDER_ID }}
+          # GDRIVE_FOLDER_NAME:       ${{ secrets.GDRIVE_FOLDER_NAME }}
+
+          # If you enabled domain-wide delegation and want to act on a user's Drive (optional):
+          # GDRIVE_SUBJECT:            ${{ secrets.GDRIVE_SUBJECT }}
         run: |
           if [ "${{ steps.sync_type.outputs.force_deep_sync }}" = "true" ]; then
             echo "Deep sync: ${{ steps.pickscript.outputs.script }}"
@@ -240,13 +166,13 @@ jobs:
 
       - name: Validate state files (non-PHI only)
         run: |
-          echo "## Checking non-PHI state artifacts (may be absent—MEGA push can remove locals)"
+          echo "## Checking non-PHI state artifacts (may be absent—Drive push can remove locals)"
           for f in last_sync_state.json sent_appointments.json appointments_store.json ghl_appointments_map.json ghl_contacts_map.json appointment_types_cache.json; do
             if [ -f "$f" ]; then
               echo "Found $f (size: $(stat -c%s "$f" 2>/dev/null || stat -f%z "$f"))"
               jq empty "$f" || { echo "Invalid JSON in $f"; exit 1; }
             else
-              echo "$f not present locally (expected when MEGA push succeeded)."
+              echo "$f not present locally (expected when remote push succeeded)."
             fi
           done
 
