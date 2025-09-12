@@ -151,6 +151,9 @@ REQUIRED_APPOINTMENT_FIELDS = [
     'WirelessPhone', 'Gender', 'Birthdate'
 ]
 
+# ➕ NEW: Local appointment-types cache file (no API calls; use repo-persisted file)
+APPT_TYPES_CACHE_FILE = 'appointment_types_cache.json'
+
 # =========================
 # ===== LOGGING ===========
 # =========================
@@ -242,10 +245,12 @@ def parse_time(s: Optional[str]) -> Optional[datetime.datetime]:
         except Exception:
             return None
 
+# ➕ CHANGED: always output UTC with trailing 'Z'
 def to_iso(dt: datetime.datetime) -> str:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.isoformat()
+    dt_utc = dt.astimezone(timezone.utc)
+    return dt_utc.replace(tzinfo=None).isoformat() + "Z"
 
 def clinic_local_date(dt: datetime.datetime) -> datetime.date:
     return dt.astimezone(CLINIC_TIMEZONE).date()
@@ -255,16 +260,20 @@ def valid_email_or_unknown(email: str) -> str:
     email = (email or '').strip()
     return email if email and EMAIL_RE.match(email) else "unknown@gmail.com"
 
+# ➕ CHANGED: be 422-safe — require at least 10 digits; return "" to skip search if too short
 def normalize_phone_for_search(phone: str) -> str:
     phone = (phone or '').strip()
     if not phone:
         return ""
-    digits = re.sub(r"[^\d+]", "", phone)
-    if digits and digits[0] != '+':
-        pure = re.sub(r"\D", "", digits)
-        if len(pure) == 10:
-            return "+1" + pure  # default to +1; adjust per region if needed
-    return digits
+    # prefer pure digits for length checks
+    pure = re.sub(r"\D", "", phone)
+    if len(pure) < 10:
+        return ""  # unusable for search; will trigger upsert without phone
+    if phone.startswith('+'):
+        return re.sub(r"[^\d+]", "", phone)
+    if len(pure) == 10:
+        return "+1" + pure
+    return "+" + pure
 
 # =========================
 # === GOOGLE DRIVE STATE ==
@@ -558,11 +567,96 @@ def fetch_appointments_for_window(clinic: int, start: datetime.datetime, end: da
         uniq[key] = a
     result = list(uniq.values())
 
+    # ➕ NEW: Broken-by-type filtering using local cache file
+    result = _apply_broken_type_filter_with_cache(result, clinic)
+
     # ➕ NEW: final count summary for the clinic
     logger.info(f"Clinic {clinic}: appointments raw={len(all_appts)} after-de-dupe={len(result)}")
     _debug_write(f"od_appts_clinic_{clinic}.json", {"start": start.isoformat(), "end": end.isoformat(), "appointments": result})
     return result
 
+# ➕ NEW: Appointment-type cache loading (file-only; no API)
+def _load_appt_types_cache() -> Optional[object]:
+    try:
+        with open(APPT_TYPES_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        logger.info("Appointment type cache not found: %s (Broken filter will not apply).", APPT_TYPES_CACHE_FILE)
+    except Exception as e:
+        logger.warning("Failed to read appointment type cache %s: %s", APPT_TYPES_CACHE_FILE, e)
+    return None
+
+def _normalize_type_map_from_cache(data: object, clinic_num: int) -> Dict[int, str]:
+    """
+    Accepts several shapes:
+      - { "9034": { "123": "COMP EX", ... }, "9035": { ... } }
+      - { "123": "COMP EX", ... }
+      - { "items": [ { "AppointmentTypeNum": 123, "AppointmentTypeName": "COMP EX" }, ... ] }
+      - [ { "AppointmentTypeNum": 123, "AppointmentTypeName": "COMP EX" }, ... ]
+    """
+    def add_item(out: Dict[int, str], it: dict):
+        num = it.get("AppointmentTypeNum") or it.get("TypeNum") or it.get("Id")
+        name = it.get("AppointmentTypeName") or it.get("Description") or it.get("Name")
+        if num is not None:
+            try:
+                out[int(num)] = (name or "").strip()
+            except Exception:
+                pass
+
+    if isinstance(data, dict):
+        if str(clinic_num) in data and isinstance(data[str(clinic_num)], dict):
+            return {int(k): (v or "").strip() for k, v in data[str(clinic_num)].items()}
+        if "global" in data and isinstance(data["global"], dict):
+            return {int(k): (v or "").strip() for k, v in data["global"].items()}
+        try:
+            return {int(k): (v or "").strip() for k, v in data.items()}
+        except Exception:
+            pass
+        if isinstance(data.get("items"), list):
+            out: Dict[int, str] = {}
+            for it in data["items"]:
+                if isinstance(it, dict):
+                    add_item(out, it)
+            return out
+
+    if isinstance(data, list):
+        out: Dict[int, str] = {}
+        for it in data:
+            if isinstance(it, dict):
+                add_item(out, it)
+        return out
+
+    return {}
+
+def _apply_broken_type_filter_with_cache(appts: List[Dict[str, Any]], clinic_num: int) -> List[Dict[str, Any]]:
+    allow = {x.strip().lower() for x in CLINIC_BROKEN_APPOINTMENT_TYPE_FILTERS.get(clinic_num, [])}
+    if not allow:
+        return appts
+    cache = _load_appt_types_cache()
+    if cache is None:
+        logger.info("Clinic %s: no appointment-type cache available; Broken filter skipped.", clinic_num)
+        return appts
+    tmap = _normalize_type_map_from_cache(cache, clinic_num)
+    if not tmap:
+        logger.info("Clinic %s: appointment-type cache empty/unparsable; Broken filter skipped.", clinic_num)
+        return appts
+
+    kept: List[Dict[str, Any]] = []
+    dropped = 0
+    for a in appts:
+        if (a.get("AptStatus") or "").lower() == "broken":
+            tnum = a.get("AppointmentTypeNum")
+            tname = tmap.get(int(tnum)) if tnum is not None else ""
+            if tname and tname.strip().lower() in allow:
+                kept.append(a)
+            else:
+                dropped += 1
+                continue
+        else:
+            kept.append(a)
+    if dropped:
+        logger.info("Clinic %s: Broken filter dropped %d appointment(s) by type.", clinic_num, dropped)
+    return kept
 
 # =========================
 # ===== GHL CLIENT ========
@@ -578,6 +672,10 @@ def ghl_search_contact_by_phone(phone: str) -> Optional[Dict[str, Any]]:
     try:
         r = get_session().post(url, headers=ghl_headers(), json=body, timeout=REQUEST_TIMEOUT)
         _debug_write("ghl_contacts_search_req.json", {"url": url, "body": body})
+        # ➕ NEW: explicit 422 handling to avoid noisy errors on short/invalid queries
+        if r.status_code == 422:
+            logger.error("GHL contact search failed: 422. Reason: %s", r.text)
+            return None
         if r.status_code == 401:
             logger.error("GHL auth failed (401) – check token and Version header.")
             return None
@@ -763,8 +861,10 @@ def ghl_create_appointment(calendar_id: str, contact_id: str, assigned_user_id: 
         "assignedUserId": assigned_user_id,
         "title": title or "Dental Appointment",
         "appointmentStatus": status,  # confirmed / cancelled / showed
-        "startTime": to_iso(start_dt.astimezone(CLINIC_TIMEZONE)),
-        "endTime": to_iso(end_dt.astimezone(CLINIC_TIMEZONE)),
+        # ➕ CHANGED: send UTC "Z" times + include timeZone to keep 7am as 7am
+        "startTime": to_iso(start_dt),
+        "endTime": to_iso(end_dt),
+        "timeZone": str(CLINIC_TIMEZONE),
         "ignoreFreeSlotValidation": True,
         "locationId": GHL_LOCATION_ID
     }
@@ -790,8 +890,10 @@ def ghl_update_appointment(event_id: str, calendar_id: str, assigned_user_id: Op
         "assignedUserId": assigned_user_id,
         "title": title or "Dental Appointment",
         "appointmentStatus": status,
-        "startTime": to_iso(start_dt.astimezone(CLINIC_TIMEZONE)),
-        "endTime": to_iso(end_dt.astimezone(CLINIC_TIMEZONE)),
+        # ➕ CHANGED: send UTC "Z" times + include timeZone
+        "startTime": to_iso(start_dt),
+        "endTime": to_iso(end_dt),
+        "timeZone": str(CLINIC_TIMEZONE),
         "ignoreFreeSlotValidation": True,
         "locationId": GHL_LOCATION_ID
     }
@@ -891,6 +993,8 @@ def ensure_contact_id(first: str, last: str, email: str, phone: str,
 
     # 2) phone search
     phone_norm = normalize_phone_for_search(phone)
+    if not phone_norm and phone:
+        logger.warning("Pat %s phone unusable for search (%r) → skipping search.", pat_num, phone)
     found = ghl_search_contact_by_phone(phone_norm) if phone_norm else None
     if found and found.get('id'):
         cid = found['id']
