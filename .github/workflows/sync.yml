@@ -128,7 +128,7 @@ jobs:
           echo "script=$SCRIPT" >> $GITHUB_OUTPUT
           echo "Using $SCRIPT"
 
-      # Pre-login & folder ensure with timeouts so Python won't hang on MEGA init
+      # Pre-login & folder ensure with background server, socket poll, and timeouts
       - name: MEGAcmd pre-login & folder ensure
         env:
           MEGA_EMAIL:   ${{ secrets.MEGA_EMAIL }}
@@ -136,14 +136,34 @@ jobs:
           MEGA_FOLDER:  ${{ secrets.MEGA_FOLDER }}
         run: |
           set -euo pipefail
-          echo "Starting MEGAcmd server…"
-          mega-cmd-server --daemon || true
+
+          # Clean up any stale server/socket (bounded)
+          timeout 5s mega-quit || true
+          rm -f "$HOME/.megaCmd/megacmd.socket" || true
+          mkdir -p "$HOME/.megaCmd"
+
+          echo "Starting MEGAcmd server in background…"
+          nohup mega-cmd-server --daemon >"$HOME/.megaCmd/server.log" 2>&1 &
+
+          # Wait up to 20s for the UNIX socket to appear
+          for i in $(seq 1 20); do
+            if [ -S "$HOME/.megaCmd/megacmd.socket" ]; then
+              echo "megacmd.socket is ready."
+              break
+            fi
+            sleep 1
+          done
+          if [ ! -S "$HOME/.megaCmd/megacmd.socket" ]; then
+            echo "::error::MEGAcmd socket did not appear. Server log follows:"
+            tail -n 200 "$HOME/.megaCmd/server.log" || true
+            exit 1
+          fi
 
           echo "MEGAcmd version:"
-          mega-version || true
+          timeout 5s mega-version || true
 
           echo "Checking login state…"
-          if mega-whoami >/dev/null 2>&1; then
+          if timeout 5s mega-whoami >/dev/null 2>&1; then
             echo "Already logged in."
           else
             echo "Logging in to MEGA (timeout 40s)…"
@@ -156,11 +176,13 @@ jobs:
 
             if [ $LOGIN_RC -ne 0 ]; then
               echo "::error::MEGA login failed or timed out (rc=${LOGIN_RC})."
-              if echo "${LOGIN_OUT}" | grep -iqE 'confirm|verification|email'; then
+              if echo "${LOGIN_OUT}" | grep -iqE 'confirm|verification|email|approve'; then
                 echo "::error::MEGA requires device/email confirmation for this login."
                 echo "Open the confirmation link MEGA sent to ${MEGA_EMAIL}, approve the new device,"
                 echo "then re-run the workflow. The session will be cached in ~/.megaCmd."
               fi
+              echo "Server log tail:"
+              tail -n 200 "$HOME/.megaCmd/server.log" || true
               exit 1
             fi
           fi
