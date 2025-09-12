@@ -2,8 +2,8 @@ name: Open Dental → GHL Sync
 
 on:
   schedule:
-    - cron: '0 7 * * *'              # Deep sync at 2 AM CDT (07:00 UTC)
-    - cron: '0,40 13-23,0-10 * * *'  # Hourly at :00 from 8 AM–8 PM CDT (UTC)
+    - cron: '0 7 * * *'           # Deep sync at 2 AM CDT (07:00 UTC) during DST
+    - cron: '0 13-23,0-1 * * *'   # Hourly at :00 from 8 AM–8 PM CDT (13:00–01:00 UTC)
   workflow_dispatch:
     inputs:
       force_deep_sync:
@@ -43,25 +43,34 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
+      # Install system tools needed by the workflow & script
+      - name: Install MEGAcmd and tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y megacmd jq
+
+      - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests python-dateutil jq mega.py pycryptodome
+          pip install requests
+
+      # (Optional) Cache MEGAcmd session so subsequent runs don't have to re-login
+      - name: Cache MEGAcmd session
+        uses: actions/cache@v4
+        with:
+          path: ~/.megaCmd
+          key: megacmd-${{ runner.os }}-v1
 
       - name: Determine sync type
         id: sync_type
         run: |
           FORCE_DEEP_SYNC="false"
           REASON="incremental"
-
           if [ "${{ github.event.inputs.force_deep_sync }}" = "true" ]; then
-            FORCE_DEEP_SYNC="true"
-            REASON="manual_deep_sync"
+            FORCE_DEEP_SYNC="true"; REASON="manual_deep_sync"
           elif [[ "${{ github.event_name }}" == "schedule" && "${{ github.event.schedule }}" == "0 7 * * *" ]]; then
-            FORCE_DEEP_SYNC="true"
-            REASON="scheduled_deep_sync"
+            FORCE_DEEP_SYNC="true"; REASON="scheduled_deep_sync"
           fi
-
           echo "force_deep_sync=$FORCE_DEEP_SYNC" >> $GITHUB_OUTPUT
           echo "sync_reason=$REASON" >> $GITHUB_OUTPUT
           echo "Starting sync run_id=${{ github.run_id }} reason=$REASON"
@@ -69,7 +78,6 @@ jobs:
       - name: Ensure .gitignore excludes state/PII files
         run: |
           if [ -f .gitignore ]; then
-            # NEVER commit state / PII
             grep -q "^patient_cache\.json$" .gitignore || echo "patient_cache.json" >> .gitignore
             grep -q "^appointments_store\.json$" .gitignore || echo "appointments_store.json" >> .gitignore
             grep -q "^ghl_appointments_map\.json$" .gitignore || echo "ghl_appointments_map.json" >> .gitignore
@@ -115,6 +123,13 @@ jobs:
           echo "script=$SCRIPT" >> $GITHUB_OUTPUT
           echo "Using $SCRIPT"
 
+      # If you use MEGA 2FA, store the Base32 secret as MEGA_TOTP_SECRET and we’ll derive MEGA_AUTH_CODE here.
+      - name: Generate MEGA 2FA code (optional)
+        if: ${{ secrets.MEGA_TOTP_SECRET != '' }}
+        run: |
+          sudo apt-get update -y && sudo apt-get install -y oathtool
+          echo "MEGA_AUTH_CODE=$(oathtool --totp -b '${{ secrets.MEGA_TOTP_SECRET }}')" >> $GITHUB_ENV
+
       - name: Run sync
         id: sync
         env:
@@ -125,19 +140,12 @@ jobs:
 
           # ---- GoHighLevel / LeadConnector ----
           GHL_LOCATION_ID:           ${{ secrets.GHL_LOCATION_ID }}
-          # The script will accept any of these. We wire your Location API Key into GHL_API_KEY too:
-          GHL_AUTH_TOKEN:            ${{ secrets.GHL_AUTH_TOKEN }}          # OAuth access token (JWT)
-          GHL_OAUTH_TOKEN:           ${{ secrets.GHL_OAUTH_TOKEN }}         # (optional alt)
-          GHL_API_KEY:               ${{ secrets.GHL_LOCATION_API_KEY }}    # Location API Key (static) → used if tokens above empty
-
-          # Mappings (JSON strings)
-          GHL_CALENDAR_MAP:          ${{ secrets.GHL_CALENDAR_MAP }}        # {"clinic:9034":"cal_x","clinic:9035":"cal_y","default":"cal_fallback"}
-          GHL_ASSIGNED_USER_MAP:     ${{ secrets.GHL_ASSIGNED_USER_MAP }}   # {"clinic:9034":"user_a","clinic:9035":"user_b"}
-
-          # Optional: Contacts custom field for Clinic (CONTACT object)
+          GHL_AUTH_TOKEN:            ${{ secrets.GHL_AUTH_TOKEN }}
+          GHL_OAUTH_TOKEN:           ${{ secrets.GHL_OAUTH_TOKEN }}
+          GHL_API_KEY:               ${{ secrets.GHL_LOCATION_API_KEY }}
+          GHL_CALENDAR_MAP:          ${{ secrets.GHL_CALENDAR_MAP }}
+          GHL_ASSIGNED_USER_MAP:     ${{ secrets.GHL_ASSIGNED_USER_MAP }}
           GHL_CUSTOM_FIELD_CLINIC_ID: ${{ secrets.GHL_CUSTOM_FIELD_CLINIC_ID }}
-
-          # Tag to add on appointment create/update
           GHL_TAG_FROM_OD:           "fromopendental"
 
           # ---- Clinics & behavior ----
@@ -153,22 +161,23 @@ jobs:
           RETRY_ATTEMPTS:            "5"
           BACKOFF_FACTOR:            "3.0"
 
-          # ---- MEGA (state replication) ----
+          # ---- MEGA (MEGAcmd) ----
           MEGA_EMAIL:                ${{ secrets.MEGA_EMAIL }}
           MEGA_PASSWORD:             ${{ secrets.MEGA_PASSWORD }}
-          MEGA_FOLDER:               ${{ secrets.MEGA_FOLDER }}   # defaults to "od_ghl_sync" if unset
+          MEGA_FOLDER:               ${{ secrets.MEGA_FOLDER }}    # e.g. od_ghl_sync
+          MEGA_AUTH_CODE:            ${{ env.MEGA_AUTH_CODE }}     # set only if 2FA step ran
         run: |
-          echo "Incremental sync: ${{ steps.pickscript.outputs.script }}"
           if [ "${{ steps.sync_type.outputs.force_deep_sync }}" = "true" ]; then
             echo "Deep sync: ${{ steps.pickscript.outputs.script }}"
             python3 "${{ steps.pickscript.outputs.script }}" --force-deep-sync --verbose --once
           else
+            echo "Incremental sync: ${{ steps.pickscript.outputs.script }}"
             python3 "${{ steps.pickscript.outputs.script }}" --verbose --once
           fi
 
       - name: Validate state files (non-PHI only)
         run: |
-          echo "## Checking non-PHI state artifacts (may be absent—MEGA-first run uses temp dir)"
+          echo "## Checking non-PHI state artifacts (may be absent—MEGA push can remove locals)"
           for f in last_sync_state.json sent_appointments.json appointments_store.json ghl_appointments_map.json ghl_contacts_map.json appointment_types_cache.json; do
             if [ -f "$f" ]; then
               echo "Found $f (size: $(stat -c%s "$f" 2>/dev/null || stat -f%z "$f"))"
@@ -192,5 +201,3 @@ jobs:
           git fetch origin "${GITHUB_REF_NAME:-main}"
           git pull --rebase origin "${GITHUB_REF_NAME:-main}"
           git stash pop || true
-
-      # We don't commit state back to the repo; MEGA holds state.
