@@ -154,7 +154,7 @@ REQUIRED_APPOINTMENT_FIELDS = [
     'WirelessPhone', 'Gender', 'Birthdate'
 ]
 
-# >>> NEW: force-read the repo file next to this script
+# >>> ALWAYS read cache file from the repo folder next to this script
 APPT_TYPES_CACHE_PATH = os.path.join(os.path.dirname(__file__), 'appointment_types_cache.json')
 
 # =========================
@@ -307,19 +307,25 @@ def load_appointment_types_cache(path: str = APPT_TYPES_CACHE_PATH) -> Dict[int,
     Accepts flexible shapes:
       - {"by_num": {"123":"COMP EX", ...}}
       - {"types": [{"AppointmentTypeNum":123,"AppointmentTypeName":"COMP EX"}, ...]}
+      - {"appointment_types": {"shared": {"123":"COMP EX", ...}, ...}}
       - Or a plain {"123":"COMP EX", ...}
     """
     data = load_json_or(path, {})
     by_num: Dict[int, str] = {}
 
+    def _add_pair(k: Any, v: Any):
+        ik = _try_int(k)
+        if ik is not None and v:
+            by_num[ik] = str(v)
+
+    # Case 1: explicit "by_num"
     if isinstance(data, dict) and data.get("by_num"):
         for k, v in (data["by_num"] or {}).items():
-            ik = _try_int(k)
-            if ik is not None and v:
-                by_num[ik] = str(v)
+            _add_pair(k, v)
         logger.info(f"Loaded {len(by_num)} appointment types from {os.path.abspath(path)}")
         return by_num
 
+    # Case 2: list of dicts
     if isinstance(data, dict) and isinstance(data.get("types"), list):
         for t in data["types"]:
             n = _try_int(t.get("AppointmentTypeNum"))
@@ -329,12 +335,26 @@ def load_appointment_types_cache(path: str = APPT_TYPES_CACHE_PATH) -> Dict[int,
         logger.info(f"Loaded {len(by_num)} appointment types from {os.path.abspath(path)}")
         return by_num
 
+    # Case 3: nested groups under "appointment_types" (e.g., {"appointment_types": {"shared": {...}}})
+    if isinstance(data, dict) and isinstance(data.get("appointment_types"), dict):
+        groups = data["appointment_types"]
+        for grp in groups.values():
+            if isinstance(grp, dict):
+                for k, v in grp.items():
+                    _add_pair(k, v)
+            elif isinstance(grp, list):
+                for t in grp:
+                    n = _try_int(t.get("AppointmentTypeNum"))
+                    name = t.get("AppointmentTypeName") or t.get("Description") or t.get("Name")
+                    if n is not None and name:
+                        by_num[n] = str(name)
+        logger.info(f"Loaded {len(by_num)} appointment types from {os.path.abspath(path)}")
+        return by_num
+
+    # Case 4: plain num->name map
     if isinstance(data, dict):
-        # assume num->name
         for k, v in data.items():
-            ik = _try_int(k)
-            if ik is not None and v:
-                by_num[ik] = str(v)
+            _add_pair(k, v)
         logger.info(f"Loaded {len(by_num)} appointment types from {os.path.abspath(path)}")
         return by_num
 
