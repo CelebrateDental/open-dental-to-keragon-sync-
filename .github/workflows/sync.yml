@@ -12,8 +12,9 @@ on:
         default: "false"
 
 concurrency:
-  group: sync-open-dental-to-ghl-${{ github.run_id }}
+  group: sync-open-dental-to-ghl
   cancel-in-progress: true
+
 
 jobs:
   sync:
