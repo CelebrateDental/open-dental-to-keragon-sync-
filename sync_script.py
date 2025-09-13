@@ -154,6 +154,9 @@ REQUIRED_APPOINTMENT_FIELDS = [
     'WirelessPhone', 'Gender', 'Birthdate'
 ]
 
+# >>> NEW: force-read the repo file next to this script
+APPT_TYPES_CACHE_PATH = os.path.join(os.path.dirname(__file__), 'appointment_types_cache.json')
+
 # =========================
 # ===== LOGGING ===========
 # =========================
@@ -298,7 +301,7 @@ def _try_int(x) -> Optional[int]:
     except Exception:
         return None
 
-def load_appointment_types_cache(path: str = "appointment_types_cache.json") -> Dict[int, str]:
+def load_appointment_types_cache(path: str = APPT_TYPES_CACHE_PATH) -> Dict[int, str]:
     """
     Load local cache without hitting OD.
     Accepts flexible shapes:
@@ -314,6 +317,7 @@ def load_appointment_types_cache(path: str = "appointment_types_cache.json") -> 
             ik = _try_int(k)
             if ik is not None and v:
                 by_num[ik] = str(v)
+        logger.info(f"Loaded {len(by_num)} appointment types from {os.path.abspath(path)}")
         return by_num
 
     if isinstance(data, dict) and isinstance(data.get("types"), list):
@@ -322,6 +326,7 @@ def load_appointment_types_cache(path: str = "appointment_types_cache.json") -> 
             name = t.get("AppointmentTypeName") or t.get("Description") or t.get("Name")
             if n is not None and name:
                 by_num[n] = str(name)
+        logger.info(f"Loaded {len(by_num)} appointment types from {os.path.abspath(path)}")
         return by_num
 
     if isinstance(data, dict):
@@ -330,9 +335,10 @@ def load_appointment_types_cache(path: str = "appointment_types_cache.json") -> 
             ik = _try_int(k)
             if ik is not None and v:
                 by_num[ik] = str(v)
+        logger.info(f"Loaded {len(by_num)} appointment types from {os.path.abspath(path)}")
         return by_num
 
-    # anything else → empty
+    logger.info(f"Loaded 0 appointment types from {os.path.abspath(path)}")
     return {}
 
 def appt_type_name_from_cache(appointment_type_num: Any) -> Optional[str]:
@@ -1174,10 +1180,10 @@ def main_once(dry_run: bool = False, force_deep_sync: bool = False):
     DRIVE.connect()
     pull_all_from_drive()
 
-    # Load appt types cache once
+    # Load appt types cache once (from repo file next to this script)
     global _APPT_TYPE_BY_NUM, _APPT_TYPES_LOADED
     if not _APPT_TYPES_LOADED:
-        _APPT_TYPE_BY_NUM = load_appointment_types_cache()
+        _APPT_TYPE_BY_NUM = load_appointment_types_cache(APPT_TYPES_CACHE_PATH)
         _APPT_TYPES_LOADED = True
         if not _APPT_TYPE_BY_NUM:
             logger.warning("appointment_types_cache.json not found or empty; Broken-type filtering may skip unknowns.")
