@@ -116,6 +116,9 @@ BACKOFF_FACTOR = float(os.environ.get('BACKOFF_FACTOR', '3.0'))
 ENABLE_PAGINATION = os.environ.get('ENABLE_PAGINATION', 'true').lower() == 'true'
 PAGE_SIZE = int(os.environ.get('PAGE_SIZE', '100'))
 
+# ➕ Gentler on OpenDental (default ~0.35s between OD calls ≈ 2.8 rps)
+OD_RATE_LIMIT_SECONDS = float(os.environ.get('OD_RATE_LIMIT_SECONDS', '0.35'))
+
 # Optional deep trace (writes sync_debug.log and debug/*.json)
 TRACE = os.environ.get('OD_GHL_TRACE', '0') == '1'
 
@@ -229,16 +232,24 @@ def ghl_headers() -> Dict[str, str]:
         'Accept': 'application/json'
     }
 
+# ---- TIME HELPERS (timezone fix) ----
 def parse_time(s: Optional[str]) -> Optional[datetime.datetime]:
+    """
+    Parse OpenDental datetime strings.
+    - If the string is naive (no tz), treat it as clinic-local (America/Chicago).
+    - Otherwise respect the given timezone.
+    """
     if not s:
         return None
     try:
         dt = datetime.datetime.fromisoformat(s.replace('Z', '+00:00'))
-        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=CLINIC_TIMEZONE)
+        return dt
     except Exception:
         try:
             dt = datetime.datetime.strptime(s, "%Y-%m-%d")
-            return dt.replace(tzinfo=timezone.utc)
+            return dt.replace(tzinfo=CLINIC_TIMEZONE)
         except Exception:
             return None
 
@@ -246,6 +257,14 @@ def to_iso(dt: datetime.datetime) -> str:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.isoformat()
+
+def to_utc_z(dt: datetime.datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=CLINIC_TIMEZONE)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def clinic_tz_name() -> str:
+    return getattr(CLINIC_TIMEZONE, "key", str(CLINIC_TIMEZONE))
 
 def clinic_local_date(dt: datetime.datetime) -> datetime.date:
     return dt.astimezone(CLINIC_TIMEZONE).date()
@@ -264,16 +283,8 @@ def normalize_phone_for_search(phone: str) -> str:
         pure = re.sub(r"\D", "", digits)
         if len(pure) == 10:
             return "+1" + pure  # default to +1; adjust per region if needed
+        return pure
     return digits
-
-def phone_looks_usable(e164: str) -> bool:
-    """Skip obviously junk phones that make /contacts/search return 422."""
-    if not e164:
-        return False
-    digits = re.sub(r"\D", "", e164)
-    if e164.startswith("+1"):
-        return len(digits) == 11  # +1 + 10 digits
-    return len(digits) >= 8      # basic floor for non-US
 
 # =========================
 # === GOOGLE DRIVE STATE ==
@@ -378,7 +389,6 @@ class DriveAdapter:
 
         try:
             from googleapiclient.http import MediaIoBaseDownload
-            import io
 
             req = self.service.files().get_media(fileId=file_id)
             fh = io.BytesIO()
@@ -471,53 +481,6 @@ def save_state(sent_map: Dict[str, Dict[str, str]], last_sync: Dict[int, Optiona
     atomic_save_json(GHL_MAP_FILE, ghl_map); DRIVE.push(GHL_MAP_FILE)
     atomic_save_json(GHL_CONTACTS_MAP_FILE, {str(k): v for k, v in contact_map.items()}); DRIVE.push(GHL_CONTACTS_MAP_FILE)
 
-# ========= appointment types cache (local file) =========
-APPT_TYPES_MAP: Dict[int, str] = {}
-
-def _load_appointment_types_cache_once(path: str = "appointment_types_cache.json"):
-    global APPT_TYPES_MAP
-    if APPT_TYPES_MAP:
-        return
-    raw = load_json_or(path, {})
-    mapping: Dict[int, str] = {}
-
-    # Accept flexible shapes:
-    # 1) { "123": "COMP EX", "124": "..." }
-    # 2) { "123": {"Name":"COMP EX"}, ... }
-    # 3) [ {"AppointmentTypeNum":123,"Name":"COMP EX"}, ... ]
-    if isinstance(raw, dict):
-        if "types" in raw and isinstance(raw["types"], dict):
-            raw = raw["types"]
-        for k, v in raw.items():
-            try:
-                if isinstance(v, str):
-                    mapping[int(k)] = v
-                elif isinstance(v, dict):
-                    name = v.get("Name") or v.get("DefName")
-                    if name:
-                        mapping[int(k)] = name
-            except:
-                pass
-    elif isinstance(raw, list):
-        for item in raw:
-            try:
-                num = item.get("AppointmentTypeNum") or item.get("DefNum") or item.get("ApptTypeNum")
-                name = item.get("Name") or item.get("DefName")
-                if num is not None and name:
-                    mapping[int(num)] = name
-            except:
-                pass
-
-    APPT_TYPES_MAP = mapping
-    if not APPT_TYPES_MAP:
-        logger.warning("appointment_types_cache.json missing or empty — Broken-appointment type filtering may skip all Broken items.")
-
-def _appt_type_name(num: Any) -> Optional[str]:
-    try:
-        return APPT_TYPES_MAP.get(int(num))
-    except:
-        return None
-
 # =========================
 # ===== OD FETCH ==========
 # =========================
@@ -546,6 +509,8 @@ def od_get_paginated(endpoint: str, params: Dict[str, Any]) -> Optional[List[Any
         if chunk is None:
             return None
         out.extend(chunk)
+        # be gentle between OD page fetches
+        time.sleep(OD_RATE_LIMIT_SECONDS)
         if len(chunk) < PAGE_SIZE:
             break
         offset += PAGE_SIZE
@@ -584,38 +549,26 @@ def fetch_appointments_for_window(clinic: int, start: datetime.datetime, end: da
 
     _ = get_operatories(clinic)
 
-    # Ensure appt-type cache ready (for Broken filtering)
-    _load_appointment_types_cache_once()
-
-    # ➕ NEW: show the window, ops & statuses we’re about to pull
+    # show the window, ops & statuses we’re about to pull
     logger.debug(
         f"Clinic {clinic}: fetching appointments {params_base['dateStart']}..{params_base['dateEnd']} "
         f"ops={sorted(valid_ops)} statuses={sorted(VALID_STATUSES)}"
     )
-
-    allowed_broken_names_upper = {s.strip().upper() for s in CLINIC_BROKEN_APPOINTMENT_TYPE_FILTERS.get(clinic, [])}
 
     for status in VALID_STATUSES:
         for op in CLINIC_OPERATORY_FILTERS.get(clinic, []):
             p = dict(params_base); p['AptStatus'] = status; p['Op'] = str(op)
             chunk = od_get_paginated('appointments', p) or []
 
-            # ➕ NEW: show the row-count per status/op query
+            # row-count per status/op query
             logger.debug(f"Clinic {clinic}: AptStatus={status} Op={op} -> {len(chunk)} returned")
 
             for a in chunk:
                 opnum = a.get('Op') or a.get('OperatoryNum')
-                if opnum not in valid_ops:
-                    continue
-
-                # Filter Broken by appointment type name (per-clinic whitelist)
-                if status == 'Broken' and allowed_broken_names_upper:
-                    at_name = _appt_type_name(a.get('AppointmentTypeNum')) or ""
-                    if at_name.strip().upper() not in allowed_broken_names_upper:
-                        continue
-
-                all_appts.append(a)
-            time.sleep(0.12)
+                if opnum in valid_ops:
+                    all_appts.append(a)
+            # be gentle on OD between queries, too
+            time.sleep(OD_RATE_LIMIT_SECONDS)
 
     # de-dupe…
     uniq: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
@@ -624,7 +577,7 @@ def fetch_appointments_for_window(clinic: int, start: datetime.datetime, end: da
         uniq[key] = a
     result = list(uniq.values())
 
-    # ➕ NEW: final count summary for the clinic
+    # final count summary for the clinic
     logger.info(f"Clinic {clinic}: appointments raw={len(all_appts)} after-de-dupe={len(result)}")
     _debug_write(f"od_appts_clinic_{clinic}.json", {"start": start.isoformat(), "end": end.isoformat(), "appointments": result})
     return result
@@ -636,29 +589,40 @@ def fetch_appointments_for_window(clinic: int, start: datetime.datetime, end: da
 def ghl_search_contact_by_phone(phone: str) -> Optional[Dict[str, Any]]:
     """
     Search contacts by text query (phone). POST /contacts/search
+    - Skips search if phone is too short (to avoid 422s and useless queries)
+    - Uses page/pageLimit (no 'limit') to satisfy API schema
     """
-    if not phone or not phone_looks_usable(phone):
-        logger.debug(f"Skipping GHL contact search: unusable phone '{phone}'")
+    if not phone:
         return None
+
+    # Require at least 7 digits for a "usable" search
+    pure_digits = re.sub(r"\D", "", phone.replace("+", ""))
+    if len(pure_digits) < 7:
+        logger.debug(f"Skipping GHL contact search: phone too short ('{phone}')")
+        return None
+
     url = f"{GHL_API_BASE}/contacts/search"
-    body = {"query": phone, "page": 1, "pageLimit": 10, "locationId": GHL_LOCATION_ID}
+    body = {"query": phone, "page": 1, "pageLimit": 1, "locationId": GHL_LOCATION_ID}
     try:
         r = get_session().post(url, headers=ghl_headers(), json=body, timeout=REQUEST_TIMEOUT)
         _debug_write("ghl_contacts_search_req.json", {"url": url, "body": body})
         if r.status_code == 401:
             logger.error("GHL auth failed (401) – check token and Version header.")
             return None
-        if r.status_code == 422:
-            logger.error(f"GHL contact search failed: 422. Reason: {r.text}")
+        if 400 <= r.status_code < 600:
+            reason = ""
+            try:
+                reason = r.text
+            except Exception:
+                pass
+            logger.error(f"GHL contact search failed: {r.status_code}. Reason: {reason}")
             return None
-        r.raise_for_status()
         data = r.json()
         _debug_write("ghl_contacts_search_resp.json", data)
         contacts = data.get('contacts') if isinstance(data, dict) else (data if isinstance(data, list) else [])
         return contacts[0] if contacts else None
     except requests.RequestException as e:
-        body_text = e.response.text if getattr(e, "response", None) else ""
-        logger.error(f"GHL contact search failed: {e}. Reason: {body_text}")
+        logger.error(f"GHL contact search failed: {e}")
         return None
 
 def ghl_build_contact_payload(patient: Dict[str, Any], clinic_num: int) -> Dict[str, Any]:
@@ -784,7 +748,7 @@ def _calendar_id_in_event(a: Dict[str, Any]) -> Optional[str]:
 def ghl_get_contact_appointments(contact_id: str) -> List[Dict[str, Any]]:
     if not contact_id:
         return []
-    url = f"{GHL_API_BASE}/contacts/{contact_id}/appointments"
+    url = f"{GHL_API_BASE}/contacts/{contact_id}/appointments"}
     try:
         r = get_session().get(url, headers=ghl_headers(), timeout=REQUEST_TIMEOUT)
         _debug_write("ghl_contact_appts_req.json", {"url": url, "contactId": contact_id})
@@ -834,8 +798,9 @@ def ghl_create_appointment(calendar_id: str, contact_id: str, assigned_user_id: 
         "assignedUserId": assigned_user_id,
         "title": title or "Dental Appointment",
         "appointmentStatus": status,  # confirmed / cancelled / showed
-        "startTime": to_iso(start_dt.astimezone(CLINIC_TIMEZONE)),
-        "endTime": to_iso(end_dt.astimezone(CLINIC_TIMEZONE)),
+        "startTime": to_utc_z(start_dt),   # send UTC Z
+        "endTime":   to_utc_z(end_dt),     # send UTC Z
+        "timeZone":  clinic_tz_name(),     # ensure proper rendering
         "ignoreFreeSlotValidation": True,
         "locationId": GHL_LOCATION_ID
     }
@@ -861,8 +826,9 @@ def ghl_update_appointment(event_id: str, calendar_id: str, assigned_user_id: Op
         "assignedUserId": assigned_user_id,
         "title": title or "Dental Appointment",
         "appointmentStatus": status,
-        "startTime": to_iso(start_dt.astimezone(CLINIC_TIMEZONE)),
-        "endTime": to_iso(end_dt.astimezone(CLINIC_TIMEZONE)),
+        "startTime": to_utc_z(start_dt),
+        "endTime":   to_utc_z(end_dt),
+        "timeZone":  clinic_tz_name(),
         "ignoreFreeSlotValidation": True,
         "locationId": GHL_LOCATION_ID
     }
@@ -947,26 +913,22 @@ def ghl_contact_payload_from_patient_like(first: str, last: str, email: str, pho
 def ensure_contact_id(first: str, last: str, email: str, phone: str,
                       pat_num: int,
                       clinic_num: int,
-                      contact_map: Dict[int, Any],
-                      patient_extra: Optional[Dict[str, Any]] = None) -> Tuple[Optional[str], bool]:
+                      contact_map: Dict[int, Any]) -> Tuple[Optional[str], bool]:
     """
     Returns (contact_id, is_new_contact).
     Path:
       1) If PatNum is already mapped -> return that id (is_new=False)
-      2) Else search by normalized phone (only if usable)
-      3) Else upsert (create) with OD extras (gender/DOB/address/zip) and return id (is_new=True)
+      2) Else search by normalized phone (skip if unusable)
+      3) Else upsert (create) and return id (is_new=True)
     """
     # 1) PatNum fast path
     mapped = contact_map.get(pat_num)
     if mapped and mapped.get('contactId'):
         return mapped['contactId'], False
 
-    # 2) phone search (guard junk)
+    # 2) phone search
     phone_norm = normalize_phone_for_search(phone)
-    found = ghl_search_contact_by_phone(phone_norm) if phone_looks_usable(phone_norm) else None
-    if not phone_looks_usable(phone_norm):
-        logger.debug(f"PatNum {pat_num}: skipping contact search — unusable phone '{phone_norm}'")
-
+    found = ghl_search_contact_by_phone(phone_norm) if phone_norm else None
     if found and found.get('id'):
         cid = found['id']
         contact_map[pat_num] = {
@@ -977,13 +939,8 @@ def ensure_contact_id(first: str, last: str, email: str, phone: str,
         }
         return cid, False
 
-    # 3) create with full payload (merge OD extras like Gender, Birthdate, Address, Zip)
+    # 3) create with full payload
     patient_like = ghl_contact_payload_from_patient_like(first, last, email, phone)
-    if patient_extra:
-        for k in ("Gender", "Birthdate", "Address", "Zip", "PostalCode", "WirelessPhone", "HmPhone"):
-            v = patient_extra.get(k)
-            if v not in (None, ""):
-                patient_like[k] = v
     cid = ghl_upsert_contact(patient_like, clinic_num)
     if cid:
         contact_map[pat_num] = {
@@ -1009,7 +966,7 @@ def process_one_appt(appt: Dict[str, Any],
           * If it's a NEW contact → CREATE appointment immediately (no need to fetch appointments).
           * If not new:
               - fetch the contact's appointments; pick the LATEST same-day event (by dateUpdated/updatedAt) on the SAME calendar → UPDATE.
-              - if none → CREATE a new one.
+              - if none → CREATE new event.
           * store AptNum -> eventId mapping for future updates.
       - After **every successful CREATE or UPDATE**, tag the contact with **fromopendental**.
     """
@@ -1034,16 +991,6 @@ def process_one_appt(appt: Dict[str, Any],
     email = valid_email_or_unknown(p.get('Email', ''))
     phone = p.get('WirelessPhone') or p.get('HmPhone') or ''
 
-    # collect extra OD fields so NEW contact gets full profile (incl. gender)
-    patient_extra = {
-        "Gender": p.get("Gender") or appt.get("Gender"),
-        "Birthdate": (p.get("Birthdate") or appt.get("Birthdate")),
-        "Address": p.get("Address") or appt.get("Address"),
-        "Zip": p.get("Zip") or appt.get("Zip") or appt.get("PostalCode"),
-        "WirelessPhone": p.get("WirelessPhone") or appt.get("WirelessPhone"),
-        "HmPhone": p.get("HmPhone") or ""
-    }
-
     # clinic routing
     calendar_id = pick_calendar_id(clinic)
     assigned_user_id = pick_assigned_user_id(clinic)
@@ -1052,7 +999,7 @@ def process_one_appt(appt: Dict[str, Any],
         return None
 
     # Ensure / create contact, capture whether it's new
-    contact_id, is_new_contact = ensure_contact_id(first, last, email, phone, pat_num, clinic, contact_map, patient_extra=patient_extra)
+    contact_id, is_new_contact = ensure_contact_id(first, last, email, phone, pat_num, clinic, contact_map)
     if not contact_id:
         logger.error(f"Apt {apt_num}: failed to ensure contact")
         return None
@@ -1209,7 +1156,8 @@ def main_once(dry_run: bool = False, force_deep_sync: bool = False):
             if pat:
                 patients[pn] = pat
                 patient_cache[pn] = pat
-            time.sleep(0.12)
+            # be gentle between OD patient fetches
+            time.sleep(OD_RATE_LIMIT_SECONDS)
 
         # Process each
         for a in to_process:
