@@ -116,7 +116,7 @@ BACKOFF_FACTOR = float(os.environ.get('BACKOFF_FACTOR', '3.0'))
 ENABLE_PAGINATION = os.environ.get('ENABLE_PAGINATION', 'true').lower() == 'true'
 PAGE_SIZE = int(os.environ.get('PAGE_SIZE', '100'))
 
-# ➕ Gentler on OpenDental (default ~0.35s between OD calls ≈ 2.8 rps)
+# ➕ Gentler on OpenDental (tune via env; try 0.75–1.0 for “very gentle”)
 OD_RATE_LIMIT_SECONDS = float(os.environ.get('OD_RATE_LIMIT_SECONDS', '0.35'))
 
 # Optional deep trace (writes sync_debug.log and debug/*.json)
@@ -285,6 +285,61 @@ def normalize_phone_for_search(phone: str) -> str:
             return "+1" + pure  # default to +1; adjust per region if needed
         return pure
     return digits
+
+# =========================
+# === APPT TYPE CACHE =====
+# =========================
+_APPT_TYPE_BY_NUM: Dict[int, str] = {}
+_APPT_TYPES_LOADED = False
+
+def _try_int(x) -> Optional[int]:
+    try:
+        return int(x)
+    except Exception:
+        return None
+
+def load_appointment_types_cache(path: str = "appointment_types_cache.json") -> Dict[int, str]:
+    """
+    Load local cache without hitting OD.
+    Accepts flexible shapes:
+      - {"by_num": {"123":"COMP EX", ...}}
+      - {"types": [{"AppointmentTypeNum":123,"AppointmentTypeName":"COMP EX"}, ...]}
+      - Or a plain {"123":"COMP EX", ...}
+    """
+    data = load_json_or(path, {})
+    by_num: Dict[int, str] = {}
+
+    if isinstance(data, dict) and data.get("by_num"):
+        for k, v in (data["by_num"] or {}).items():
+            ik = _try_int(k)
+            if ik is not None and v:
+                by_num[ik] = str(v)
+        return by_num
+
+    if isinstance(data, dict) and isinstance(data.get("types"), list):
+        for t in data["types"]:
+            n = _try_int(t.get("AppointmentTypeNum"))
+            name = t.get("AppointmentTypeName") or t.get("Description") or t.get("Name")
+            if n is not None and name:
+                by_num[n] = str(name)
+        return by_num
+
+    if isinstance(data, dict):
+        # assume num->name
+        for k, v in data.items():
+            ik = _try_int(k)
+            if ik is not None and v:
+                by_num[ik] = str(v)
+        return by_num
+
+    # anything else → empty
+    return {}
+
+def appt_type_name_from_cache(appointment_type_num: Any) -> Optional[str]:
+    n = _try_int(appointment_type_num)
+    if n is None:
+        return None
+    return _APPT_TYPE_BY_NUM.get(n)
 
 # =========================
 # === GOOGLE DRIVE STATE ==
@@ -546,6 +601,8 @@ def fetch_appointments_for_window(clinic: int, start: datetime.datetime, end: da
     }
     all_appts: List[Dict[str, Any]] = []
     valid_ops = set(CLINIC_OPERATORY_FILTERS.get(clinic, []))
+    # prepare Broken-type allowlist (normalized)
+    broken_allow = set(n.strip().upper() for n in CLINIC_BROKEN_APPOINTMENT_TYPE_FILTERS.get(clinic, []))
 
     _ = get_operatories(clinic)
 
@@ -565,8 +622,22 @@ def fetch_appointments_for_window(clinic: int, start: datetime.datetime, end: da
 
             for a in chunk:
                 opnum = a.get('Op') or a.get('OperatoryNum')
-                if opnum in valid_ops:
-                    all_appts.append(a)
+                if opnum not in valid_ops:
+                    continue
+
+                # NEW: filter Broken appts by appointment type name using local cache
+                if status == 'Broken':
+                    type_name = appt_type_name_from_cache(a.get('AppointmentTypeNum')) \
+                                or (a.get('AppointmentTypeName') or a.get('AppointmentType') or '')
+                    name_norm = (type_name or '').strip().upper()
+                    if not name_norm:
+                        logger.debug(f"Skip Broken AptNum {a.get('AptNum')} – unknown AppointmentType (not in cache)")
+                        continue
+                    if name_norm not in broken_allow:
+                        # not in clinic allow-list → skip
+                        continue
+
+                all_appts.append(a)
             # be gentle on OD between queries, too
             time.sleep(OD_RATE_LIMIT_SECONDS)
 
@@ -1102,6 +1173,14 @@ def main_once(dry_run: bool = False, force_deep_sync: bool = False):
     # Connect Drive and seed state locally if needed
     DRIVE.connect()
     pull_all_from_drive()
+
+    # Load appt types cache once
+    global _APPT_TYPE_BY_NUM, _APPT_TYPES_LOADED
+    if not _APPT_TYPES_LOADED:
+        _APPT_TYPE_BY_NUM = load_appointment_types_cache()
+        _APPT_TYPES_LOADED = True
+        if not _APPT_TYPE_BY_NUM:
+            logger.warning("appointment_types_cache.json not found or empty; Broken-type filtering may skip unknowns.")
 
     last_sync = load_last_sync()                  # clinic → iso str
     sent_map = load_json_or(SENT_APPTS_FILE, {})  # AptNum → {last_sent_tstamp}
