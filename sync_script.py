@@ -748,7 +748,7 @@ def _calendar_id_in_event(a: Dict[str, Any]) -> Optional[str]:
 def ghl_get_contact_appointments(contact_id: str) -> List[Dict[str, Any]]:
     if not contact_id:
         return []
-    url = f"{GHL_API_BASE}/contacts/{contact_id}/appointments"}
+    url = f"{GHL_API_BASE}/contacts/{contact_id}/appointments"
     try:
         r = get_session().get(url, headers=ghl_headers(), timeout=REQUEST_TIMEOUT)
         _debug_write("ghl_contact_appts_req.json", {"url": url, "contactId": contact_id})
