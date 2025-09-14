@@ -15,6 +15,8 @@ What this does:
     * If existing contact → fetch that contact’s appointments, filter to same clinic-local day
       **and** same calendar, pick the **latest by `dateUpdated`/`updatedAt`**, then UPDATE it;
       if none match, CREATE a new one.
+- On **update failure**: **do not create** a new event. Log the error and record to a
+  local dead-letter queue (`failed_updates.json`) for investigation.
 - Appointment status mapping:
     Broken → cancelled
     Complete → showed
@@ -107,6 +109,7 @@ SENT_APPTS_FILE = 'sent_appointments.json'      # AptNum → { last_sent_tstamp 
 APPT_SNAPSHOT_FILE = 'appointments_store.json'  # AptNum → last OD snapshot used
 GHL_MAP_FILE = 'ghl_appointments_map.json'      # AptNum → { contactId, eventId, calendarId, clinic }
 GHL_CONTACTS_MAP_FILE = 'ghl_contacts_map.json' # PatNum → { contactId, phone, email, updatedAt }
+FAILED_UPDATES_FILE = 'failed_updates.json'     # AptNum → failure info (DLQ)
 
 # Performance / retry / pagination
 LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
@@ -370,6 +373,8 @@ def appt_type_name_from_cache(appointment_type_num: Any) -> Optional[str]:
 # =========================
 # === GOOGLE DRIVE STATE ==
 # =========================
+_FAILED_UPDATES: Dict[str, Any] = {}
+
 class DriveAdapter:
     """
     Google Drive storage for state files (Service Account).
@@ -561,6 +566,31 @@ def save_state(sent_map: Dict[str, Dict[str, str]], last_sync: Dict[int, Optiona
     atomic_save_json(APPT_SNAPSHOT_FILE, snapshot); DRIVE.push(APPT_SNAPSHOT_FILE)
     atomic_save_json(GHL_MAP_FILE, ghl_map); DRIVE.push(GHL_MAP_FILE)
     atomic_save_json(GHL_CONTACTS_MAP_FILE, {str(k): v for k, v in contact_map.items()}); DRIVE.push(GHL_CONTACTS_MAP_FILE)
+
+def load_failed_updates() -> Dict[str, Any]:
+    return load_json_or(FAILED_UPDATES_FILE, {})
+
+def save_failed_updates(failed: Dict[str, Any]):
+    atomic_save_json(FAILED_UPDATES_FILE, failed)
+    # Optional Drive push if you've pre-created failed_updates.json in Drive:
+    # DRIVE.push(FAILED_UPDATES_FILE)
+
+def dlq_record(apt_num: str, clinic: int, event_id: Optional[str], contact_id: Optional[str],
+               err_code: Optional[int], err_msg: str):
+    now = datetime.datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+    item = _FAILED_UPDATES.get(apt_num, {})
+    item.update({
+        "aptnum": apt_num,
+        "clinic": clinic,
+        "eventId": event_id,
+        "contactId": contact_id,
+        "lastErrorCode": err_code,
+        "lastErrorMessage": (err_msg or "")[:1000],
+        "retryCount": item.get("retryCount", 0) + 1,
+        "firstSeen": item.get("firstSeen") or now,
+        "lastTried": now,
+    })
+    _FAILED_UPDATES[apt_num] = item
 
 # =========================
 # ===== OD FETCH ==========
@@ -914,9 +944,9 @@ def ghl_create_appointment(calendar_id: str, contact_id: str, assigned_user_id: 
 
 def ghl_update_appointment(event_id: str, calendar_id: str, assigned_user_id: Optional[str],
                            title: str, start_dt: datetime.datetime, end_dt: datetime.datetime,
-                           status: str) -> bool:
+                           status: str) -> Tuple[bool, Optional[int], str]:
     if not event_id:
-        return False
+        return False, None, "missing event_id"
     url = f"{GHL_API_BASE}/calendars/events/appointments/{event_id}"
     body = {
         "calendarId": calendar_id,
@@ -932,11 +962,20 @@ def ghl_update_appointment(event_id: str, calendar_id: str, assigned_user_id: Op
     try:
         r = get_session().put(url, headers=ghl_headers(), json=body, timeout=REQUEST_TIMEOUT)
         _debug_write("ghl_update_event_req.json", {"url": url, "body": body, "eventId": event_id})
-        r.raise_for_status()
-        return True
+        if 200 <= r.status_code < 300:
+            return True, r.status_code, ""
+        err_txt = ""
+        try:
+            err_txt = r.text
+        except Exception:
+            pass
+        logger.error(f"GHL update appointment failed: HTTP {r.status_code} body={err_txt}")
+        return False, r.status_code, err_txt
     except requests.RequestException as e:
-        logger.error(f"GHL update appointment failed: {e} body={e.response.text if getattr(e,'response',None) else ''}")
-        return False
+        code = getattr(getattr(e, "response", None), "status_code", None)
+        body = getattr(getattr(e, "response", None), "text", None) or str(e)
+        logger.error(f"GHL update appointment failed: {e} body={body}")
+        return False, code, body
 
 # =========================
 # ===== STATE & CACHE =====
@@ -1108,7 +1147,7 @@ def process_one_appt(appt: Dict[str, Any],
     mapped = ghl_map.get(apt_num)
     if mapped and mapped.get('eventId'):
         event_id = mapped['eventId']
-        ok = ghl_update_appointment(event_id, calendar_id, assigned_user_id, title, start_local, end_local, status)
+        ok, code, msg = ghl_update_appointment(event_id, calendar_id, assigned_user_id, title, start_local, end_local, status)
         if ok:
             mapped.update({"contactId": contact_id, "calendarId": calendar_id, "clinic": clinic})
             ghl_map[apt_num] = mapped
@@ -1117,13 +1156,8 @@ def process_one_appt(appt: Dict[str, Any],
             ghl_tag_contact(contact_id, "fromopendental")
             return event_id
         else:
-            logger.warning(f"Apt {apt_num}: mapped update failed — creating fresh and remapping")
-            new_id = ghl_create_appointment(calendar_id, contact_id, assigned_user_id, title, start_local, end_local, status)
-            if new_id:
-                ghl_map[apt_num] = {"contactId": contact_id, "eventId": new_id, "calendarId": calendar_id, "clinic": clinic}
-                # Tag the contact on create
-                ghl_tag_contact(contact_id, "fromopendental")
-                return new_id
+            dlq_record(apt_num, clinic, event_id, contact_id, code, msg)
+            logger.error(f"Apt {apt_num}: mapped update failed (HTTP {code}). NOT creating a new event. Logged to DLQ.")
             return None
 
     # ===== Not mapped =====
@@ -1143,7 +1177,7 @@ def process_one_appt(appt: Dict[str, Any],
     contact_events = ghl_get_contact_appointments(contact_id)
     candidate_event_id = pick_latest_same_day_event(contact_events, start_local, calendar_id)
     if candidate_event_id:
-        ok = ghl_update_appointment(candidate_event_id, calendar_id, assigned_user_id, title, start_local, end_local, status)
+        ok, code, msg = ghl_update_appointment(candidate_event_id, calendar_id, assigned_user_id, title, start_local, end_local, status)
         if ok:
             ghl_map[apt_num] = {"contactId": contact_id, "eventId": candidate_event_id, "calendarId": calendar_id, "clinic": clinic}
             logger.info(f"✓ Reconciled via latest same-day event {candidate_event_id} for AptNum {apt_num}")
@@ -1151,7 +1185,9 @@ def process_one_appt(appt: Dict[str, Any],
             ghl_tag_contact(contact_id, "fromopendental")
             return candidate_event_id
         else:
-            logger.warning(f"Apt {apt_num}: same-day update failed — creating fresh")
+            dlq_record(apt_num, clinic, candidate_event_id, contact_id, code, msg)
+            logger.error(f"Apt {apt_num}: same-day update failed (HTTP {code}). NOT creating a new event. Logged to DLQ.")
+            return None
 
     # No same-day match → create new
     new_event_id = ghl_create_appointment(calendar_id, contact_id, assigned_user_id, title, start_local, end_local, status)
@@ -1213,6 +1249,8 @@ def main_once(dry_run: bool = False, force_deep_sync: bool = False):
     snapshot = load_json_or(APPT_SNAPSHOT_FILE, {})
     ghl_map = load_json_or(GHL_MAP_FILE, {})
     contact_map = load_contact_map()
+    global _FAILED_UPDATES
+    _FAILED_UPDATES = load_failed_updates()
 
     patient_cache = load_patient_cache()
     total = 0
@@ -1265,6 +1303,8 @@ def main_once(dry_run: bool = False, force_deep_sync: bool = False):
             time.sleep(OD_RATE_LIMIT_SECONDS)
 
         # Process each
+        successes = 0
+        max_success_ts: Optional[datetime.datetime] = None
         for a in to_process:
             aptnum = str(a.get('AptNum', ''))
             if dry_run:
@@ -1276,14 +1316,19 @@ def main_once(dry_run: bool = False, force_deep_sync: bool = False):
                 total += 1
                 sent_map.setdefault(aptnum, {})['last_sent_tstamp'] = a.get('DateTStamp', '')
                 snapshot[aptnum] = a
+                successes += 1
+                ts = parse_time(a.get('DateTStamp', ''))
+                if ts and (max_success_ts is None or ts > max_success_ts):
+                    max_success_ts = ts
 
-        # advance last_sync only if we processed items
-        if to_process:
-            last_sync[clinic] = datetime.datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+        # advance last_sync only if we had at least one success; use max successful DateTStamp
+        if successes > 0 and max_success_ts:
+            last_sync[clinic] = max_success_ts.astimezone(timezone.utc).isoformat()
 
     # Persist state + Drive push
     save_patient_cache(patient_cache)  # local only; you’re not caching this in Actions
     save_state(sent_map, last_sync, snapshot, ghl_map, contact_map)
+    save_failed_updates(_FAILED_UPDATES)
     logger.info(f"Done. Created/updated {total} appointments.")
 
 def main_loop(dry_run: bool = False, force_deep_sync: bool = False):
