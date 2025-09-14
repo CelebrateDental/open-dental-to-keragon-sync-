@@ -555,7 +555,7 @@ def pull_all_from_drive():
     """
     Local-first: only pull a file from Drive if it does NOT exist locally.
     """
-    for f in (STATE_FILE, SENT_APPTS_FILE, APPT_SNAPSHOT_FILE, GHL_MAP_FILE, GHL_CONTACTS_MAP_FILE):
+    for f in (STATE_FILE, SENT_APPTS_FILE, APPT_SNAPSHOT_FILE, GHL_MAP_FILE, GHL_CONTACTS_MAP_FILE, FAILED_UPDATES_FILE):
         if not os.path.exists(f):
             DRIVE.pull(f)
 
@@ -573,7 +573,7 @@ def load_failed_updates() -> Dict[str, Any]:
 def save_failed_updates(failed: Dict[str, Any]):
     atomic_save_json(FAILED_UPDATES_FILE, failed)
     # Optional Drive push if you've pre-created failed_updates.json in Drive:
-    # DRIVE.push(FAILED_UPDATES_FILE)
+    DRIVE.push(FAILED_UPDATES_FILE)
 
 def dlq_record(apt_num: str, clinic: int, event_id: Optional[str], contact_id: Optional[str],
                err_code: Optional[int], err_msg: str):
