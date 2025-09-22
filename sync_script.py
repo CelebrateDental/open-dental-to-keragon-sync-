@@ -681,6 +681,12 @@ def fetch_appointments_for_window(clinic: int, start: datetime.datetime, end: da
                 if opnum not in valid_ops:
                     continue
 
+                # >>> NEW RULE: exclude any appointment whose Note contains "[fromGHL]"
+                note_val = a.get('Note') or ''
+                if isinstance(note_val, str) and '[fromGHL]' in note_val:
+                    logger.debug(f"Skip AptNum {a.get('AptNum')} – Note contains [fromGHL]")
+                    continue
+
                 # NEW: filter Broken appts by appointment type name using local cache
                 if status == 'Broken':
                     type_name = appt_type_name_from_cache(a.get('AppointmentTypeNum')) \
