@@ -12,9 +12,11 @@ What this does:
 - If AptNum already mapped to a GHL event → UPDATE that exact event (even if date/time changed).
 - If AptNum not mapped:
     * If contact is NEW → CREATE new appointment immediately (no prior fetch).
-    * If existing contact → fetch that contact’s appointments, filter to same clinic-local day
-      **and** same calendar, pick the **latest by `dateUpdated`/`updatedAt`**, then UPDATE it;
-      if none match, CREATE a new one.
+    * If existing contact → **NEW BEHAVIOR**: look up AptNum in the Drive-mirrored
+      reconciliation file `ghl_od_appointments_map.json` (eventId→info). If found, use
+      that eventId for UPDATE; also refresh `updatedAt` in that file and update the main
+      map. If not found, CREATE a new event.
+      (We no longer fetch all GHL appointments to pick "latest same-day".)
 - On **update failure**: **do not create** a new event. Log the error and record to a
   local dead-letter queue (`failed_updates.json`) for investigation.
 - Appointment status mapping:
@@ -110,6 +112,8 @@ APPT_SNAPSHOT_FILE = 'appointments_store.json'  # AptNum → last OD snapshot us
 GHL_MAP_FILE = 'ghl_appointments_map.json'      # AptNum → { contactId, eventId, calendarId, clinic }
 GHL_CONTACTS_MAP_FILE = 'ghl_contacts_map.json' # PatNum → { contactId, phone, email, updatedAt }
 FAILED_UPDATES_FILE = 'failed_updates.json'     # AptNum → failure info (DLQ)
+# NEW: reconciliation file (Drive-mirrored; eventId → info containing aptNum)
+GHL2OD_APPTS_FILE = 'ghl_od_appointments_map.json'
 
 # Performance / retry / pagination
 LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
@@ -555,7 +559,7 @@ def pull_all_from_drive():
     """
     Local-first: only pull a file from Drive if it does NOT exist locally.
     """
-    for f in (STATE_FILE, SENT_APPTS_FILE, APPT_SNAPSHOT_FILE, GHL_MAP_FILE, GHL_CONTACTS_MAP_FILE, FAILED_UPDATES_FILE):
+    for f in (STATE_FILE, SENT_APPTS_FILE, APPT_SNAPSHOT_FILE, GHL_MAP_FILE, GHL_CONTACTS_MAP_FILE, FAILED_UPDATES_FILE, GHL2OD_APPTS_FILE):
         if not os.path.exists(f):
             DRIVE.pull(f)
 
@@ -616,7 +620,7 @@ def od_get_paginated(endpoint: str, params: Dict[str, Any]) -> Optional[List[Any
     offset = 0
     while True:
         p = dict(params); p['limit'] = PAGE_SIZE; p['offset'] = offset
-        chunk = od_get(endpoint, p)
+        chunk = od_get(endpoint, p) or []
         if chunk is None:
             return None
         out.extend(chunk)
@@ -879,6 +883,7 @@ def _calendar_id_in_event(a: Dict[str, Any]) -> Optional[str]:
     return a.get("calendarId") or (a.get("calendar") or {}).get("id")
 
 def ghl_get_contact_appointments(contact_id: str) -> List[Dict[str, Any]]:
+    # NOTE: kept for completeness; not used in the unmapped-appointment path anymore.
     if not contact_id:
         return []
     url = f"{GHL_API_BASE}/contacts/{contact_id}/appointments"
@@ -898,8 +903,7 @@ def pick_latest_same_day_event(contact_events: List[Dict[str, Any]],
                                od_start_local: datetime.datetime,
                                calendar_id: str) -> Optional[str]:
     """
-    Filter to events on the SAME clinic-local day AND same calendar,
-    then choose the one with the greatest 'updated' timestamp.
+    (Legacy) Not used in the new flow. Keeping for reference.
     """
     od_day = clinic_local_date(od_start_local)
     same_day_events: List[Dict[str, Any]] = []
@@ -1021,6 +1025,37 @@ def load_contact_map() -> Dict[int, Any]:
             pass
     return out
 
+def load_ghl2od_map() -> Dict[str, str]:
+    """
+    Load mapping from ghl_od_appointments_map.json:
+      {
+        "<eventId>": { "aptNum": "3821874", "patNum": "...", ... },
+        ...
+      }
+    Returns AptNum -> EventId for fast lookup.
+    """
+    data = load_json_or(GHL2OD_APPTS_FILE, {})
+    apt_to_event: Dict[str, str] = {}
+    if isinstance(data, dict):
+        for event_id, info in data.items():
+            if not isinstance(info, dict):
+                continue
+            apt = str(info.get("aptNum", "")).strip()
+            if apt:
+                apt_to_event[apt] = event_id
+    return apt_to_event
+
+def save_ghl2od_entry_updated_at(event_id: str):
+    """
+    Update only the 'updatedAt' field for the given event in ghl_od_appointments_map.json,
+    preserving the file's existing structure/fields exactly, then push to Drive.
+    """
+    data = load_json_or(GHL2OD_APPTS_FILE, {})
+    if isinstance(data, dict) and event_id in data and isinstance(data[event_id], dict):
+        data[event_id]["updatedAt"] = datetime.datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+        atomic_save_json(GHL2OD_APPTS_FILE, data)
+        DRIVE.push(GHL2OD_APPTS_FILE)
+
 # =========================
 # ===== CORE: PROCESS =====
 # =========================
@@ -1107,8 +1142,9 @@ def process_one_appt(appt: Dict[str, Any],
           * ensure contact by phone (create if needed) and record contactId in contact_map.
           * If it's a NEW contact → CREATE appointment immediately (no need to fetch appointments).
           * If not new:
-              - fetch the contact's appointments; pick the LATEST same-day event (by dateUpdated/updatedAt) on the SAME calendar → UPDATE.
-              - if none → CREATE new event.
+              - **NEW**: look up AptNum in ghl_od_appointments_map.json (Drive-mirrored).
+                If found, UPDATE that eventId and refresh updatedAt in that file; also update main map.
+                If none → CREATE a new event.
           * store AptNum -> eventId mapping for future updates.
       - After **every successful CREATE or UPDATE**, tag the contact with **fromopendental**.
     """
@@ -1179,23 +1215,27 @@ def process_one_appt(appt: Dict[str, Any],
         logger.error(f"Apt {apt_num}: failed to create event for new contact")
         return None
 
-    # Existing contact (but AptNum not mapped) → pick latest same-day event by updatedAt, same calendar only
-    contact_events = ghl_get_contact_appointments(contact_id)
-    candidate_event_id = pick_latest_same_day_event(contact_events, start_local, calendar_id)
+    # Existing contact (but AptNum not mapped) → check the Drive-mirrored reconciliation file
+    ghl2od_map = load_ghl2od_map()
+    candidate_event_id = ghl2od_map.get(apt_num)
+
     if candidate_event_id:
         ok, code, msg = ghl_update_appointment(candidate_event_id, calendar_id, assigned_user_id, title, start_local, end_local, status)
         if ok:
+            # Update main map (memory; persisted via save_state())
             ghl_map[apt_num] = {"contactId": contact_id, "eventId": candidate_event_id, "calendarId": calendar_id, "clinic": clinic}
-            logger.info(f"✓ Reconciled via latest same-day event {candidate_event_id} for AptNum {apt_num}")
+            logger.info(f"✓ Reconciled via {GHL2OD_APPTS_FILE} event {candidate_event_id} for AptNum {apt_num}")
             # Tag the contact on update
             ghl_tag_contact(contact_id, "fromopendental")
+            # Refresh updatedAt in reconciliation file and push
+            save_ghl2od_entry_updated_at(candidate_event_id)
             return candidate_event_id
         else:
             dlq_record(apt_num, clinic, candidate_event_id, contact_id, code, msg)
-            logger.error(f"Apt {apt_num}: same-day update failed (HTTP {code}). NOT creating a new event. Logged to DLQ.")
+            logger.error(f"Apt {apt_num}: update via {GHL2OD_APPTS_FILE} failed (HTTP {code}). NOT creating new. Logged to DLQ.")
             return None
 
-    # No same-day match → create new
+    # Not found in reconciliation file → create new
     new_event_id = ghl_create_appointment(calendar_id, contact_id, assigned_user_id, title, start_local, end_local, status)
     if new_event_id:
         ghl_map[apt_num] = {"contactId": contact_id, "eventId": new_event_id, "calendarId": calendar_id, "clinic": clinic}
@@ -1353,7 +1393,7 @@ def main_loop(dry_run: bool = False, force_deep_sync: bool = False):
 # =========================
 if __name__ == "__main__":
     import argparse
-    p = argparse.ArgumentParser(description="OpenDental → GHL sync (AptNum-first, same-day reconciliation, clinic routing, contact tagging)")
+    p = argparse.ArgumentParser(description="OpenDental → GHL sync (AptNum-first, reconciliation via Drive map, clinic routing, contact tagging)")
     p.add_argument("--dry-run", action="store_true", help="Log actions without calling GHL")
     p.add_argument("--force-deep-sync", action="store_true", help="Use deep sync window this cycle")
     p.add_argument("--once", action="store_true", help="Run once and exit")
