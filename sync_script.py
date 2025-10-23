@@ -849,7 +849,7 @@ def ghl_tag_contact(contact_id: str, tag: str = "fromopendental") -> bool:
 
 def map_appt_status_to_ghl(status: str) -> str:
     s = (status or "").strip().lower()
-    if s == "broken":
+    if s == "broken" or s == "UnschedList":
         return "cancelled"
     if s == "complete":
         return "showed"
