@@ -152,7 +152,7 @@ CLINIC_BROKEN_APPOINTMENT_TYPE_FILTERS: Dict[int, List[str]] = {
     9034: ["COMP EX", "COMP EX CHILD"],
     9035: ["CASH CONSULT", "INSURANCE CONSULT", "INS CONSULT"]
 }
-VALID_STATUSES = {'Scheduled', 'Complete', 'Broken'}
+VALID_STATUSES = {'Scheduled', 'Complete', 'Broken', 'UnschedList'}
 
 REQUIRED_APPOINTMENT_FIELDS = [
     'AptNum', 'AptDateTime', 'AptStatus', 'PatNum', 'Op', 'OperatoryNum',
@@ -675,15 +675,20 @@ def fetch_appointments_for_window(clinic: int, start: datetime.datetime, end: da
     for status in VALID_STATUSES:
         for op in CLINIC_OPERATORY_FILTERS.get(clinic, []):
             p = dict(params_base); p['AptStatus'] = status; p['Op'] = str(op)
+
+            if status == "UnschedList":
+                p['Op'] = "0"
+
             chunk = od_get_paginated('appointments', p) or []
 
             # row-count per status/op query
-            logger.debug(f"Clinic {clinic}: AptStatus={status} Op={op} -> {len(chunk)} returned")
+            logger.debug(f"Clinic {clinic}: AptStatus={status} Op={p['Op']} -> {len(chunk)} returned")
 
             for a in chunk:
-                opnum = a.get('Op') or a.get('OperatoryNum')
-                if opnum not in valid_ops:
-                    continue
+                if not status == "UnschedList":
+                    opnum = a.get('Op') or a.get('OperatoryNum')
+                    if opnum not in valid_ops:
+                        continue
 
                 # >>> NEW RULE: exclude any appointment whose Note contains "[fromGHL]"
                 note_val = a.get('Note') or ''
@@ -706,6 +711,11 @@ def fetch_appointments_for_window(clinic: int, start: datetime.datetime, end: da
                 all_appts.append(a)
             # be gentle on OD between queries, too
             time.sleep(OD_RATE_LIMIT_SECONDS)
+
+            # There is no need to iterate over all the OP numbers for the clinic
+            # if we are only searching for the unscheduled list (always op=0)
+            if status == "UnschedList":
+                break
 
     # de-dupe…
     uniq: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
@@ -809,7 +819,14 @@ def ghl_upsert_contact(patient: Dict[str, Any], clinic_num: int) -> Optional[str
         _debug_write("ghl_contact_upsert_resp.json", j)
         return (j.get("contact") or {}).get("id") or j.get("id")
     except requests.RequestException as e:
-        logger.error(f"GHL upsert contact failed: {e} body={e.response.text if getattr(e,'response',None) else ''}")
+        resp = getattr(e, 'response', None)
+        resp_text = ''
+        try:
+            if resp is not None:
+                resp_text = getattr(resp, 'text', '') or ''
+        except Exception:
+            resp_text = ''
+        logger.error(f"GHL upsert contact failed: {e} body={resp_text}")
         return None
 
 def ghl_tag_contact(contact_id: str, tag: str = "fromopendental") -> bool:
@@ -949,7 +966,8 @@ def ghl_create_appointment(calendar_id: str, contact_id: str, assigned_user_id: 
         _debug_write("ghl_create_event_resp.json", j)
         return j.get('id') or j.get('eventId') or j.get('appointmentId')
     except requests.RequestException as e:
-        logger.error(f"GHL create appointment failed: {e} body={e.response.text if getattr(e,'response',None) else ''}")
+        resp_text = getattr(getattr(e, 'response', None), 'text', '') or ''
+        logger.error(f"GHL create appointment failed: {e} body={resp_text}")
         return None
 
 def ghl_update_appointment(event_id: str, calendar_id: str, assigned_user_id: Optional[str],
