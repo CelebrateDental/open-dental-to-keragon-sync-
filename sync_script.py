@@ -609,7 +609,8 @@ def od_get(endpoint: str, params: Dict[str, Any]) -> Optional[List[Any]]:
         _debug_write(f"od_{endpoint}_resp.json", data)
         return data if isinstance(data, list) else [data]
     except requests.RequestException as e:
-        body = e.response.text if getattr(e, 'response', None) else ''
+        resp_obj = getattr(e, 'response', None)
+        body = getattr(resp_obj, 'text', '') if resp_obj is not None else ''
         logger.error(f"OD GET failed {endpoint}: {e} {body}")
         return None
 
@@ -650,6 +651,19 @@ def get_operatories(clinic: int) -> List[Dict[str, Any]]:
         except Exception:
             pass
     return ops
+
+def fetch_appointment_history(aptnum: str) -> List[Dict[str, Any]]:
+    if not aptnum:
+        return []
+    history = od_get('histappointments', {'AptNum': str(aptnum)}) or []
+    return history if isinstance(history, list) else []
+
+def _history_entry_timestamp(entry: Dict[str, Any]) -> datetime.datetime:
+    for key in ('DateTStamp', 'SecDateTEntry', 'SecDateTEdit', 'ChangedDate'):
+        ts = parse_time(entry.get(key)) if entry else None
+        if ts:
+            return ts
+    return datetime.datetime.min.replace(tzinfo=timezone.utc)
 
 
 def fetch_appointments_for_window(clinic: int, start: datetime.datetime, end: datetime.datetime) -> List[Dict[str, Any]]:
@@ -724,6 +738,23 @@ def fetch_appointments_for_window(clinic: int, start: datetime.datetime, end: da
         uniq[key] = a
     result = list(uniq.values())
 
+    for appointment in result:
+        if appointment.get('AptStatus') == "UnschedList":
+            note_marker = None
+            history = fetch_appointment_history(str(appointment.get('AptNum', '')))
+            if history:
+                history_sorted = sorted(history, key=_history_entry_timestamp)
+                if len(history_sorted) >= 2:
+                    last_status = str((history_sorted[-1] or {}).get('AptStatus', '')).strip().lower()
+                    prev_hist_app_action = str((history_sorted[-2] or {}).get('HistApptAction', '')).strip().lower()
+                    if last_status == 'unschedlist' and prev_hist_app_action == 'cancelled':
+                        note_marker = "CANCELLED"
+                    if last_status == 'unschedlist' and prev_hist_app_action == 'missed':
+                        note_marker = "MISSED"
+
+            appointment['_ghl_note'] = note_marker
+            time.sleep(OD_RATE_LIMIT_SECONDS)
+
     # final count summary for the clinic
     logger.info(f"Clinic {clinic}: appointments raw={len(all_appts)} after-de-dupe={len(result)}")
     _debug_write(f"od_appts_clinic_{clinic}.json", {"start": start.isoformat(), "end": end.isoformat(), "appointments": result})
@@ -776,7 +807,7 @@ def ghl_build_contact_payload(patient: Dict[str, Any], clinic_num: int) -> Dict[
     # Required fields
     first = (patient.get("FName") or "").strip()
     last  = (patient.get("LName") or "").strip()
-    email = valid_email_or_unknown(patient.get("Email"))
+    email = valid_email_or_unknown(str(patient.get("Email") or ""))
     phone = normalize_phone_for_search(patient.get("WirelessPhone") or patient.get("WirelessPh") or patient.get("HmPhone") or "")
     dob   = (patient.get("Birthdate") or "").strip() or None  # prefer YYYY-MM-DD from OD
     address1 = (patient.get("Address") or "").strip()
@@ -944,7 +975,7 @@ def pick_latest_same_day_event(contact_events: List[Dict[str, Any]],
 
 def ghl_create_appointment(calendar_id: str, contact_id: str, assigned_user_id: Optional[str],
                            title: str, start_dt: datetime.datetime, end_dt: datetime.datetime,
-                           status: str) -> Optional[str]:
+                           status: str, note: Optional[str] = None) -> Optional[str]:
     url = f"{GHL_API_BASE}/calendars/events/appointments"
     body = {
         "calendarId": calendar_id,
@@ -958,6 +989,10 @@ def ghl_create_appointment(calendar_id: str, contact_id: str, assigned_user_id: 
         "ignoreFreeSlotValidation": True,
         "locationId": GHL_LOCATION_ID
     }
+
+    if note:
+        add_tag_patient(contact_id, note)
+
     try:
         r = get_session().post(url, headers=ghl_headers(), json=body, timeout=REQUEST_TIMEOUT)
         _debug_write("ghl_create_event_req.json", {"url": url, "body": body})
@@ -969,10 +1004,30 @@ def ghl_create_appointment(calendar_id: str, contact_id: str, assigned_user_id: 
         resp_text = getattr(getattr(e, 'response', None), 'text', '') or ''
         logger.error(f"GHL create appointment failed: {e} body={resp_text}")
         return None
+    
+def add_tag_patient(contact_id: str, note: str):
+    url = f"{GHL_API_BASE}/contacts/"+str(contact_id)+"/tags"
+
+    body = {
+        "tags": [note]
+    }
+
+    try:
+        r = get_session().post(url, headers=ghl_headers(), json=body, timeout=REQUEST_TIMEOUT)
+        _debug_write("ghl_create_event_req.json", {"url": url, "body": body})
+        r.raise_for_status()
+        j = r.json()
+        _debug_write("ghl_create_event_resp.json", j)
+        return j.get('tags')
+    except requests.RequestException as e:
+        resp_text = getattr(getattr(e, 'response', None), 'text', '') or ''
+        logger.error(f"GHL add tag failed: {e} body={resp_text}")
+        return None
 
 def ghl_update_appointment(event_id: str, calendar_id: str, assigned_user_id: Optional[str],
                            title: str, start_dt: datetime.datetime, end_dt: datetime.datetime,
-                           status: str) -> Tuple[bool, Optional[int], str]:
+                           status: str, note: Optional[str] = None, 
+                           contact_id: Optional[str] = None) -> Tuple[bool, Optional[int], str]:
     if not event_id:
         return False, None, "missing event_id"
     url = f"{GHL_API_BASE}/calendars/events/appointments/{event_id}"
@@ -987,6 +1042,10 @@ def ghl_update_appointment(event_id: str, calendar_id: str, assigned_user_id: Op
         "ignoreFreeSlotValidation": True,
         "locationId": GHL_LOCATION_ID
     }
+
+    if note and contact_id:
+        add_tag_patient(contact_id, note)
+
     try:
         r = get_session().put(url, headers=ghl_headers(), json=body, timeout=REQUEST_TIMEOUT)
         _debug_write("ghl_update_event_req.json", {"url": url, "body": body, "eventId": event_id})
@@ -1202,12 +1261,13 @@ def process_one_appt(appt: Dict[str, Any],
 
     title = f"{first} {last}".strip() or "Dental Appointment"
     status = map_appt_status_to_ghl(appt.get('AptStatus', ''))
+    ghl_note = appt.get('_ghl_note')
 
     # ===== If AptNum already mapped → update exact event =====
     mapped = ghl_map.get(apt_num)
     if mapped and mapped.get('eventId'):
         event_id = mapped['eventId']
-        ok, code, msg = ghl_update_appointment(event_id, calendar_id, assigned_user_id, title, start_local, end_local, status)
+        ok, code, msg = ghl_update_appointment(event_id, calendar_id, assigned_user_id, title, start_local, end_local, status, ghl_note, contact_id)
         if ok:
             mapped.update({"contactId": contact_id, "calendarId": calendar_id, "clinic": clinic})
             ghl_map[apt_num] = mapped
@@ -1223,7 +1283,7 @@ def process_one_appt(appt: Dict[str, Any],
     # ===== Not mapped =====
     if is_new_contact:
         # brand-new contact → no need to fetch appointments; just create
-        new_event_id = ghl_create_appointment(calendar_id, contact_id, assigned_user_id, title, start_local, end_local, status)
+        new_event_id = ghl_create_appointment(calendar_id, contact_id, assigned_user_id, title, start_local, end_local, status, ghl_note)
         if new_event_id:
             ghl_map[apt_num] = {"contactId": contact_id, "eventId": new_event_id, "calendarId": calendar_id, "clinic": clinic}
             logger.info(f"＋ Created event {new_event_id} for NEW contact, AptNum {apt_num}")
@@ -1238,7 +1298,7 @@ def process_one_appt(appt: Dict[str, Any],
     candidate_event_id = ghl2od_map.get(apt_num)
 
     if candidate_event_id:
-        ok, code, msg = ghl_update_appointment(candidate_event_id, calendar_id, assigned_user_id, title, start_local, end_local, status)
+        ok, code, msg = ghl_update_appointment(candidate_event_id, calendar_id, assigned_user_id, title, start_local, end_local, status, ghl_note, contact_id)
         if ok:
             # Update main map (memory; persisted via save_state())
             ghl_map[apt_num] = {"contactId": contact_id, "eventId": candidate_event_id, "calendarId": calendar_id, "clinic": clinic}
@@ -1254,7 +1314,7 @@ def process_one_appt(appt: Dict[str, Any],
             return None
 
     # Not found in reconciliation file → create new
-    new_event_id = ghl_create_appointment(calendar_id, contact_id, assigned_user_id, title, start_local, end_local, status)
+    new_event_id = ghl_create_appointment(calendar_id, contact_id, assigned_user_id, title, start_local, end_local, status, ghl_note)
     if new_event_id:
         ghl_map[apt_num] = {"contactId": contact_id, "eventId": new_event_id, "calendarId": calendar_id, "clinic": clinic}
         logger.info(f"＋ Created event {new_event_id} for AptNum {apt_num}")
