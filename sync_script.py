@@ -52,7 +52,6 @@ import threading
 import datetime
 import base64
 from typing import Any, Dict, List, Optional, Set, Tuple
-from dataclasses import dataclass
 from datetime import timezone, timedelta
 from zoneinfo import ZoneInfo
 
@@ -802,6 +801,15 @@ def ghl_search_contact_by_phone(phone: str) -> Optional[Dict[str, Any]]:
     except requests.RequestException as e:
         logger.error(f"GHL contact search failed: {e}")
         return None
+    
+def convert_language_to_ghl_format(language_od_format: str) -> str:
+    match language_od_format:
+        case "eng":
+            return "English"
+        case "spa":
+            return "Spanish"
+        case _:
+            return ""
 
 def ghl_build_contact_payload(patient: Dict[str, Any], clinic_num: int) -> Dict[str, Any]:
     # Required fields
@@ -813,6 +821,7 @@ def ghl_build_contact_payload(patient: Dict[str, Any], clinic_num: int) -> Dict[
     address1 = (patient.get("Address") or "").strip()
     postal = (patient.get("Zip") or patient.get("PostalCode") or "").strip()
     gender = (patient.get("Gender") or "").strip()
+    language = (patient.get("Language") or "").strip()
 
     payload: Dict[str, Any] = {
         "locationId": GHL_LOCATION_ID,
@@ -825,6 +834,13 @@ def ghl_build_contact_payload(patient: Dict[str, Any], clinic_num: int) -> Dict[
         "postalCode": postal or None,
         "gender": gender or None,
     }
+
+    if language:
+        payload['customFields'] = [{
+            "id": "hm8CJt0R3HVbZw2PWEhW",
+            "key": "contact.language",
+            "field_value": [convert_language_to_ghl_format(language)]
+        }]
 
     # Preferred: custom field for clinic
     if GHL_CUSTOM_FIELD_CLINIC_ID:
@@ -1161,13 +1177,14 @@ def validate_configuration() -> bool:
         return False
     return True
 
-def ghl_contact_payload_from_patient_like(first: str, last: str, email: str, phone: str) -> Dict[str, Any]:
-    return {"FName": first, "LName": last, "Email": email, "WirelessPhone": phone}
+def ghl_contact_payload_from_patient_like(first: str, last: str, email: str, phone: str, language) -> Dict[str, Any]:
+    return {"FName": first, "LName": last, "Email": email, "WirelessPhone": phone, "Language": language}
 
 def ensure_contact_id(first: str, last: str, email: str, phone: str,
                       pat_num: int,
                       clinic_num: int,
-                      contact_map: Dict[int, Any]) -> Tuple[Optional[str], bool]:
+                      contact_map: Dict[int, Any],
+                      language: str) -> Tuple[Optional[str], bool]:
     """
     Returns (contact_id, is_new_contact).
     Path:
@@ -1194,7 +1211,7 @@ def ensure_contact_id(first: str, last: str, email: str, phone: str,
         return cid, False
 
     # 3) create with full payload
-    patient_like = ghl_contact_payload_from_patient_like(first, last, email, phone)
+    patient_like = ghl_contact_payload_from_patient_like(first, last, email, phone, language)
     cid = ghl_upsert_contact(patient_like, clinic_num)
     if cid:
         contact_map[pat_num] = {
@@ -1245,6 +1262,7 @@ def process_one_appt(appt: Dict[str, Any],
     last  = (p.get('LName') or appt.get('LName') or '').strip()
     email = valid_email_or_unknown(p.get('Email', ''))
     phone = p.get('WirelessPhone') or p.get('HmPhone') or ''
+    language = (p.get('Language') or '').strip()
 
     # clinic routing
     calendar_id = pick_calendar_id(clinic)
@@ -1254,7 +1272,7 @@ def process_one_appt(appt: Dict[str, Any],
         return None
 
     # Ensure / create contact, capture whether it's new
-    contact_id, is_new_contact = ensure_contact_id(first, last, email, phone, pat_num, clinic, contact_map)
+    contact_id, is_new_contact = ensure_contact_id(first, last, email, phone, pat_num, clinic, contact_map, language)
     if not contact_id:
         logger.error(f"Apt {apt_num}: failed to ensure contact")
         return None
