@@ -746,9 +746,9 @@ def fetch_appointments_for_window(clinic: int, start: datetime.datetime, end: da
                 if len(history_sorted) >= 2:
                     last_status = str((history_sorted[-1] or {}).get('AptStatus', '')).strip().lower()
                     prev_hist_app_action = str((history_sorted[-2] or {}).get('HistApptAction', '')).strip().lower()
-                    if last_status == 'unschedlist' and prev_hist_app_action == 'cancelled':
+                    if last_status in ['unschedlist', 'broken'] and prev_hist_app_action == 'cancelled':
                         note_marker = "CANCELLED"
-                    if last_status == 'unschedlist' and prev_hist_app_action == 'missed':
+                    if last_status in ['unschedlist', 'broken'] and prev_hist_app_action == 'missed':
                         note_marker = "MISSED"
 
             appointment['_ghl_note'] = note_marker
