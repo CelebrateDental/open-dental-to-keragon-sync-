@@ -58,6 +58,9 @@ from zoneinfo import ZoneInfo
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # =========================
 # ====== CONFIG ===========
@@ -96,6 +99,9 @@ except Exception:
 # Custom Field ID for "Clinic" on GHL Contacts (required to store clinic number)
 # If missing, we will WARN and fall back to tagging (clinic:<num>).
 GHL_CUSTOM_FIELD_CLINIC_ID = os.environ.get('GHL_CUSTOM_FIELD_CLINIC_ID', '').strip()
+# Custom field that tracks family grouping (defaults to existing deployments)
+GHL_CUSTOM_FIELD_FAMILY_NUMBER_ID = os.environ.get('GHL_CUSTOM_FIELD_FAMILY_NUMBER_ID', 'nbPK7xXHaN20YAL0gAQY').strip()
+GHL_CUSTOM_FIELD_FAMILY_NUMBER_KEY = os.environ.get('GHL_CUSTOM_FIELD_FAMILY_NUMBER_KEY', 'contact.family_number').strip()
 
 # Google Drive (Service Account) for state
 GDRIVE_SA_JSON        = os.environ.get('GDRIVE_SERVICE_ACCOUNT_JSON', '').strip()
@@ -294,6 +300,49 @@ def normalize_phone_for_search(phone: str) -> str:
             return "+1" + pure  # default to +1; adjust per region if needed
         return pure
     return digits
+
+
+def detect_family_patients(patients: Dict[int, Dict[str, Any]]) -> Set[int]:
+    """Identify patients who belong to the same family based on shared wireless phone numbers."""
+    groups: Dict[str, List[Tuple[int, Dict[str, Any]]]] = {}
+    for pat_num, info in patients.items():
+        phone_raw = (info.get('WirelessPhone') or '').strip()
+        phone_key = normalize_phone_for_search(phone_raw)
+        if not phone_key:
+            continue
+        groups.setdefault(phone_key, []).append((pat_num, info))
+
+    family_pat_nums: Set[int] = set()
+
+    def _first_key(name: Optional[str]) -> str:
+        return re.sub(r"\s+", "", (name or '').strip().lower())
+
+    def _last_parts(name: Optional[str]) -> Set[str]:
+        return {part for part in re.split(r"\s+", (name or '').strip().lower()) if part}
+
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        prepared: List[Tuple[int, str, Set[str]]] = []
+        for pat_num, info in members:
+            prepared.append((pat_num, _first_key(info.get('FName')), _last_parts(info.get('LName'))))
+
+        for idx, (pat_num, first_key, last_parts) in enumerate(prepared):
+            if not first_key or not last_parts:
+                continue
+            for jdx, (other_pat_num, other_first_key, other_last_parts) in enumerate(prepared):
+                if idx == jdx:
+                    continue
+                if not other_first_key or not other_last_parts:
+                    continue
+                if first_key == other_first_key:
+                    continue
+                if last_parts.intersection(other_last_parts):
+                    family_pat_nums.add(pat_num)
+                    family_pat_nums.add(other_pat_num)
+                    break
+
+    return family_pat_nums
 
 # =========================
 # === APPT TYPE CACHE =====
@@ -721,6 +770,7 @@ def fetch_appointments_for_window(clinic: int, start: datetime.datetime, end: da
                         # not in clinic allow-list → skip
                         continue
 
+                a['is_family'] = False
                 all_appts.append(a)
             # be gentle on OD between queries, too
             time.sleep(OD_RATE_LIMIT_SECONDS)
@@ -754,6 +804,8 @@ def fetch_appointments_for_window(clinic: int, start: datetime.datetime, end: da
             appointment['_ghl_note'] = note_marker
             time.sleep(OD_RATE_LIMIT_SECONDS)
 
+    # Family detection moved out; appointments rely on patient data later
+
     # final count summary for the clinic
     logger.info(f"Clinic {clinic}: appointments raw={len(all_appts)} after-de-dupe={len(result)}")
     _debug_write(f"od_appts_clinic_{clinic}.json", {"start": start.isoformat(), "end": end.isoformat(), "appointments": result})
@@ -779,6 +831,7 @@ def ghl_search_contact_by_phone(phone: str) -> Optional[Dict[str, Any]]:
         return None
 
     url = f"{GHL_API_BASE}/contacts/search"
+    # print(phone, "phone")
     body = {"query": phone, "page": 1, "pageLimit": 1, "locationId": GHL_LOCATION_ID}
     try:
         r = get_session().post(url, headers=ghl_headers(), json=body, timeout=REQUEST_TIMEOUT)
@@ -795,6 +848,8 @@ def ghl_search_contact_by_phone(phone: str) -> Optional[Dict[str, Any]]:
             logger.error(f"GHL contact search failed: {r.status_code}. Reason: {reason}")
             return None
         data = r.json()
+        # print("data", data)
+        # print("body", body)
         _debug_write("ghl_contacts_search_resp.json", data)
         contacts = data.get('contacts') if isinstance(data, dict) else (data if isinstance(data, list) else [])
         return contacts[0] if contacts else None
@@ -811,7 +866,7 @@ def convert_language_to_ghl_format(language_od_format: str) -> str:
         case _:
             return ""
 
-def ghl_build_contact_payload(patient: Dict[str, Any], clinic_num: int) -> Dict[str, Any]:
+def ghl_build_contact_payload(patient: Dict[str, Any], clinic_num: int, is_family_member: bool) -> Dict[str, Any]:
     # Required fields
     first = (patient.get("FName") or "").strip()
     last  = (patient.get("LName") or "").strip()
@@ -822,29 +877,44 @@ def ghl_build_contact_payload(patient: Dict[str, Any], clinic_num: int) -> Dict[
     postal = (patient.get("Zip") or patient.get("PostalCode") or "").strip()
     gender = (patient.get("Gender") or "").strip()
     language = (patient.get("Language") or "").strip()
-
+    print("patient", patient)
     payload: Dict[str, Any] = {
         "locationId": GHL_LOCATION_ID,
         "firstName": first,
         "lastName": last,
         "email": email,
-        "phone": phone or None,
+        "phone": phone if not is_family_member else None,
         "dateOfBirth": dob,          # YYYY-MM-DD
         "address1": address1 or None,
         "postalCode": postal or None,
         "gender": gender or None,
     }
 
+    payload['customFields'] = []
+
     if language:
-        payload['customFields'] = [{
-            "id": "hm8CJt0R3HVbZw2PWEhW",
-            "key": "contact.language",
-            "field_value": [convert_language_to_ghl_format(language)]
-        }]
+        payload['customFields'].append(
+            {
+                "id": "hm8CJt0R3HVbZw2PWEhW",
+                "key": "contact.language",
+                "field_value": [convert_language_to_ghl_format(language)]
+            },
+        )
+
+    if is_family_member and GHL_CUSTOM_FIELD_FAMILY_NUMBER_ID:
+        # print("heyyy entra aqui")
+        family_field = {
+            "id": GHL_CUSTOM_FIELD_FAMILY_NUMBER_ID,
+            "field_value": phone
+        }
+        if GHL_CUSTOM_FIELD_FAMILY_NUMBER_KEY:
+            family_field["key"] = GHL_CUSTOM_FIELD_FAMILY_NUMBER_KEY
+        payload['customFields'].append(family_field)
+
 
     # Preferred: custom field for clinic
     if GHL_CUSTOM_FIELD_CLINIC_ID:
-        payload["customFields"] = [{"id": GHL_CUSTOM_FIELD_CLINIC_ID, "value": str(clinic_num)}]
+        payload["customFields"].append({"id": GHL_CUSTOM_FIELD_CLINIC_ID, "value": str(clinic_num)})
     else:
         # Fallback: tag the contact with clinic:<num>
         payload["tags"] = [f"clinic:{clinic_num}"]
@@ -852,12 +922,13 @@ def ghl_build_contact_payload(patient: Dict[str, Any], clinic_num: int) -> Dict[
     # Clean out null/empty list fields
     return {k: v for k, v in payload.items() if v not in (None, [], "")}
 
-def ghl_upsert_contact(patient: Dict[str, Any], clinic_num: int) -> Optional[str]:
+def ghl_upsert_contact(patient: Dict[str, Any], clinic_num: int, is_family_member: bool) -> Optional[str]:
     """
     POST /contacts/upsert
     """
     url = f"{GHL_API_BASE}/contacts/upsert"
-    body = ghl_build_contact_payload(patient, clinic_num)
+    body = ghl_build_contact_payload(patient, clinic_num, is_family_member)
+    # print(body, "final body")
     try:
         r = get_session().post(url, headers=ghl_headers(), json=body, timeout=REQUEST_TIMEOUT)
         _debug_write("ghl_contact_upsert_req.json", {"url": url, "body": body})
@@ -1184,7 +1255,8 @@ def ensure_contact_id(first: str, last: str, email: str, phone: str,
                       pat_num: int,
                       clinic_num: int,
                       contact_map: Dict[int, Any],
-                      language: str) -> Tuple[Optional[str], bool]:
+                      language: str,
+                      is_family: bool = False) -> Tuple[Optional[str], bool]:
     """
     Returns (contact_id, is_new_contact).
     Path:
@@ -1200,19 +1272,55 @@ def ensure_contact_id(first: str, last: str, email: str, phone: str,
     # 2) phone search
     phone_norm = normalize_phone_for_search(phone)
     found = ghl_search_contact_by_phone(phone_norm) if phone_norm else None
+    is_family_member = is_family
+
     if found and found.get('id'):
-        cid = found['id']
-        contact_map[pat_num] = {
-            "contactId": cid,
-            "phone": phone_norm,
-            "email": valid_email_or_unknown(email),
-            "updatedAt": datetime.datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
-        }
-        return cid, False
+        ghl_contact_lastname = found.get('lastNameLowerCase')
+        ghl_contact_lastname = ghl_contact_lastname.strip() # type: ignore
+        ghl_contact_lastname = ghl_contact_lastname.split()
+        ghl_contact_lastname = [word.replace(" ", "") for word in ghl_contact_lastname]
+
+        ghl_contact_lastname = set(ghl_contact_lastname)
+
+        od_contact_lastname = last.lower()
+        od_contact_lastname = od_contact_lastname.strip()
+        od_contact_lastname = od_contact_lastname.split()
+        od_contact_lastname = [word.replace(" ", "") for word in od_contact_lastname]
+        od_contact_lastname = set(od_contact_lastname)
+
+        ghl_contact_firstname = found.get('firstNameLowerCase')
+        ghl_contact_firstname = ghl_contact_firstname.replace(" ", "") # type: ignore
+
+        od_contact_firstname = first.lower()
+        od_contact_firstname = od_contact_firstname.replace(" ", "")
+
+
+        # print(od_contact_firstname, "od_contact_firstname")
+        # print(ghl_contact_firstname, "ghl_contact_firstname")
+        # print(od_contact_lastname, "od_contact_lastname")
+        # print(ghl_contact_lastname, "ghl_contact_lastname")
+        # print(ghl_contact_lastname.intersection(od_contact_lastname), "intersection")
+
+        if(ghl_contact_firstname == od_contact_firstname and od_contact_lastname == ghl_contact_lastname):
+            cid = found['id']
+            contact_map[pat_num] = {
+                "contactId": cid,
+                "phone": phone_norm,
+                "email": valid_email_or_unknown(email),
+                "updatedAt": datetime.datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+            }
+            return cid, False
+        
+        if(
+            ghl_contact_firstname != od_contact_firstname and 
+            len(ghl_contact_lastname.intersection(od_contact_lastname)) > 0
+        ):
+            # print("esoo entro aqui")
+            is_family_member = True
 
     # 3) create with full payload
     patient_like = ghl_contact_payload_from_patient_like(first, last, email, phone, language)
-    cid = ghl_upsert_contact(patient_like, clinic_num)
+    cid = ghl_upsert_contact(patient_like, clinic_num, is_family_member)
     if cid:
         contact_map[pat_num] = {
             "contactId": cid,
@@ -1271,8 +1379,11 @@ def process_one_appt(appt: Dict[str, Any],
         logger.error(f"Clinic {clinic}: missing calendar mapping")
         return None
 
+    # Flag family members so the contact payload can omit direct phone and rely on the shared custom field
+    is_family = bool(p.get('is_family') or appt.get('is_family'))
+
     # Ensure / create contact, capture whether it's new
-    contact_id, is_new_contact = ensure_contact_id(first, last, email, phone, pat_num, clinic, contact_map, language)
+    contact_id, is_new_contact = ensure_contact_id(first, last, email, phone, pat_num, clinic, contact_map, language, is_family)
     if not contact_id:
         logger.error(f"Apt {apt_num}: failed to ensure contact")
         return None
@@ -1433,16 +1544,35 @@ def main_once(dry_run: bool = False, force_deep_sync: bool = False):
         # Pull minimal patient info (prefer cache; if missing, fetch)
         patients: Dict[int, Dict[str, Any]] = {}
         for pn in sorted(pat_nums):
+            cached = patient_cache.get(pn)
+            if cached is not None:
+                patients[pn] = dict(cached)
+            else:
+                data = od_get(f"patients/{pn}", {}) or []
+                print('data', data)
+                pat = (data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else {}))
+                patients[pn] = dict(pat) if isinstance(pat, dict) else {}
+                patient_cache[pn] = dict(patients[pn])
+                # be gentle between OD patient fetches
+                time.sleep(OD_RATE_LIMIT_SECONDS)
+
+        family_pat_nums = detect_family_patients(patients)
+
+        for pn, info in patients.items():
+            is_family_flag = pn in family_pat_nums
+            info['is_family'] = is_family_flag
             if pn in patient_cache:
-                patients[pn] = patient_cache[pn]
-                continue
-            data = od_get(f"patients/{pn}", {}) or []
-            pat = (data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else {}))
-            if pat:
-                patients[pn] = pat
-                patient_cache[pn] = pat
-            # be gentle between OD patient fetches
-            time.sleep(OD_RATE_LIMIT_SECONDS)
+                patient_cache[pn]['is_family'] = is_family_flag
+
+        for appt in appts:
+            patnum_raw = appt.get('PatNum')
+            patnum_int: Optional[int] = None
+            if patnum_raw is not None:
+                try:
+                    patnum_int = int(patnum_raw)
+                except (TypeError, ValueError):
+                    patnum_int = None
+            appt['is_family'] = bool(patnum_int and patnum_int in family_pat_nums)
 
         # Process each
         successes = 0
