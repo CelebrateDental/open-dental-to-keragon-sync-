@@ -840,7 +840,7 @@ def ghl_search_contact_by_phone(phone: str) -> Optional[Dict[str, Any]]:
         return None
 
     url = f"{GHL_API_BASE}/contacts/search"
-    # print(phone, "phone")
+
     body = {"query": phone, "page": 1, "pageLimit": 1, "locationId": GHL_LOCATION_ID}
     try:
         r = get_session().post(url, headers=ghl_headers(), json=body, timeout=REQUEST_TIMEOUT)
@@ -857,8 +857,7 @@ def ghl_search_contact_by_phone(phone: str) -> Optional[Dict[str, Any]]:
             logger.error(f"GHL contact search failed: {r.status_code}. Reason: {reason}")
             return None
         data = r.json()
-        # print("data", data)
-        # print("body", body)
+
         _debug_write("ghl_contacts_search_resp.json", data)
         contacts = data.get('contacts') if isinstance(data, dict) else (data if isinstance(data, list) else [])
         return contacts[0] if contacts else None
@@ -886,7 +885,7 @@ def ghl_build_contact_payload(patient: Dict[str, Any], clinic_num: int, is_famil
     postal = (patient.get("Zip") or patient.get("PostalCode") or "").strip()
     gender = (patient.get("Gender") or "").strip()
     language = (patient.get("Language") or "").strip()
-    print("patient", patient)
+
     payload: Dict[str, Any] = {
         "locationId": GHL_LOCATION_ID,
         "firstName": first,
@@ -911,7 +910,6 @@ def ghl_build_contact_payload(patient: Dict[str, Any], clinic_num: int, is_famil
         )
 
     if is_family_member and GHL_CUSTOM_FIELD_FAMILY_NUMBER_ID:
-        # print("heyyy entra aqui")
         family_field = {
             "id": GHL_CUSTOM_FIELD_FAMILY_NUMBER_ID,
             "field_value": phone
@@ -937,7 +935,7 @@ def ghl_upsert_contact(patient: Dict[str, Any], clinic_num: int, is_family_membe
     """
     url = f"{GHL_API_BASE}/contacts/upsert"
     body = ghl_build_contact_payload(patient, clinic_num, is_family_member)
-    # print(body, "final body")
+
     try:
         r = get_session().post(url, headers=ghl_headers(), json=body, timeout=REQUEST_TIMEOUT)
         _debug_write("ghl_contact_upsert_req.json", {"url": url, "body": body})
@@ -1705,7 +1703,6 @@ def main_once(dry_run: bool = False, force_deep_sync: bool = False):
                 patients[pn] = dict(cached)
             else:
                 data = od_get(f"patients/{pn}", {}) or []
-                print('data', data)
                 pat = (data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else {}))
                 patients[pn] = dict(pat) if isinstance(pat, dict) else {}
                 patient_cache[pn] = dict(patients[pn])
