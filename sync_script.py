@@ -52,7 +52,7 @@ import threading
 import datetime
 import base64
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
-from datetime import timezone, timedelta
+from datetime import timezone, timedelta, time as timeConvertor
 from zoneinfo import ZoneInfo
 
 import requests
@@ -1276,6 +1276,34 @@ def ghl_update_appointment(event_id: str, calendar_id: str, assigned_user_id: Op
         logger.error(f"GHL update appointment failed: {e} body={body}")
         return False, code, body
 
+def ghl_update_appt_status(event_id: str, status: str, note: Optional[str] = None) -> Tuple[bool, Optional[int], str]:
+    if not event_id:
+        return False, None, "missing event_id"
+    url = f"{GHL_API_BASE}/calendars/events/appointments/{event_id}"
+    body = {
+        "appointmentStatus": status,
+        "ignoreFreeSlotValidation": True,
+        "locationId": GHL_LOCATION_ID
+    }
+
+    try:
+        r = get_session().put(url, headers=ghl_headers(), json=body, timeout=REQUEST_TIMEOUT)
+        _debug_write("ghl_update_event_req.json", {"url": url, "body": body, "eventId": event_id})
+        if 200 <= r.status_code < 300:
+            return True, r.status_code, ""
+        err_txt = ""
+        try:
+            err_txt = r.text
+        except Exception:
+            pass
+        logger.error(f"GHL update appointment status failed: HTTP {r.status_code} body={err_txt}")
+        return False, r.status_code, err_txt
+    except requests.RequestException as e:
+        code = getattr(getattr(e, "response", None), "status_code", None)
+        body = getattr(getattr(e, "response", None), "text", None) or str(e)
+        logger.error(f"GHL update appointment status failed: {e} body={body}")
+        return False, code, body
+
 # =========================
 # ===== STATE & CACHE =====
 # =========================
@@ -1673,6 +1701,45 @@ def main_once(dry_run: bool = False, force_deep_sync: bool = False):
         if not appts:
             logger.info(f"Clinic {clinic}: no appointments in window.")
             continue
+        
+        unique_patients = set()
+        saturday_payments = dict()
+
+        for a in appts:
+            if a.get('AptDateTime'):
+                apptDateTime = str(a.get('AptDateTime')).replace('Z', '+00:00')
+                apptDateTime = datetime.datetime.fromisoformat(apptDateTime)
+                apptDateTimeWeekday = apptDateTime.weekday()
+
+                if a.get('PatNum') and apptDateTimeWeekday == 5: # is saturday
+                    unique_patients.add(a['PatNum'])
+                    saturday_payments[a.get('AptNum')] = {
+                        'PatNum': a['PatNum'],
+                        'ApptDateTime': a['AptDateTime'],
+                        'Paid': False
+                    }
+
+        for p in unique_patients:
+            paymentsPatient = od_get(f"accountmodules/{p}/ServiceDateView", {}) or []
+
+            for saturday_appt, index_saturday in saturday_payments:
+                if(saturday_appt['PatNum'] == p):
+                    best_payment = {}
+                    best_payment_id = 0
+                    for payment, index_payment in paymentsPatient:
+                        if int(payment.get('Credit', 0)) == 50:
+                            if "prepay" in payment.get('Reference', '').lower():
+                                if payment.get('TransDate', '') <= saturday_appt['ApptDateTime']:
+                                    if best_payment_id == 0:
+                                        best_payment = payment
+
+                                    if best_payment['TransDate'] < payment['TransDate']:
+                                        best_payment = payment
+                                        best_payment_id = index_payment
+                    
+                    if best_payment_id != 0:
+                        saturday_appt[index_saturday]['Paid'] = True
+                        del paymentsPatient[best_payment_id]
 
         # Filter to new/updated by DateTStamp vs SENT_APPTS_FILE
         to_process: List[Dict[str, Any]] = []
@@ -1690,6 +1757,13 @@ def main_once(dry_run: bool = False, force_deep_sync: bool = False):
             if a.get('PatNum'):
                 try: pat_nums.add(int(a['PatNum']))
                 except: pass
+
+        for saturday_appt, appt_id in saturday_payments:
+            if saturday_appt['Paid']:
+                event_id = ghl_map.get(appt_id, None)
+
+                if event_id:
+                    ok, code, msg = ghl_update_appt_status(event_id, "confirmed")
 
         if not to_process:
             logger.info(f"Clinic {clinic}: nothing new/updated to send.")
