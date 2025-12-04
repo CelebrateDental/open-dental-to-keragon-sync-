@@ -80,6 +80,7 @@ GHL_LOCATION_ID = os.environ.get('GHL_LOCATION_ID', '').strip()
 GHL_API_VERSION = os.environ.get('GHL_API_VERSION', '2021-07-28')
 
 CONFIRMATION_STATUS_APPT_VALUE = 2936
+SATURDAY_PREPAYMENT_AMOUNT = 50
 
 # Clinic → calendarId (strict by clinic)
 # Provide as JSON, e.g. {"clinic:9034":"cal_XXXX","clinic:9035":"cal_YYYY","default":"cal_DEFAULT"}
@@ -1819,7 +1820,7 @@ def main_once(dry_run: bool = False, force_deep_sync: bool = False):
                         credit_int = int(float(credit_val))
                     except (TypeError, ValueError):
                         continue
-                    if credit_int != 50:
+                    if credit_int != SATURDAY_PREPAYMENT_AMOUNT:
                         continue
                     reference = str(payment.get('Reference', '') or '').lower()
                     if 'prepay' not in reference:
