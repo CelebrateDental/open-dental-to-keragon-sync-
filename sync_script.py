@@ -52,7 +52,7 @@ import threading
 import datetime
 import base64
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
-from datetime import timezone, timedelta, time as timeConvertor
+from datetime import timezone, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
@@ -78,6 +78,8 @@ GHL_API_TOKEN = (
 ).strip()
 GHL_LOCATION_ID = os.environ.get('GHL_LOCATION_ID', '').strip()
 GHL_API_VERSION = os.environ.get('GHL_API_VERSION', '2021-07-28')
+
+CONFIRMATION_STATUS_APPT_VALUE = 2936
 
 # Clinic → calendarId (strict by clinic)
 # Provide as JSON, e.g. {"clinic:9034":"cal_XXXX","clinic:9035":"cal_YYYY","default":"cal_DEFAULT"}
@@ -618,7 +620,10 @@ def pull_all_from_drive():
     """
     for f in (STATE_FILE, SENT_APPTS_FILE, APPT_SNAPSHOT_FILE, GHL_MAP_FILE, GHL_CONTACTS_MAP_FILE, FAILED_UPDATES_FILE, GHL2OD_APPTS_FILE):
         if not os.path.exists(f):
-            DRIVE.pull(f)
+            try:
+                DRIVE.pull(f)
+            except Exception as e:
+                logger.warning(f"Drive pull failed for {f}: {e}")
 
 def save_state(sent_map: Dict[str, Dict[str, str]], last_sync: Dict[int, Optional[str]],
                snapshot: Dict[str, Any], ghl_map: Dict[str, Any], contact_map: Dict[int, Any]):
@@ -723,7 +728,7 @@ def _history_entry_timestamp(entry: Dict[str, Any]) -> datetime.datetime:
     return datetime.datetime.min.replace(tzinfo=timezone.utc)
 
 
-def fetch_appointments_for_window(clinic: int, start: datetime.datetime, end: datetime.datetime) -> List[Dict[str, Any]]:
+def fetch_appointments_for_window(clinic: int, start: datetime.datetime, end: datetime.datetime) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     params_base = {
         'ClinicNum': str(clinic),
         'dateStart': start.astimezone(timezone.utc).date().strftime('%Y-%m-%d'),
@@ -731,6 +736,7 @@ def fetch_appointments_for_window(clinic: int, start: datetime.datetime, end: da
         'fields': ','.join(REQUIRED_APPOINTMENT_FIELDS),
     }
     all_appts: List[Dict[str, Any]] = []
+    special_saturday_appts: List[Dict[str, Any]] = []
     valid_ops = set(CLINIC_OPERATORY_FILTERS.get(clinic, []))
     # prepare Broken-type allowlist (normalized)
     broken_allow = set(n.strip().upper() for n in CLINIC_BROKEN_APPOINTMENT_TYPE_FILTERS.get(clinic, []))
@@ -765,6 +771,14 @@ def fetch_appointments_for_window(clinic: int, start: datetime.datetime, end: da
                 note_val = a.get('Note') or ''
                 if isinstance(note_val, str) and '[fromGHL]' in note_val:
                     logger.debug(f"Skip AptNum {a.get('AptNum')} – Note contains [fromGHL]")
+
+                    # if the appointment is not set for saturday, then skip it
+                    # we use another mechanism to handle saturday appts created from GHL
+                    apt_date_str = a.get('AptDateTime') or a.get('AptDate')
+                    apt_date = parse_time(apt_date_str)
+                    if apt_date and apt_date.weekday() == 5:
+                        a['is_family'] = False
+                        special_saturday_appts.append(a)
                     continue
 
                 # NEW: filter Broken appts by appointment type name using local cache
@@ -789,12 +803,19 @@ def fetch_appointments_for_window(clinic: int, start: datetime.datetime, end: da
             if status == "UnschedList":
                 break
 
-    # de-dupe…
+    # de-dupe regular appointments
     uniq: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
     for a in all_appts:
         key = (str(a.get('AptNum', '')), str(a.get('PatNum', '')), a.get('AptDateTime', ''))
         uniq[key] = a
     result = list(uniq.values())
+
+    # de-dupe special saturday appointments
+    uniq_saturday: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    for a in special_saturday_appts:
+        key = (str(a.get('AptNum', '')), str(a.get('PatNum', '')), a.get('AptDateTime', ''))
+        uniq_saturday[key] = a
+    special_saturday_result = list(uniq_saturday.values())
 
     for appointment in result:
         if appointment.get('AptStatus') == "UnschedList":
@@ -813,12 +834,11 @@ def fetch_appointments_for_window(clinic: int, start: datetime.datetime, end: da
             appointment['_ghl_note'] = note_marker
             time.sleep(OD_RATE_LIMIT_SECONDS)
 
-    # Family detection moved out; appointments rely on patient data later
-
     # final count summary for the clinic
-    logger.info(f"Clinic {clinic}: appointments raw={len(all_appts)} after-de-dupe={len(result)}")
-    _debug_write(f"od_appts_clinic_{clinic}.json", {"start": start.isoformat(), "end": end.isoformat(), "appointments": result})
-    return result
+    logger.info(f"Clinic {clinic}: appointments raw={len(all_appts)} after-de-dupe={len(result)} special-saturday={len(special_saturday_result)}")
+    _debug_write(f"od_appts_clinic_{clinic}.json", {"start": start.isoformat(), "end": end.isoformat(), "appointments": result, "special_saturday_appts": special_saturday_result})
+
+    return result, special_saturday_result
 
 
 # =========================
@@ -1188,6 +1208,10 @@ def pick_latest_same_day_event(contact_events: List[Dict[str, Any]],
 def ghl_create_appointment(calendar_id: str, contact_id: str, assigned_user_id: Optional[str],
                            title: str, start_dt: datetime.datetime, end_dt: datetime.datetime,
                            status: str, note: Optional[str] = None) -> Optional[str]:
+    
+    if end_dt.weekday() == 5: # appointment on saturday is unconfirmed automatically
+        status = "new"
+
     url = f"{GHL_API_BASE}/calendars/events/appointments"
     body = {
         "calendarId": calendar_id,
@@ -1275,6 +1299,28 @@ def ghl_update_appointment(event_id: str, calendar_id: str, assigned_user_id: Op
         body = getattr(getattr(e, "response", None), "text", None) or str(e)
         logger.error(f"GHL update appointment failed: {e} body={body}")
         return False, code, body
+    
+def update_od_appt_to_confirmed(appt_id: str) -> bool:
+    url = f"{API_BASE_URL}/appointments/{appt_id}/Confirm"
+    body = {
+        "defNum": CONFIRMATION_STATUS_APPT_VALUE
+    }
+    try:
+        r = get_session().put(url, headers=od_headers(), json=body, timeout=REQUEST_TIMEOUT)
+        _debug_write(f"od_appt_confirm_req.json", {"url": url, "body": body})
+        if 200 <= r.status_code < 300:
+            return True
+        err_txt = ""
+        try:
+            err_txt = r.text
+        except Exception:
+            pass
+        logger.error(f"OD update appointment confirmation status failed: HTTP {r.status_code} body={err_txt}")
+        return False
+    except requests.RequestException as e:
+        body = getattr(getattr(e, "response", None), "text", None) or str(e)
+        logger.error(f"OD update appointment confirmation status failed: {e} body={body}")
+        return False
 
 def ghl_update_appt_status(event_id: str, status: str, note: Optional[str] = None) -> Tuple[bool, Optional[int], str]:
     if not event_id:
@@ -1283,7 +1329,8 @@ def ghl_update_appt_status(event_id: str, status: str, note: Optional[str] = Non
     body = {
         "appointmentStatus": status,
         "ignoreFreeSlotValidation": True,
-        "locationId": GHL_LOCATION_ID
+        "locationId": GHL_LOCATION_ID,
+        "toNotify": False
     }
 
     try:
@@ -1697,49 +1744,101 @@ def main_once(dry_run: bool = False, force_deep_sync: bool = False):
         start, end, is_incr = generate_window(last_sync.get(clinic), force_deep_sync)
         logger.info(f"Clinic {clinic}: window {start} → {end} ({'incremental' if is_incr else 'deep'})")
 
-        appts = fetch_appointments_for_window(clinic, start, end)
-        if not appts:
+        appts, special_saturday_appts = fetch_appointments_for_window(clinic, start, end)
+        if not appts and not special_saturday_appts:
             logger.info(f"Clinic {clinic}: no appointments in window.")
             continue
         
-        unique_patients = set()
-        saturday_payments = dict()
+        unique_patients: Set[int] = set()
+        saturday_payments: Dict[str, Dict[str, Any]] = {}
+        patient_saturday_appts: Dict[int, List[str]] = {}
 
-        for a in appts:
-            if a.get('AptDateTime'):
-                apptDateTime = str(a.get('AptDateTime')).replace('Z', '+00:00')
-                apptDateTime = datetime.datetime.fromisoformat(apptDateTime)
-                apptDateTimeWeekday = apptDateTime.weekday()
+        for a in appts + special_saturday_appts:
+            apt_num_raw = a.get('AptNum')
+            pat_raw = a.get('PatNum')
+            apt_dt_raw = a.get('AptDateTime')
+            if not apt_num_raw or not pat_raw or not apt_dt_raw:
+                continue
+            try:
+                pat_num_int = int(pat_raw)
+            except (TypeError, ValueError):
+                continue
 
-                if a.get('PatNum') and apptDateTimeWeekday == 5: # is saturday
-                    unique_patients.add(a['PatNum'])
-                    saturday_payments[a.get('AptNum')] = {
-                        'PatNum': a['PatNum'],
-                        'ApptDateTime': a['AptDateTime'],
-                        'Paid': False
-                    }
+            appt_dt_iso = str(apt_dt_raw).replace('Z', '+00:00')
+            try:
+                appt_dt = datetime.datetime.fromisoformat(appt_dt_iso)
+            except ValueError:
+                continue
 
-        for p in unique_patients:
-            paymentsPatient = od_get(f"accountmodules/{p}/ServiceDateView", {}) or []
+            if appt_dt.weekday() != 5:
+                continue  # Not a Saturday appointment
 
-            for saturday_appt, index_saturday in saturday_payments:
-                if(saturday_appt['PatNum'] == p):
-                    best_payment = {}
-                    best_payment_id = 0
-                    for payment, index_payment in paymentsPatient:
-                        if int(payment.get('Credit', 0)) == 50:
-                            if "prepay" in payment.get('Reference', '').lower():
-                                if payment.get('TransDate', '') <= saturday_appt['ApptDateTime']:
-                                    if best_payment_id == 0:
-                                        best_payment = payment
+            apt_num = str(apt_num_raw)
+            unique_patients.add(pat_num_int)
+            saturday_payments[apt_num] = {
+                'PatNum': pat_num_int,
+                'ApptDateTime': apt_dt_raw,
+                'Paid': False
+            }
+            patient_saturday_appts.setdefault(pat_num_int, []).append(apt_num)
 
-                                    if best_payment['TransDate'] < payment['TransDate']:
-                                        best_payment = payment
-                                        best_payment_id = index_payment
-                    
-                    if best_payment_id != 0:
-                        saturday_appt[index_saturday]['Paid'] = True
-                        del paymentsPatient[best_payment_id]
+        patients_to_fetch: List[int] = []
+        for pat in sorted(unique_patients):
+            patients_to_fetch.append(pat)
+
+        # payment match algorithm
+        for p in patients_to_fetch:
+            payments_patient = od_get(f"accountmodules/{p}/ServiceDateView", {}) or []
+            if payments_patient is None:
+                payments_patient = []
+            if not isinstance(payments_patient, list):
+                payments_patient = [payments_patient]
+
+            patient_appts = patient_saturday_appts.get(p, [])
+            if not patient_appts:
+                continue
+
+            for apt_id in patient_appts:
+                appt_info = saturday_payments.get(apt_id)
+                if not appt_info:
+                    continue
+                appt_dt_raw = appt_info.get('ApptDateTime')
+                if not appt_dt_raw:
+                    continue
+                try:
+                    appt_dt = datetime.datetime.fromisoformat(str(appt_dt_raw).replace('Z', '+00:00'))
+                except ValueError:
+                    continue
+
+                best_candidate: Optional[Tuple[int, datetime.datetime]] = None
+                for idx, payment in enumerate(list(payments_patient)):
+                    if not isinstance(payment, dict):
+                        continue
+                    credit_val = payment.get('Credit', 0)
+                    try:
+                        credit_int = int(float(credit_val))
+                    except (TypeError, ValueError):
+                        continue
+                    if credit_int != 50:
+                        continue
+                    reference = str(payment.get('Reference', '') or '').lower()
+                    if 'prepay' not in reference:
+                        continue
+                    trans_raw = payment.get('TransDate')
+                    if not trans_raw:
+                        continue
+                    try:
+                        trans_dt = datetime.datetime.fromisoformat(str(trans_raw).replace('Z', '+00:00'))
+                    except ValueError:
+                        continue
+                    if trans_dt <= appt_dt:
+                        if not best_candidate or trans_dt > best_candidate[1]:
+                            best_candidate = (idx, trans_dt)
+
+                if best_candidate:
+                    idx_to_pop, _ = best_candidate
+                    saturday_payments[apt_id]['Paid'] = True
+                    payments_patient.pop(idx_to_pop)
 
         # Filter to new/updated by DateTStamp vs SENT_APPTS_FILE
         to_process: List[Dict[str, Any]] = []
@@ -1758,14 +1857,7 @@ def main_once(dry_run: bool = False, force_deep_sync: bool = False):
                 try: pat_nums.add(int(a['PatNum']))
                 except: pass
 
-        for saturday_appt, appt_id in saturday_payments:
-            if saturday_appt['Paid']:
-                event_id = ghl_map.get(appt_id, None)
-
-                if event_id:
-                    ok, code, msg = ghl_update_appt_status(event_id, "confirmed")
-
-        if not to_process:
+        if not to_process and not special_saturday_appts:
             logger.info(f"Clinic {clinic}: nothing new/updated to send.")
             continue
 
@@ -1856,6 +1948,46 @@ def main_once(dry_run: bool = False, force_deep_sync: bool = False):
         # advance last_sync only if we had at least one success; use max successful DateTStamp
         if successes > 0 and max_success_ts:
             last_sync[clinic] = max_success_ts.astimezone(timezone.utc).isoformat()
+
+        for appt_id, saturday_appt in saturday_payments.items():
+            map_entry = ghl_map.get(appt_id)
+            event_id: Optional[str] = None
+            if isinstance(map_entry, dict):
+                event_id = map_entry.get('eventId')
+            elif isinstance(map_entry, str):
+                event_id = map_entry
+
+            # If no payment found for this Saturday appointment
+            if not saturday_appt.get('Paid'):
+                # If the map entry has paid=True, reset it to False since payment is no longer found
+                if isinstance(map_entry, dict) and map_entry.get('paid') is True:
+                    map_entry['paid'] = False
+                    ghl_map[appt_id] = map_entry
+                    logger.info(f"Apt {appt_id}: Reset paid to False (payment no longer found)")
+                continue
+
+            # Payment found - check if we need to call the API
+            if not event_id:
+                continue
+
+            # Check if already marked as paid in ghl_map - skip API call if so
+            already_paid = isinstance(map_entry, dict) and map_entry.get('paid') is True
+            if already_paid:
+                logger.debug(f"Apt {appt_id}: Already marked as paid in map, skipping status update")
+                continue
+
+            ok, code, msg = ghl_update_appt_status(event_id, "confirmed", "Saturday appointment prepaid")
+            logger.info(f"Apt {appt_id}: Saturday prepaid update status to confirmed {'succeeded' if ok else 'failed'}")
+
+            # If successful, mark as paid in ghl_map
+            if ok:
+                update_od_appt_to_confirmed(appt_id)
+                if isinstance(map_entry, dict):
+                    map_entry['paid'] = True
+                    ghl_map[appt_id] = map_entry
+                else:
+                    # map_entry is a string (just event_id), convert to dict
+                    ghl_map[appt_id] = {'eventId': event_id, 'paid': True}
 
     # Persist state + Drive push
     save_patient_cache(patient_cache)  # local only; you’re not caching this in Actions
