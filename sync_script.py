@@ -845,7 +845,7 @@ def fetch_appointments_for_window(clinic: int, start: datetime.datetime, end: da
 # =========================
 # ===== GHL CLIENT ========
 # =========================
-def ghl_search_contact_by_phone(phone: str) -> Optional[Dict[str, Any]]:
+def ghl_search_contact_by_phone(phone: str, first: str) -> Optional[Dict[str, Any]]:
     """
     Search contacts by text query (phone). POST /contacts/search
     - Skips search if phone is too short (to avoid 422s and useless queries)
@@ -862,7 +862,7 @@ def ghl_search_contact_by_phone(phone: str) -> Optional[Dict[str, Any]]:
 
     url = f"{GHL_API_BASE}/contacts/search"
 
-    body = {"query": phone, "page": 1, "pageLimit": 1, "locationId": GHL_LOCATION_ID}
+    body = {"query": phone, "page": 1, "pageLimit": 20, "locationId": GHL_LOCATION_ID}
     try:
         r = get_session().post(url, headers=ghl_headers(), json=body, timeout=REQUEST_TIMEOUT)
         _debug_write("ghl_contacts_search_req.json", {"url": url, "body": body})
@@ -881,7 +881,13 @@ def ghl_search_contact_by_phone(phone: str) -> Optional[Dict[str, Any]]:
 
         _debug_write("ghl_contacts_search_resp.json", data)
         contacts = data.get('contacts') if isinstance(data, dict) else (data if isinstance(data, list) else [])
-        return contacts[0] if contacts else None
+
+        for contact in contacts or []:
+            c_first = (contact.get('firstName') or '').strip().lower()
+            if c_first == first.strip().lower():
+                return contact
+
+        return None
     except requests.RequestException as e:
         logger.error(f"GHL contact search failed: {e}")
         return None
@@ -1475,7 +1481,7 @@ def ensure_contact_id(first: str, last: str, email: str, phone: str,
 
     # 2) phone search
     phone_norm = normalize_phone_for_search(phone)
-    found = ghl_search_contact_by_phone(phone_norm) if phone_norm else None
+    found = ghl_search_contact_by_phone(phone_norm, first) if phone_norm else None
     is_family_member = is_family
     related_contact_candidates: Set[str] = set()
 
@@ -1490,7 +1496,7 @@ def ensure_contact_id(first: str, last: str, email: str, phone: str,
         first_name_raw = (found.get('firstNameLowerCase') or '').replace(" ", "")
         od_contact_firstname = (first or '').strip().lower().replace(" ", "")
 
-        if first_name_raw == od_contact_firstname and od_contact_lastname == ghl_contact_lastname:
+        if first_name_raw == od_contact_firstname and ghl_contact_lastname.intersection(od_contact_lastname):
             cid = found_id
             contact_map[pat_num] = {
                 "contactId": cid,
