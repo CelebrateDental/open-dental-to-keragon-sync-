@@ -165,6 +165,9 @@ CLINIC_BROKEN_APPOINTMENT_TYPE_FILTERS: Dict[int, List[str]] = {
 }
 VALID_STATUSES = {'Scheduled', 'Complete', 'Broken', 'UnschedList'}
 
+CONGRESS_ORTHO_CLINIC = 9035
+CONGRESS_ORTHO_BLOCKED_OPERATORIES = {0, 11576, 11577, 11582, 11574}
+
 REQUIRED_APPOINTMENT_FIELDS = [
     'AptNum', 'AptDateTime', 'AptStatus', 'PatNum', 'Op', 'OperatoryNum',
     'Pattern', 'AppointmentTypeNum', 'Note', 'DateTStamp', 'FName', 'LName',
@@ -1492,7 +1495,6 @@ def fetch_all_appointments_for_clinic_opportunity_match(clinic: int, start: date
 def match_appointments_to_opportunities(
     appts: List[Dict[str, Any]],
     opps: Dict[str, Any],
-    contact_map: Dict[int, Any],
     patients: Dict[int, Dict[str, Any]]
 ) -> Tuple[List[Tuple[Dict[str, Any], str]], Dict[str, Any]]:
     """
@@ -1779,7 +1781,7 @@ def process_congress_ortho_opportunity_matching(
     logger.info(f"Loaded patient info for {len(patients)} patients for opportunity matching")
 
     # Match appointments to opportunities
-    matched, remaining = match_appointments_to_opportunities(all_appts, opportunities_to_match, contact_map, patients)
+    matched, remaining = match_appointments_to_opportunities(all_appts, opportunities_to_match, patients)
 
     if matched:
         logger.info(f"Found {len(matched)} opportunity matches")
