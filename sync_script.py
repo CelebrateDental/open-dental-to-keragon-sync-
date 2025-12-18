@@ -110,6 +110,7 @@ GDRIVE_SA_JSON_B64    = os.environ.get('GDRIVE_SERVICE_ACCOUNT_JSON_B64', '').st
 GDRIVE_SUBJECT        = os.environ.get('GDRIVE_SUBJECT', '').strip()         # optional (domain-wide delegation)
 GDRIVE_FOLDER_ID      = os.environ.get('GDRIVE_FOLDER_ID', '').strip()
 GDRIVE_FOLDER_NAME    = os.environ.get('GDRIVE_FOLDER_NAME', 'od_ghl_sync').strip()  # used if no folder id
+GOOGLE_DRIVE_FILE_ID_OPPORTUNITIES = os.environ.get('GOOGLE_DRIVE_FILE_ID_OPPORTUNITIES', '').strip()
 
 # Local state files (also mirrored to Drive)
 STATE_FILE = 'last_sync_state.json'             # clinic → ISO timestamp
@@ -438,6 +439,7 @@ def appt_type_name_from_cache(appointment_type_num: Any) -> Optional[str]:
 # === GOOGLE DRIVE STATE ==
 # =========================
 _FAILED_UPDATES: Dict[str, Any] = {}
+opportunities_to_match: Dict[str, Any] = {}
 
 class DriveAdapter:
     """
@@ -590,6 +592,62 @@ class DriveAdapter:
                     "Do not delete/create files in My Drive with the service account."
                 )
 
+    def fetch_file_by_id(self, file_id: str) -> Optional[bytes]:
+        """
+        Download a file by its Drive id and return raw bytes.
+        """
+        if not file_id:
+            return None
+        if not self.service:
+            logger.warning("Drive unavailable; cannot fetch file id %s", file_id)
+            return None
+        try:
+            from googleapiclient.http import MediaIoBaseDownload
+
+            req = self.service.files().get_media(fileId=file_id)
+            fh = io.BytesIO()
+            downloader = MediaIoBaseDownload(fh, req)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+            return fh.getvalue()
+        except Exception as e:
+            logger.warning("Drive fetch error for id %s: %s", file_id, e)
+            return None
+
+    def update_file_by_id(self, file_id: str, content: bytes, mime: str = "application/json", max_retries: int = 3) -> bool:
+        if not file_id:
+            logger.warning("No file id provided for Drive update")
+            return False
+        if not self.service:
+            logger.warning("Drive unavailable; cannot update file id %s", file_id)
+            return False
+        
+        from googleapiclient.http import MediaIoBaseUpload
+        
+        last_error: Optional[Exception] = None
+        for attempt in range(max_retries):
+            try:
+                media = MediaIoBaseUpload(io.BytesIO(content), mimetype=mime, resumable=False)
+                self.service.files().update(fileId=file_id, media_body=media).execute()
+                return True
+            except Exception as e:
+                last_error = e
+                err_str = str(e).lower()
+                # Retry on transient SSL/network errors
+                if any(x in err_str for x in ('eof occurred', 'ssl', 'connection', 'timeout', 'broken pipe')):
+                    wait_time = (2 ** attempt) + 1  # 2, 3, 5 seconds
+                    logger.warning("Drive update transient error (attempt %d/%d) for id %s: %s. Retrying in %ds...", 
+                                   attempt + 1, max_retries, file_id, e, wait_time)
+                    time.sleep(wait_time)
+                    continue
+                # Non-retryable error
+                break
+        
+        logger.warning("Drive update error for id %s: %s", file_id, last_error)
+        return False
+
+
 DRIVE = DriveAdapter()
 
 
@@ -625,6 +683,25 @@ def pull_all_from_drive():
                 DRIVE.pull(f)
             except Exception as e:
                 logger.warning(f"Drive pull failed for {f}: {e}")
+
+def load_opportunities_to_match_from_drive() -> Dict[str, Any]:
+    file_id = GOOGLE_DRIVE_FILE_ID_OPPORTUNITIES
+    if not file_id:
+        logger.warning("GOOGLE_DRIVE_FILE_ID_OPPORTUNITIES not set; opportunities_to_match remains empty.")
+        return {}
+    blob = DRIVE.fetch_file_by_id(file_id)
+    if blob is None:
+        return {}
+    try:
+        data = json.loads(blob.decode('utf-8'))
+        if isinstance(data, dict):
+            logger.info("Loaded opportunities_to_match from Drive id %s (%d keys)", file_id, len(data))
+            return data
+        logger.warning("Opportunities file is not a JSON object (got %s)", type(data).__name__)
+    except Exception as e:
+        logger.warning("Failed to parse opportunities file: %s", e)
+    return {}
+
 
 def save_state(sent_map: Dict[str, Dict[str, str]], last_sync: Dict[int, Optional[str]],
                snapshot: Dict[str, Any], ghl_map: Dict[str, Any], contact_map: Dict[int, Any]):
@@ -1353,6 +1430,387 @@ def ghl_update_appt_status(event_id: str, status: str, note: Optional[str] = Non
         return False, code, body
 
 # =========================
+# === OPPORTUNITY MATCHING =
+# =========================
+def normalize_name_for_match(name: str) -> str:
+    """Normalize a name for fuzzy matching: lowercase, strip whitespace, remove special chars."""
+    if not name:
+        return ""
+    # Lowercase, strip, and remove extra whitespace
+    normalized = re.sub(r'\s+', ' ', (name or '').strip().lower())
+    # Remove special characters but keep spaces
+    normalized = re.sub(r'[^a-z0-9\s]', '', normalized)
+    return normalized.strip()
+
+
+def names_match(name1: str, name2: str) -> bool:
+    """Check if two names match (case-insensitive, ignoring extra whitespace/special chars)."""
+    n1 = normalize_name_for_match(name1)
+    n2 = normalize_name_for_match(name2)
+    if not n1 or not n2:
+        return False
+    return n1 == n2
+
+
+def fetch_all_appointments_for_clinic_opportunity_match(clinic: int, start: datetime.datetime, end: datetime.datetime) -> List[Dict[str, Any]]:
+    """
+    Fetch ALL appointments for Congress Ortho Clinic (9035) regardless of operatory,
+    for opportunity matching purposes.
+    """
+    params_base = {
+        'ClinicNum': str(clinic),
+        'dateStart': start.astimezone(timezone.utc).date().strftime('%Y-%m-%d'),
+        'dateEnd': end.astimezone(timezone.utc).date().strftime('%Y-%m-%d'),
+        'fields': ','.join(REQUIRED_APPOINTMENT_FIELDS),
+    }
+    all_appts: List[Dict[str, Any]] = []
+
+    logger.debug(
+        f"Clinic {clinic}: fetching ALL appointments for opportunity matching "
+        f"{params_base['dateStart']}..{params_base['dateEnd']}"
+    )
+
+    for status in VALID_STATUSES:
+        p = dict(params_base)
+        p['AptStatus'] = status
+        chunk = od_get_paginated('appointments', p) or []
+        logger.debug(f"Clinic {clinic} opportunity fetch: AptStatus={status} -> {len(chunk)} returned")
+        all_appts.extend(chunk)
+        time.sleep(OD_RATE_LIMIT_SECONDS)
+
+    # De-dupe
+    uniq: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    for a in all_appts:
+        key = (str(a.get('AptNum', '')), str(a.get('PatNum', '')), a.get('AptDateTime', ''))
+        uniq[key] = a
+    result = list(uniq.values())
+
+    logger.info(f"Clinic {clinic}: ALL appointments for opportunity matching: raw={len(all_appts)} after-de-dupe={len(result)}")
+    return result
+
+
+def match_appointments_to_opportunities(
+    appts: List[Dict[str, Any]],
+    opps: Dict[str, Any],
+    contact_map: Dict[int, Any],
+    patients: Dict[int, Dict[str, Any]]
+) -> Tuple[List[Tuple[Dict[str, Any], str]], Dict[str, Any]]:
+    """
+    Match appointments to opportunities based on patient name vs contact name.
+    Only match if the operatory is NOT in CONGRESS_ORTHO_BLOCKED_OPERATORIES.
+    
+    Args:
+        appts: List of appointment dictionaries
+        opps: Opportunities dictionary (opp_id -> opp_data)
+        contact_map: PatNum -> contact info mapping
+        patients: PatNum -> patient info dictionary (for name lookup)
+    
+    Returns:
+        - List of (appointment, opportunity_id) tuples that matched
+        - Remaining opportunities dict (unmatched)
+    """
+    matched: List[Tuple[Dict[str, Any], str]] = []
+    remaining_opps = dict(opps)  # Copy to avoid mutating original during iteration
+
+    for appt in appts:
+        # Check operatory - must NOT be in blocked list
+        op_num = appt.get('Op') or appt.get('OperatoryNum') or 0
+        try:
+            op_num_int = int(op_num)
+        except (TypeError, ValueError):
+            op_num_int = 0
+
+        if op_num_int in CONGRESS_ORTHO_BLOCKED_OPERATORIES:
+            continue
+
+        # Get patient info from patients dict using PatNum
+        pat_num = appt.get('PatNum')
+        pat_num_int: Optional[int] = None
+        if pat_num is not None:
+            try:
+                pat_num_int = int(pat_num)
+            except (TypeError, ValueError):
+                pass
+
+        # Build patient full name from patients dict (preferred) or fallback to appt fields
+        patient_info = patients.get(pat_num_int, {}) if pat_num_int else {}
+        first = (patient_info.get('FName') or appt.get('FName') or '').strip()
+        last = (patient_info.get('LName') or appt.get('LName') or '').strip()
+        patient_name = f"{first} {last}".strip()
+
+        if not patient_name:
+            logger.debug(f"Skipping appt {appt.get('AptNum')} - no patient name found (PatNum={pat_num})")
+            continue
+
+        # Try to match against each opportunity
+        for opp_id, opp_data in list(remaining_opps.items()):
+            if not isinstance(opp_data, dict):
+                continue
+
+            contact_name = opp_data.get('contact_name', '')
+            if not contact_name:
+                continue
+
+            if names_match(patient_name, contact_name):
+                matched.append((appt, opp_id))
+                # Remove from remaining
+                del remaining_opps[opp_id]
+                logger.info(
+                    f"Opportunity MATCH: AptNum {appt.get('AptNum')} patient '{patient_name}' "
+                    f"matched opportunity '{opp_id}' contact '{contact_name}'"
+                )
+                break  # One appointment can only match one opportunity
+
+    return matched, remaining_opps
+
+
+def tag_contact_won(contact_id: str) -> bool:
+    """Tag the contact with 'Won' tag."""
+    return ghl_tag_contact(contact_id, "Won")
+
+
+def process_opportunity_matches(
+    matched: List[Tuple[Dict[str, Any], str]],
+    opps: Dict[str, Any],
+    contact_map: Dict[int, Any]
+) -> Dict[str, Any]:
+    """
+    Process matched appointments:
+    - Tag the contact with 'Won'
+    - Remove the opportunity from the dictionary
+    
+    Returns the updated opportunities dictionary.
+    """
+    updated_opps = dict(opps)
+
+    for appt, opp_id in matched:
+        # Get contact_id from opportunity data or from contact_map
+        opp_data = opps.get(opp_id, {})
+        contact_id = opp_data.get('contact_id')
+
+        # If no contact_id in opportunity, try to find via PatNum in contact_map
+        if not contact_id:
+            pat_num = appt.get('PatNum')
+            if pat_num:
+                try:
+                    pat_num_int = int(pat_num)
+                    contact_entry = contact_map.get(pat_num_int)
+                    if isinstance(contact_entry, dict):
+                        contact_id = contact_entry.get('contactId')
+                except (TypeError, ValueError):
+                    pass
+
+        # Tag contact with "Won"
+        if contact_id:
+            success = tag_contact_won(contact_id)
+            if success:
+                logger.info(f"Tagged contact {contact_id} with 'Won' for opportunity {opp_id}")
+            else:
+                logger.warning(f"Failed to tag contact {contact_id} with 'Won' for opportunity {opp_id}")
+        else:
+            logger.warning(f"No contact_id found for opportunity {opp_id}, cannot tag 'Won'")
+
+        # Remove opportunity from dict
+        if opp_id in updated_opps:
+            del updated_opps[opp_id]
+            logger.info(f"Removed matched opportunity {opp_id} from opportunities_to_match")
+
+    return updated_opps
+
+
+def cleanup_old_opportunities(opps: Dict[str, Any], max_age_days: int = 30) -> Dict[str, Any]:
+    """
+    Remove opportunities older than max_age_days from the dictionary.
+    Uses the 'opportunity_date' field from each opportunity.
+    """
+    if not opps:
+        return {}
+
+    now = datetime.datetime.now(tz=timezone.utc)
+    cutoff = now - timedelta(days=max_age_days)
+    cleaned_opps: Dict[str, Any] = {}
+    removed_count = 0
+
+    for opp_id, opp_data in opps.items():
+        if not isinstance(opp_data, dict):
+            cleaned_opps[opp_id] = opp_data
+            continue
+
+        opp_date_raw = opp_data.get('opportunity_date')
+        if not opp_date_raw:
+            # No date, keep it
+            cleaned_opps[opp_id] = opp_data
+            continue
+
+        # Parse opportunity date
+        opp_date: Optional[datetime.datetime] = None
+        try:
+            if isinstance(opp_date_raw, str):
+                # Try mm/dd/YYYY format first (expected format from GHL)
+                try:
+                    opp_date = datetime.datetime.strptime(opp_date_raw, "%m/%d/%Y").replace(tzinfo=timezone.utc)
+                except ValueError:
+                    # Fall back to ISO format
+                    opp_date = datetime.datetime.fromisoformat(opp_date_raw.replace('Z', '+00:00'))
+            elif isinstance(opp_date_raw, datetime.datetime):
+                opp_date = opp_date_raw
+            elif isinstance(opp_date_raw, datetime.date):
+                opp_date = datetime.datetime.combine(opp_date_raw, datetime.time.min, tzinfo=timezone.utc)
+        except Exception as e:
+            logger.debug(f"Could not parse opportunity_date '{opp_date_raw}' for {opp_id}: {e}")
+            cleaned_opps[opp_id] = opp_data
+            continue
+
+        if opp_date is None:
+            cleaned_opps[opp_id] = opp_data
+            continue
+
+        # Ensure timezone-aware
+        if opp_date.tzinfo is None:
+            opp_date = opp_date.replace(tzinfo=timezone.utc)
+
+        # Check if older than cutoff
+        if opp_date < cutoff:
+            removed_count += 1
+            logger.info(f"Removing old opportunity {opp_id} (date: {opp_date.date()}, older than {max_age_days} days)")
+        else:
+            cleaned_opps[opp_id] = opp_data
+
+    if removed_count > 0:
+        logger.info(f"Removed {removed_count} opportunities older than {max_age_days} days")
+
+    return cleaned_opps
+
+
+def save_opportunities_to_drive(opps: Dict[str, Any]) -> bool:
+    """
+    Save the opportunities_to_match dictionary back to Google Drive.
+    Uses the GOOGLE_DRIVE_FILE_ID_OPPORTUNITIES file id.
+    """
+    file_id = GOOGLE_DRIVE_FILE_ID_OPPORTUNITIES
+    if not file_id:
+        logger.warning("GOOGLE_DRIVE_FILE_ID_OPPORTUNITIES not set; cannot save opportunities to Drive")
+        return False
+
+    try:
+        content = json.dumps(opps, indent=2, default=str).encode('utf-8')
+        success = DRIVE.update_file_by_id(file_id, content, mime="application/json")
+        if success:
+            logger.info(f"Saved {len(opps)} opportunities to Drive file {file_id}")
+        else:
+            logger.warning(f"Failed to save opportunities to Drive file {file_id}")
+        return success
+    except Exception as e:
+        logger.error(f"Error saving opportunities to Drive: {e}")
+        return False
+
+
+def process_congress_ortho_opportunity_matching(
+    start: datetime.datetime,
+    end: datetime.datetime,
+    contact_map: Dict[int, Any]
+) -> None:
+    """
+    Main function to process opportunity matching for Congress Ortho Clinic (9035).
+    - Fetches all appointments from clinic 9035 regardless of operatory
+    - Matches against opportunities_to_match
+    - Tags matched contacts with 'Won'
+    - Updates the global opportunities_to_match
+    """
+    global opportunities_to_match
+
+    if not opportunities_to_match:
+        logger.info("No opportunities to match against")
+        return
+
+    logger.info(f"Starting opportunity matching for Congress Ortho (clinic {CONGRESS_ORTHO_CLINIC})")
+    logger.info(f"Opportunities to match: {len(opportunities_to_match)}")
+
+    # Fetch all appointments for clinic 9035
+    all_appts = fetch_all_appointments_for_clinic_opportunity_match(CONGRESS_ORTHO_CLINIC, start, end)
+
+    if not all_appts:
+        logger.info(f"No appointments found for clinic {CONGRESS_ORTHO_CLINIC} for opportunity matching")
+        return
+
+    # Collect unique PatNums and fetch patient info for name lookup
+    pat_nums_to_fetch: Set[int] = set()
+    for appt in all_appts:
+        pat_num = appt.get('PatNum')
+        if pat_num:
+            try:
+                pat_nums_to_fetch.add(int(pat_num))
+            except (TypeError, ValueError):
+                pass
+
+    # Load patient cache and fetch missing patients or patients without names
+    patient_cache = load_patient_cache()
+    patients: Dict[int, Dict[str, Any]] = {}
+    
+    for pn in sorted(pat_nums_to_fetch):
+        cached = patient_cache.get(pn)
+        # Check if cache has the patient AND has FName/LName - if not, fetch from OD
+        has_name = (
+            cached is not None 
+            and isinstance(cached, dict) 
+            and (cached.get('FName') or cached.get('LName'))
+        )
+        
+        if has_name:
+            patients[pn] = dict(cached)
+        else:
+            # Fetch from OpenDental (either not in cache, or cache missing name fields)
+            data = od_get(f"patients/{pn}", {}) or []
+            pat = (data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else {}))
+            patients[pn] = dict(pat) if isinstance(pat, dict) else {}
+            # Update cache with fetched data (merge if existing)
+            if cached is not None and isinstance(cached, dict):
+                # Merge: keep existing fields, update with new data
+                merged = dict(cached)
+                merged.update(patients[pn])
+                patient_cache[pn] = merged
+                patients[pn] = merged
+            else:
+                patient_cache[pn] = dict(patients[pn])
+            time.sleep(OD_RATE_LIMIT_SECONDS)
+
+    # Save updated patient cache
+    save_patient_cache(patient_cache)
+    logger.info(f"Loaded patient info for {len(patients)} patients for opportunity matching")
+
+    # Match appointments to opportunities
+    matched, remaining = match_appointments_to_opportunities(all_appts, opportunities_to_match, contact_map, patients)
+
+    if matched:
+        logger.info(f"Found {len(matched)} opportunity matches")
+        # Process matches (tag contacts, remove from dict)
+        opportunities_to_match = process_opportunity_matches(matched, opportunities_to_match, contact_map)
+    else:
+        logger.info("No opportunity matches found")
+
+
+def finalize_opportunities() -> None:
+    """
+    Called at shutdown to:
+    - Clean up opportunities older than 30 days
+    - Save the final opportunities_to_match to Google Drive
+    """
+    global opportunities_to_match
+
+    logger.info("Finalizing opportunities processing...")
+
+    # Clean up old opportunities (older than 30 days)
+    opportunities_to_match = cleanup_old_opportunities(opportunities_to_match, max_age_days=30)
+
+    # Save to Google Drive
+    if opportunities_to_match is not None:
+        save_opportunities_to_drive(opportunities_to_match)
+        logger.info(f"Final opportunities count after cleanup: {len(opportunities_to_match)}")
+    else:
+        logger.info("No opportunities to save")
+
+
+# =========================
 # ===== STATE & CACHE =====
 # =========================
 def load_last_sync() -> Dict[int, Optional[str]]:
@@ -1719,6 +2177,9 @@ def main_once(dry_run: bool = False, force_deep_sync: bool = False):
     DRIVE.connect()
     pull_all_from_drive()
 
+    global opportunities_to_match
+    opportunities_to_match = load_opportunities_to_match_from_drive()
+
     # Load appt types cache once (from repo file next to this script)
     global _APPT_TYPE_BY_NUM, _APPT_TYPES_LOADED
     if not _APPT_TYPES_LOADED:
@@ -1990,8 +2451,17 @@ def main_once(dry_run: bool = False, force_deep_sync: bool = False):
                     # map_entry is a string (just event_id), convert to dict
                     ghl_map[appt_id] = {'eventId': event_id, 'paid': True}
 
+    # Process opportunity matching for Congress Ortho Clinic (9035)
+    # Use the widest sync window from the processed clinics for opportunity matching
+    if CONGRESS_ORTHO_CLINIC in CLINIC_NUMS:
+        opp_start, opp_end, _ = generate_window(last_sync.get(CONGRESS_ORTHO_CLINIC), force_deep_sync)
+        process_congress_ortho_opportunity_matching(opp_start, opp_end, contact_map)
+
+    # Finalize opportunities: cleanup old ones (>30 days) and save to Google Drive
+    finalize_opportunities()
+
     # Persist state + Drive push
-    save_patient_cache(patient_cache)  # local only; you’re not caching this in Actions
+    save_patient_cache(patient_cache)  # local only; you're not caching this in Actions
     save_state(sent_map, last_sync, snapshot, ghl_map, contact_map)
     save_failed_updates(_FAILED_UPDATES)
     logger.info(f"Done. Created/updated {total} appointments.")
