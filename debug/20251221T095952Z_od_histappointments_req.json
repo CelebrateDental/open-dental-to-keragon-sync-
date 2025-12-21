@@ -1,6 +1,0 @@
-{
-  "url": "https://api.opendental.com/api/v1/histappointments",
-  "params": {
-    "AptNum": "3765062"
-  }
-}
