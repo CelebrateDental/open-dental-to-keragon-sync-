@@ -58,6 +58,8 @@ from zoneinfo import ZoneInfo
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import ssl
+from socket import error as SocketError
 
 # =========================
 # ====== CONFIG ===========
@@ -456,8 +458,6 @@ class DriveAdapter:
         Retry a Google API call with exponential backoff.
         Handles transient SSL errors (SSLEOFError, SSLError) and other network issues.
         """
-        import ssl
-        from socket import error as SocketError
         
         retryable_exceptions = (
             ssl.SSLError,

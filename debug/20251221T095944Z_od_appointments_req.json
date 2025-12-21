@@ -1,0 +1,13 @@
+{
+  "url": "https://api.opendental.com/api/v1/appointments",
+  "params": {
+    "ClinicNum": "9034",
+    "dateStart": "2025-12-18",
+    "dateEnd": "2026-01-05",
+    "fields": "AptNum,AptDateTime,AptStatus,PatNum,Op,OperatoryNum,Pattern,AppointmentTypeNum,Note,DateTStamp,FName,LName,ProvNum,ProvHyg,Asst,ClinicNum,Address,Zip,Email,WirelessPhone,Gender,Birthdate",
+    "AptStatus": "UnschedList",
+    "Op": "0",
+    "limit": 100,
+    "offset": 0
+  }
+}

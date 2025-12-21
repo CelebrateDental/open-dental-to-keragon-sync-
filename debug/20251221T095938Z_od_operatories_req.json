@@ -1,0 +1,8 @@
+{
+  "url": "https://api.opendental.com/api/v1/operatories",
+  "params": {
+    "ClinicNum": 9034,
+    "limit": 100,
+    "offset": 0
+  }
+}
