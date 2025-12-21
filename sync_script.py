@@ -1212,6 +1212,33 @@ def pick_latest_same_day_event(contact_events: List[Dict[str, Any]],
     _debug_write("ghl_same_day_pick.json", {"picked": chosen, "candidates": same_day_events[:25]})
     return _event_id(chosen)
 
+def ghl_verify_duplicated_appointment(contact_id: str, start_dt: datetime.datetime, end_dt: datetime.datetime, calendar_id: str):
+    url = f"{GHL_API_BASE}/contacts/{contact_id}/appointments"
+
+    try:
+        r = get_session().get(url, headers=ghl_headers(), timeout=REQUEST_TIMEOUT)
+        _debug_write("ghl_get_event_req.json", {"url": url})
+        r.raise_for_status()
+        j = r.json()
+        _debug_write("ghl_get_event_resp.json", j)
+
+        if j.get('events'):
+            events = j.get('events')
+            for event in events:
+                ghl_start_time = to_utc_z(datetime.datetime.fromisoformat(event.get('startTime')))
+                ghl_end_time = to_utc_z(datetime.datetime.fromisoformat(event.get('endTime')))
+                od_start_time = to_utc_z(start_dt)
+                od_end_time = to_utc_z(end_dt)
+                if ghl_start_time == od_start_time and ghl_end_time == od_end_time:
+                    return event
+        
+        return None
+    except requests.RequestException as e:
+        resp_text = getattr(getattr(e, 'response', None), 'text', '') or ''
+        logger.error(f"GHL verifying appointment failed: {e} body={resp_text}")
+        return None
+    
+
 def ghl_create_appointment(calendar_id: str, contact_id: str, assigned_user_id: Optional[str],
                            title: str, start_dt: datetime.datetime, end_dt: datetime.datetime,
                            status: str, note: Optional[str] = None) -> Optional[str]:
@@ -1679,13 +1706,20 @@ def process_one_appt(appt: Dict[str, Any],
             return None
 
     # Not found in reconciliation file → create new
-    new_event_id = ghl_create_appointment(calendar_id, contact_id, assigned_user_id, title, start_local, end_local, status, ghl_note)
-    if new_event_id:
-        ghl_map[apt_num] = {"contactId": contact_id, "eventId": new_event_id, "calendarId": calendar_id, "clinic": clinic}
-        logger.info(f"＋ Created event {new_event_id} for AptNum {apt_num}")
-        # Tag the contact on create
-        ghl_tag_contact(contact_id, "fromopendental")
-        return new_event_id
+    duplicated_appointment = ghl_verify_duplicated_appointment(contact_id, start_local, end_local, calendar_id)
+    
+    if duplicated_appointment:
+        ghl_map[apt_num] = {"contactId": contact_id, "eventId": duplicated_appointment['id'], "calendarId": calendar_id, "clinic": clinic}
+        logger.info(f"＋ Detected duplicated event {duplicated_appointment['id']} for AptNum {apt_num}")
+        return duplicated_appointment['id']
+    else:
+        new_event_id = ghl_create_appointment(calendar_id, contact_id, assigned_user_id, title, start_local, end_local, status, ghl_note)
+        if new_event_id:
+            ghl_map[apt_num] = {"contactId": contact_id, "eventId": new_event_id, "calendarId": calendar_id, "clinic": clinic}
+            logger.info(f"＋ Created event {new_event_id} for AptNum {apt_num}")
+            # Tag the contact on create
+            ghl_tag_contact(contact_id, "fromopendental")
+            return new_event_id
 
     logger.error(f"Apt {apt_num}: failed to create appointment")
     return None
