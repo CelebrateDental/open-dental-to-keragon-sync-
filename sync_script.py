@@ -451,6 +451,45 @@ class DriveAdapter:
         self.service = None
         self.folder_id = GDRIVE_FOLDER_ID
 
+    def _retry_api_call(self, call_fn, description: str, max_retries: int = 5, base_delay: float = 1.0):
+        """
+        Retry a Google API call with exponential backoff.
+        Handles transient SSL errors (SSLEOFError, SSLError) and other network issues.
+        """
+        import ssl
+        from socket import error as SocketError
+        
+        retryable_exceptions = (
+            ssl.SSLError,
+            ssl.SSLEOFError,
+            SocketError,
+            ConnectionError,
+            ConnectionResetError,
+            BrokenPipeError,
+        )
+        
+        last_exception = None
+        for attempt in range(max_retries):
+            try:
+                return call_fn()
+            except retryable_exceptions as e:
+                last_exception = e
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    logger.warning(
+                        "Drive API %s failed (attempt %d/%d): %s. Retrying in %.1fs...",
+                        description, attempt + 1, max_retries, e, delay
+                    )
+                    time.sleep(delay)
+                else:
+                    logger.error(
+                        "Drive API %s failed after %d attempts: %s",
+                        description, max_retries, e
+                    )
+        if last_exception is not None:
+            raise last_exception
+        raise RuntimeError(f"Drive API {description} failed after {max_retries} attempts")
+
     def _creds(self):
         try:
             from google.oauth2 import service_account
@@ -499,13 +538,21 @@ class DriveAdapter:
                 f"name = '{GDRIVE_FOLDER_NAME}' and "
                 f"mimeType = 'application/vnd.google-apps.folder' and trashed = false"
             )
-            res = self.service.files().list(q=q, fields="files(id,name)").execute()
+            
+            def do_folder_list():
+                return self.service.files().list(q=q, fields="files(id,name)").execute()
+            
+            res = self._retry_api_call(do_folder_list, "find folder")
             files = res.get('files', [])
             if files:
                 self.folder_id = files[0]['id']
             else:
                 body = {'name': GDRIVE_FOLDER_NAME, 'mimeType': 'application/vnd.google-apps.folder'}
-                f = self.service.files().create(body=body, fields='id').execute()
+                
+                def do_folder_create():
+                    return self.service.files().create(body=body, fields='id').execute()
+                
+                f = self._retry_api_call(do_folder_create, "create folder")
                 self.folder_id = f['id']
 
         logger.info("Drive connected. Folder id: %s", self.folder_id)
@@ -514,11 +561,15 @@ class DriveAdapter:
         if not self.service or not self.folder_id:
             return None
         q = f"name = '{os.path.basename(name)}' and '{self.folder_id}' in parents and trashed = false"
-        res = self.service.files().list(
-            q=q,
-            fields="files(id,name,modifiedTime)",
-            orderBy="modifiedTime desc"
-        ).execute()
+        
+        def do_list():
+            return self.service.files().list(
+                q=q,
+                fields="files(id,name,modifiedTime)",
+                orderBy="modifiedTime desc"
+            ).execute()
+        
+        res = self._retry_api_call(do_list, f"find file '{os.path.basename(name)}'")
         files = res.get('files', [])
         return files[0]['id'] if files else None
 
@@ -540,14 +591,18 @@ class DriveAdapter:
         try:
             from googleapiclient.http import MediaIoBaseDownload
 
-            req = self.service.files().get_media(fileId=file_id)
-            fh = io.BytesIO()
-            downloader = MediaIoBaseDownload(fh, req)
-            done = False
-            while not done:
-                _, done = downloader.next_chunk()
+            def do_download():
+                req = self.service.files().get_media(fileId=file_id)
+                fh = io.BytesIO()
+                downloader = MediaIoBaseDownload(fh, req)
+                done = False
+                while not done:
+                    _, done = downloader.next_chunk()
+                return fh.getvalue()
+            
+            content = self._retry_api_call(do_download, f"download '{os.path.basename(filename)}'")
             with open(filename, "wb") as f:
-                f.write(fh.getvalue())
+                f.write(content)
             logger.info("Drive pull → %s", os.path.basename(filename))
         except Exception as e:
             logger.warning("Drive pull error for %s: %s", os.path.basename(filename), e)
@@ -580,7 +635,11 @@ class DriveAdapter:
         try:
             from googleapiclient.http import MediaFileUpload
             media = MediaFileUpload(filename, mimetype="application/json", resumable=False)
-            updated = self.service.files().update(fileId=file_id, media_body=media).execute()
+            
+            def do_update():
+                return self.service.files().update(fileId=file_id, media_body=media).execute()
+            
+            updated = self._retry_api_call(do_update, f"push '{basename}'")
             logger.info("Drive push (version update) → %s (id %s)", basename, updated.get('id'))
         except Exception as e:
             logger.warning("Drive push error for %s: %s", basename, e)
