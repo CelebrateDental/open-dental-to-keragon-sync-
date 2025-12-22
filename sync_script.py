@@ -1026,7 +1026,7 @@ def ghl_search_contact_by_phone(phone: str, first: str) -> Optional[Dict[str, An
             if c_first == first.strip().lower():
                 return contact
 
-        return None
+        return contacts[0] if contacts else None
     except requests.RequestException as e:
         logger.error(f"GHL contact search failed: {e}")
         return None
