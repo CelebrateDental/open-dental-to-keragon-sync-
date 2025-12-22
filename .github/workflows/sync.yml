@@ -147,6 +147,7 @@ jobs:
           #   - GDRIVE_SERVICE_ACCOUNT_JSON_B64  (recommended)
           #   - GDRIVE_SERVICE_ACCOUNT_JSON      (raw JSON)
           GDRIVE_SERVICE_ACCOUNT_JSON_B64: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON_B64 }}
+          GOOGLE_DRIVE_FILE_ID_OPPORTUNITIES: ${{ secrets.GOOGLE_DRIVE_FILE_ID_OPPORTUNITIES }}
           # GDRIVE_SERVICE_ACCOUNT_JSON:      ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
 
           # Point to the Drive folder where state files are mirrored
