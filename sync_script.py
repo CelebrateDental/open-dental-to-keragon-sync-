@@ -2187,6 +2187,20 @@ def process_one_appt(appt: Dict[str, Any],
             ghl_tag_contact(contact_id, "fromopendental")
             return event_id
         else:
+            if "event id is invalid" in msg.lower():
+                # Sometimes, the Call Center people remove duplicate events manually in GHL,
+                # causing our mapping to point to a non-existing event. 
+                # In that case, we should try to detect an already existing event and re-map.
+                duplicated_appointment = ghl_verify_duplicated_appointment(contact_id, start_local, end_local, calendar_id)
+                
+                if duplicated_appointment:
+                    ghl_map[apt_num] = {"contactId": contact_id, "eventId": duplicated_appointment['id'], "calendarId": calendar_id, "clinic": clinic}
+                    logger.info(f"＋ Detected duplicated event {duplicated_appointment['id']} for AptNum {apt_num}")
+                    logger.info(f"✓ Updated mapped event {duplicated_appointment['id']} for AptNum {apt_num}")
+                    # Tag the contact on update
+                    ghl_tag_contact(contact_id, "fromopendental")
+                    return duplicated_appointment['id']
+                
             dlq_record(apt_num, clinic, event_id, contact_id, code, msg)
             logger.error(f"Apt {apt_num}: mapped update failed (HTTP {code}). NOT creating a new event. Logged to DLQ.")
             return None
@@ -2220,6 +2234,20 @@ def process_one_appt(appt: Dict[str, Any],
             save_ghl2od_entry_updated_at(candidate_event_id)
             return candidate_event_id
         else:
+            if "event id is invalid" in msg.lower():
+                # Sometimes, the Call Center people remove duplicate events manually in GHL,
+                # causing our mapping to point to a non-existing event. 
+                # In that case, we should try to detect an already existing event and re-map.
+                duplicated_appointment = ghl_verify_duplicated_appointment(contact_id, start_local, end_local, calendar_id)
+                
+                if duplicated_appointment:
+                    ghl_map[apt_num] = {"contactId": contact_id, "eventId": duplicated_appointment['id'], "calendarId": calendar_id, "clinic": clinic}
+                    logger.info(f"＋ Detected duplicated event {duplicated_appointment['id']} for AptNum {apt_num}")
+                    logger.info(f"✓ Updated mapped event {duplicated_appointment['id']} for AptNum {apt_num}")
+                    # Tag the contact on update
+                    ghl_tag_contact(contact_id, "fromopendental")
+                    return duplicated_appointment['id']
+                
             dlq_record(apt_num, clinic, candidate_event_id, contact_id, code, msg)
             logger.error(f"Apt {apt_num}: update via {GHL2OD_APPTS_FILE} failed (HTTP {code}). NOT creating new. Logged to DLQ.")
             return None
