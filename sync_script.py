@@ -1369,6 +1369,8 @@ def ghl_verify_duplicated_appointment(contact_id: str, start_dt: datetime.dateti
                 od_start_time = to_utc_z(start_dt)
                 od_end_time = to_utc_z(end_dt)
                 if ghl_start_time == od_start_time and ghl_end_time == od_end_time:
+                    if event.get('calendarId') != calendar_id:
+                        continue
                     return event
         
         return None
