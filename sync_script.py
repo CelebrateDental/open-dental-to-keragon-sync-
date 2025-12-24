@@ -161,6 +161,9 @@ CLINIC_OPERATORY_FILTERS: Dict[int, List[int]] = {
     9034: [11579, 11580, 11588],
     9035: [11574, 11576, 11577],
 }
+CLINIC_OPERATORY_FILTERS_NON_NEW_PATIENTS: Dict[int, List[int]] = {
+    9035: [11572, 11573, 11575, 11583, 11571]
+}
 CLINIC_BROKEN_APPOINTMENT_TYPE_FILTERS: Dict[int, List[str]] = {
     9034: ["COMP EX", "COMP EX CHILD"],
     9035: ["CASH CONSULT", "INSURANCE CONSULT", "INS CONSULT"]
@@ -1568,12 +1571,19 @@ def fetch_all_appointments_for_clinic_opportunity_match(clinic: int, start: date
     )
 
     for status in VALID_STATUSES:
-        p = dict(params_base)
-        p['AptStatus'] = status
-        chunk = od_get_paginated('appointments', p) or []
-        logger.debug(f"Clinic {clinic} opportunity fetch: AptStatus={status} -> {len(chunk)} returned")
-        all_appts.extend(chunk)
-        time.sleep(OD_RATE_LIMIT_SECONDS)
+        for op in CLINIC_OPERATORY_FILTERS_NON_NEW_PATIENTS.get(clinic, []):
+            p = dict(params_base); p['AptStatus'] = status; p['Op'] = str(op)
+
+            if status == "UnschedList":
+                p['Op'] = "0"
+
+            chunk = od_get_paginated('appointments', p) or []
+            logger.debug(f"Clinic {clinic} opportunity fetch: Op={p['Op']} AptStatus={status} -> {len(chunk)} returned")
+            all_appts.extend(chunk)
+
+            # No need to iterate all operatories for UnschedList (always Op=0)
+            if status == "UnschedList":
+                break
 
     # De-dupe
     uniq: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
