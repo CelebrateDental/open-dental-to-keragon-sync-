@@ -819,8 +819,8 @@ def od_get(endpoint: str, params: Dict[str, Any]) -> Optional[List[Any]]:
         logger.error(f"OD GET failed {endpoint}: {e} {body}")
         return None
 
-def od_get_paginated(endpoint: str, params: Dict[str, Any]) -> Optional[List[Any]]:
-    if not ENABLE_PAGINATION:
+def od_get_paginated(endpoint: str, params: Dict[str, Any], enable_pagination:bool = ENABLE_PAGINATION) -> Optional[List[Any]]:
+    if not enable_pagination:
         return od_get(endpoint, params)
     out: List[Any] = []
     offset = 0
@@ -1577,13 +1577,14 @@ def fetch_all_appointments_for_clinic_opportunity_match(clinic: int, start: date
             if status == "UnschedList":
                 p['Op'] = "0"
 
-            chunk = od_get_paginated('appointments', p) or []
+            chunk = od_get_paginated('appointments', p, False) or []
             logger.debug(f"Clinic {clinic} opportunity fetch: Op={p['Op']} AptStatus={status} -> {len(chunk)} returned")
             all_appts.extend(chunk)
 
             # No need to iterate all operatories for UnschedList (always Op=0)
             if status == "UnschedList":
                 break
+            time.sleep(OD_RATE_LIMIT_SECONDS)
 
     # De-dupe
     uniq: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
